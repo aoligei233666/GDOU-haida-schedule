@@ -1,0 +1,62 @@
+{
+  "expo": {
+    "name": "广海课表",
+    "slug": "gdou-schedule-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B3954"
+    },
+    "ios": {
+      "bundleIdentifier": "cn.edu.gdou.schedule",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",
+        "NSCalendarsFullAccessUsageDescription": "用于创建并同步“广海课表”专属系统日历及考试提醒",
+        "NSRemindersUsageDescription": "用于设置课前提醒与考前提醒事项",
+        "NSUserTrackingUsageDescription": "本应用不会追踪您的任何数据或存储教务账号密码"
+      }
+    },
+    "android": {
+      "package": "cn.edu.gdou.schedule",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B3954",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE",
+        "com.android.alarm.permission.SET_ALARM"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "允许“广海课表”访问系统日历，以便一键导入课程表与考试安排。"
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#0284C7",
+          "defaultChannel": "gdou-alarm-channel"
+        }
+      ]
+    ],
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
