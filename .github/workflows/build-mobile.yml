@@ -28,19 +28,22 @@ jobs:
       - name: Install dependencies
         run: npm ci || npm install
 
-      - name: Prebuild Android project
-        run: npx expo prebuild --platform android --clean
+      - name: Ensure Android project exists (preserve committed native CookieJar)
+        run: |
+          if [ ! -d "android" ]; then
+            npx expo prebuild --platform android
+          fi
 
       - name: Build Android Release APK
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --no-daemon
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86_64 --no-daemon
 
       - name: Upload Android APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gdou-schedule-android-apk
+          name: haida-schedule-android-apk
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
 
@@ -92,15 +95,15 @@ jobs:
             echo "ERROR: .app bundle not found"
             exit 1
           fi
-          rm -rf Payload gdou-schedule-ios-unsigned.ipa
+          rm -rf Payload haida-schedule-ios-unsigned.ipa
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          zip -qry gdou-schedule-ios-unsigned.ipa Payload
-          ls -lh gdou-schedule-ios-unsigned.ipa
+          zip -qry haida-schedule-ios-unsigned.ipa Payload
+          ls -lh haida-schedule-ios-unsigned.ipa
 
       - name: Upload iOS IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gdou-schedule-ios-unsigned-ipa
-          path: ios/gdou-schedule-ios-unsigned.ipa
+          name: haida-schedule-ios-unsigned-ipa
+          path: ios/haida-schedule-ios-unsigned.ipa
           if-no-files-found: error

@@ -36,6 +36,11 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders
+# generated native folders (keep android/ native source tracked for GdouEphemeralCookieJar)
 /ios
-/android
+/android/build/
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/app/build/
+/android/app/.cxx/

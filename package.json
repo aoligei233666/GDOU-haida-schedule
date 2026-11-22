@@ -1,6 +1,11 @@
 {
   "name": "gdou-schedule-app",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aoligei233666/GDOU-haida-schedule.git"
+  },
   "main": "index.ts",
   "dependencies": {
     "@expo/vector-icons": "^15.0.2",
