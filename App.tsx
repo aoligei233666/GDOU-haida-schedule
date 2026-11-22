@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect, useState } from 'react';
+import React, { Component, ErrorInfo, ReactNode, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -14,6 +14,7 @@ import { EphemeralSyncModal } from './src/components/EphemeralSyncModal';
 import { buildSampleGdouData } from './src/constants/gdouTimetable';
 import { AlarmsScreen } from './src/screens/AlarmsScreen';
 import { ExamsScreen } from './src/screens/ExamsScreen';
+import { GradesScreen } from './src/screens/GradesScreen';
 import { ScheduleScreen } from './src/screens/ScheduleScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import {
@@ -30,7 +31,7 @@ import {
 import { COLORS } from './src/theme/colors';
 import { AlarmRule, AppSettings, ExamItem, PersistedAppData } from './src/types/models';
 
-type TabKey = 'schedule' | 'exams' | 'alarms' | 'settings';
+type TabKey = 'schedule' | 'exams' | 'grades' | 'alarms' | 'settings';
 
 const TABS: {
   key: TabKey;
@@ -40,9 +41,47 @@ const TABS: {
 }[] = [
   { key: 'schedule', label: '课表', icon: 'calendar-outline', activeIcon: 'calendar' },
   { key: 'exams', label: '考试', icon: 'school-outline', activeIcon: 'school' },
+  { key: 'grades', label: '绩点学分', icon: 'ribbon-outline', activeIcon: 'ribbon' },
   { key: 'alarms', label: '闹钟日历', icon: 'alarm-outline', activeIcon: 'alarm' },
-  { key: 'settings', label: '设置', icon: 'shield-checkmark-outline', activeIcon: 'shield-checkmark' },
+  { key: 'settings', label: '关于设置', icon: 'information-circle-outline', activeIcon: 'information-circle' },
 ];
+
+class RootErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; message: string }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, message: error?.message || String(error) };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.warn('RootErrorBoundary caught:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <View style={styles.errorBoundary}>
+          <Text style={styles.errorBoundaryTitle}>海大课表遇到异常已自动恢复保护</Text>
+          <Text style={styles.errorBoundaryDesc}>{this.state.message}</Text>
+          <TouchableOpacity
+            style={styles.errorBoundaryBtn}
+            onPress={() => this.setState({ hasError: false, message: '' })}
+          >
+            <Text style={styles.errorBoundaryBtnText}>重新加载页面</Text>
+          </TouchableOpacity>
+          <Text style={styles.errorBoundaryFooter}>powered by 种果仁</Text>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function MainApp() {
   const [ready, setReady] = useState(false);
@@ -53,11 +92,22 @@ function MainApp() {
   useEffect(() => {
     let mounted = true;
     (async () => {
-      await initializeAlarmEngine();
-      const loaded = await loadPersistedData();
-      if (mounted) {
-        setAppData(loaded);
-        setReady(true);
+      try {
+        await initializeAlarmEngine();
+      } catch {
+        // Non-fatal on startup
+      }
+      try {
+        const loaded = await loadPersistedData();
+        if (mounted) {
+          setAppData(loaded);
+        }
+      } catch {
+        // Use initial defaults if storage is corrupted
+      } finally {
+        if (mounted) {
+          setReady(true);
+        }
       }
     })();
     return () => {
@@ -75,12 +125,12 @@ function MainApp() {
 
   const handleSyncSuccess = (result: SyncResult) => {
     persistUpdate((prev) => {
-      // Preserve any manually added exams while replacing synced JWXT exams
       const manualExams = prev.exams.filter((e) => e.isManual);
       return {
         ...prev,
         courses: result.courses,
         exams: [...result.exams, ...manualExams],
+        grades: result.grades.length > 0 ? result.grades : prev.grades,
         termLabel: result.termLabel,
         academicYear: result.academicYear,
         semesterCode: result.semesterCode,
@@ -91,7 +141,7 @@ function MainApp() {
 
     Alert.alert(
       '同步完成 · 凭据已销毁',
-      `成功拉取 ${result.courses.length} 项课程、${result.exams.length} 场考试（${result.termLabel}）。\n\n您的学号与密码已从内存中彻底清除，教务会话已注销，本地未保存任何登录凭据。`
+      `成功拉取：\n• 课程安排：${result.courses.length} 项\n• 考试日程：${result.exams.length} 场\n• 成绩与学分：${result.grades.length} 门\n（${result.termLabel}）\n\n您的学号与密码已从内存中彻底清除，教务会话已注销，本地未保存任何登录凭据。`
     );
   };
 
@@ -101,6 +151,7 @@ function MainApp() {
       ...prev,
       courses: sample.courses,
       exams: sample.exams,
+      grades: sample.grades,
       termLabel: sample.termLabel,
     }));
   };
@@ -141,10 +192,14 @@ function MainApp() {
   };
 
   const handleClearAll = async () => {
-    await cancelAllScheduledAlarms();
+    try {
+      await cancelAllScheduledAlarms();
+    } catch {
+      // ignore
+    }
     await clearAllLocalData();
     setAppData(createInitialAppData());
-    Alert.alert('已清空', '本地课表、考试和闹钟数据已全部清除。');
+    Alert.alert('已清空', '本地课表、考试、成绩和闹钟数据已全部清除。');
   };
 
   if (!ready) {
@@ -152,7 +207,8 @@ function MainApp() {
       <SafeAreaView style={styles.splash}>
         <StatusBar style="light" />
         <ActivityIndicator size="large" color={COLORS.oceanLight} />
-        <Text style={styles.splashText}>正在初始化广海课表...</Text>
+        <Text style={styles.splashText}>海大课表</Text>
+        <Text style={styles.splashPowered}>powered by 种果仁</Text>
       </SafeAreaView>
     );
   }
@@ -181,6 +237,13 @@ function MainApp() {
             onAddManualExam={handleAddManualExam}
             onDeleteExam={handleDeleteExam}
             onAlarmsAdded={handleAddAlarms}
+          />
+        )}
+
+        {activeTab === 'grades' && (
+          <GradesScreen
+            grades={appData.grades}
+            onOpenSync={() => setSyncModalOpen(true)}
           />
         )}
 
@@ -219,7 +282,7 @@ function MainApp() {
               >
                 <Ionicons
                   name={focused ? tab.activeIcon : tab.icon}
-                  size={22}
+                  size={21}
                   color={focused ? COLORS.oceanPrimary : COLORS.textMuted}
                 />
                 <Text style={[styles.tabLabel, focused && styles.tabLabelActive]}>
@@ -242,9 +305,11 @@ function MainApp() {
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <MainApp />
-    </SafeAreaProvider>
+    <RootErrorBoundary>
+      <SafeAreaProvider>
+        <MainApp />
+      </SafeAreaProvider>
+    </RootErrorBoundary>
   );
 }
 
@@ -262,12 +327,18 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.oceanDeep,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 12,
+    gap: 8,
   },
   splashText: {
-    fontSize: 14,
-    color: COLORS.oceanLight,
-    fontWeight: '600',
+    fontSize: 20,
+    color: COLORS.white,
+    fontWeight: '800',
+    marginTop: 6,
+  },
+  splashPowered: {
+    fontSize: 12,
+    color: '#38BDF8',
+    fontWeight: '700',
   },
   tabBarSafe: {
     backgroundColor: COLORS.surface,
@@ -286,12 +357,49 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   tabLabel: {
-    fontSize: 11,
+    fontSize: 10.5,
     color: COLORS.textMuted,
     fontWeight: '600',
   },
   tabLabelActive: {
     color: COLORS.oceanPrimary,
+    fontWeight: '700',
+  },
+  errorBoundary: {
+    flex: 1,
+    backgroundColor: COLORS.oceanDeep,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 28,
+  },
+  errorBoundaryTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.white,
+    textAlign: 'center',
+  },
+  errorBoundaryDesc: {
+    fontSize: 13,
+    color: '#CBD5E1',
+    textAlign: 'center',
+    marginTop: 10,
+    marginBottom: 20,
+  },
+  errorBoundaryBtn: {
+    backgroundColor: COLORS.oceanPrimary,
+    paddingHorizontal: 22,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  errorBoundaryBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
+  errorBoundaryFooter: {
+    fontSize: 12,
+    color: '#38BDF8',
+    marginTop: 24,
     fontWeight: '700',
   },
 });

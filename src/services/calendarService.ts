@@ -5,7 +5,7 @@ import { AppSettings, CourseItem, ExamItem } from '../types/models';
 import { parseExamIsoLocal } from './examParser';
 import { getCourseOccurrences } from './scheduleParser';
 
-const GDOU_CALENDAR_TITLE = '广海课表 (GDOU)';
+const GDOU_CALENDAR_TITLE = '海大课表 (GDOU)';
 const GDOU_CALENDAR_NAME = 'gdou_schedule_calendar';
 
 export interface CalendarSyncSummary {

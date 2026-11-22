@@ -48,6 +48,7 @@ export function createInitialAppData(now: Date = new Date()): PersistedAppData {
     schemaVersion: SCHEMA_VERSION,
     courses: [],
     exams: [],
+    grades: [],
     alarms: [],
     termLabel: term.label,
     academicYear: term.xnm,
@@ -69,6 +70,7 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
       ...parsed,
       courses: Array.isArray(parsed.courses) ? parsed.courses : [],
       exams: Array.isArray(parsed.exams) ? parsed.exams : [],
+      grades: Array.isArray(parsed.grades) ? parsed.grades : [],
       alarms: Array.isArray(parsed.alarms) ? parsed.alarms : [],
       settings: {
         ...defaults.settings,

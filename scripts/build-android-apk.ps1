@@ -1,9 +1,9 @@
 $ErrorActionPreference = "Stop"
 
-$jdkBase = "$env:LOCALAPPDATA\gdou-jdk21"
+$jdkBase = "$env:LOCALAPPDATA\gdou-jdk17"
 $jdkDir = Get-ChildItem $jdkBase -Directory -Filter "jdk-*" -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $jdkDir) {
-    throw "JDK 21 not found under $jdkBase. Set JAVA_HOME manually or install JDK 21."
+    throw "JDK 17 not found under $jdkBase. Set JAVA_HOME manually or install JDK 17."
 }
 
 $env:JAVA_HOME = $jdkDir.FullName
@@ -14,7 +14,7 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location "$projectRoot\android"
 try {
-    & .\gradlew.bat assembleRelease "-PreactNativeArchitectures=arm64-v8a,armeabi-v7a" --no-daemon
+    & .\gradlew.bat assembleRelease "-PreactNativeArchitectures=arm64-v8a" --console=plain --no-daemon
     $apkSource = "$projectRoot\android\app\build\outputs\apk\release\app-release.apk"
     $distDir = "$projectRoot\dist"
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null

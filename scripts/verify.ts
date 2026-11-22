@@ -3,6 +3,7 @@ import { buildSampleGdouData, createDefaultSettings } from '../src/constants/gdo
 import { encryptGdouPassword, purgeEphemeralCredentials } from '../src/services/cryptoAes';
 import { getExamCountdown, parseExamDateTime, parseZfExamResponse } from '../src/services/examParser';
 import { checkGdouCaptcha, prepareGdouAuthSession } from '../src/services/gdouAuth';
+import { computeGpaSummary, parseZfGradesResponse } from '../src/services/gradeParser';
 import { buildGdouIcsContent } from '../src/services/icsBuilder';
 import {
   getCourseOccurrences,
@@ -126,7 +127,17 @@ async function run() {
   assert.equal(occs[0].start.getMinutes(), 10);
   console.log('   OK: Schedule parser & occurrence generator verified.');
 
-  console.log('4) Testing 正方 exam parser & countdown...');
+  console.log('4) Testing 正方 exam & GPA/Credit parser...');
+  const parsedGrades = parseZfGradesResponse({
+    items: [
+      { kcmc: '高等数学（上）', kch: 'SX110201', xf: '5.0', cj: '90', jd: '4.0', kcxzmc: '公共必修课', xnmmc: '2025-2026', xqmmc: '1' },
+      { kcmc: '海洋科学导论', kch: 'HY100101', xf: '3.0', cj: '优秀', jd: '4.5', kcxzmc: '专业必修课', xnmmc: '2025-2026', xqmmc: '1' },
+    ],
+  });
+  const gpaSummary = computeGpaSummary(parsedGrades);
+  assert.equal(gpaSummary.totalCreditsEarned, 8);
+  assert.equal(gpaSummary.weightedGpa, 4.19);
+  console.log('   OK: GPA & credits summary verified ->', JSON.stringify(gpaSummary));
   const parsedDt = parseExamDateTime('2026-12-28(09:00-11:00)');
   assert.equal(parsedDt.dateText, '2026-12-28');
   assert.equal(parsedDt.startTimeText, '09:00');
@@ -169,7 +180,10 @@ async function run() {
   console.log('   LIVE salt len:', liveSession.pwdEncryptSalt.length, 'execution:', liveSession.execution);
   assert.ok(liveSession.pwdEncryptSalt.length >= 16, 'Expected 16-byte pwdEncryptSalt from live GDOU authserver');
   assert.ok(liveSession.execution.length > 0, 'Expected execution token from live GDOU authserver');
-  assert.ok(liveSession.serviceUrl.includes('jw.gdou.edu.cn'), 'Expected jw.gdou.edu.cn service URL');
+  assert.ok(
+    liveSession.serviceUrl.includes('gdou.edu.cn'),
+    'Expected gdou.edu.cn service URL'
+  );
   const captchaRes = await checkGdouCaptcha(liveSession, '202411701101');
   console.log('   LIVE checkNeedCaptcha:', JSON.stringify({ isNeed: captchaRes.isNeed }));
 

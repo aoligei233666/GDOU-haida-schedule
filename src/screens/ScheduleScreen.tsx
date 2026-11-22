@@ -202,18 +202,21 @@ export const ScheduleScreen: React.FC<Props> = ({
           <View style={styles.emptyIconCircle}>
             <Ionicons name="school-outline" size={44} color={COLORS.oceanPrimary} />
           </View>
-          <Text style={styles.emptyTitle}>欢迎使用广海课表</Text>
+          <Text style={styles.emptyTitle}>欢迎使用海大课表</Text>
           <Text style={styles.emptyDesc}>
-            支持一键同步广东海洋大学教务课表与考试安排。登录账号密码仅在拉取时临时验证，拉取完成立即销毁，本地零留存。
+            支持一键同步广东海洋大学教务课表、考试安排、绩点与学分。登录账号密码仅在拉取时临时验证，拉取完成立即销毁，本地零留存。
           </Text>
           <TouchableOpacity style={styles.emptyPrimaryBtn} onPress={onOpenSync}>
             <Ionicons name="cloud-download-outline" size={19} color={COLORS.white} />
-            <Text style={styles.emptyPrimaryText}>登录广海教务同步课表（用完即删）</Text>
+            <Text style={styles.emptyPrimaryText}>登录海大教务同步数据（用完即删）</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.emptySecondaryBtn} onPress={onLoadSampleData}>
             <Ionicons name="sparkles-outline" size={17} color={COLORS.oceanPrimary} />
-            <Text style={styles.emptySecondaryText}>加载广海示例课表体验日历与闹钟功能</Text>
+            <Text style={styles.emptySecondaryText}>加载海大示例数据体验课表 / 绩点 / 日历 / 闹钟</Text>
           </TouchableOpacity>
+          <Text style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 18, fontWeight: '600' }}>
+            powered by 种果仁
+          </Text>
         </View>
       ) : (
         <>

@@ -1,4 +1,4 @@
-import { AppSettings, CampusPresetKey, CourseItem, ExamItem, PeriodTime } from '../types/models';
+import { AppSettings, CampusPresetKey, CourseItem, ExamItem, GradeItem, PeriodTime } from '../types/models';
 
 export const GDOU_ENTRY_URL = 'https://netcheck.gdou.edu.cn/go.php?code=jw';
 
@@ -134,6 +134,7 @@ export function createDefaultSettings(now: Date = new Date()): AppSettings {
 export function buildSampleGdouData(now: Date = new Date()): {
   courses: CourseItem[];
   exams: ExamItem[];
+  grades: GradeItem[];
   termLabel: string;
 } {
   const term = deriveCurrentTermParams(now);
@@ -316,5 +317,88 @@ export function buildSampleGdouData(now: Date = new Date()): {
     },
   ];
 
-  return { courses, exams, termLabel: `${term.label}（示例预览）` };
+  const grades: GradeItem[] = [
+    {
+      id: 'sample-grade-1',
+      courseName: '海洋科学导论',
+      courseCode: 'HY100101',
+      academicYear: '2025-2026',
+      semester: '1',
+      termKey: '2025-2026 第1学期',
+      credit: 3.0,
+      scoreText: '92',
+      numericScore: 92,
+      gpa: 4.2,
+      courseCategory: '专业必修课',
+      examNature: '正常考试',
+      teacher: '陈海明',
+      passed: true,
+    },
+    {
+      id: 'sample-grade-2',
+      courseName: '高等数学（上）',
+      courseCode: 'SX110201',
+      academicYear: '2025-2026',
+      semester: '1',
+      termKey: '2025-2026 第1学期',
+      credit: 5.0,
+      scoreText: '88',
+      numericScore: 88,
+      gpa: 3.8,
+      courseCategory: '公共必修课',
+      examNature: '正常考试',
+      teacher: '林志强',
+      passed: true,
+    },
+    {
+      id: 'sample-grade-3',
+      courseName: '数据结构与算法',
+      courseCode: 'JS200305',
+      academicYear: '2025-2026',
+      semester: '1',
+      termKey: '2025-2026 第1学期',
+      credit: 3.5,
+      scoreText: '95',
+      numericScore: 95,
+      gpa: 4.5,
+      courseCategory: '专业必修课',
+      examNature: '正常考试',
+      teacher: '王晓东',
+      passed: true,
+    },
+    {
+      id: 'sample-grade-4',
+      courseName: '大学英语（三）',
+      courseCode: 'WY100303',
+      academicYear: '2025-2026',
+      semester: '1',
+      termKey: '2025-2026 第1学期',
+      credit: 2.0,
+      scoreText: '86',
+      numericScore: 86,
+      gpa: 3.6,
+      courseCategory: '公共必修课',
+      examNature: '正常考试',
+      teacher: '周丽华',
+      passed: true,
+    },
+    {
+      id: 'sample-grade-5',
+      courseName: '海洋文化概论',
+      courseCode: 'TS100802',
+      academicYear: '2025-2026',
+      semester: '1',
+      termKey: '2025-2026 第1学期',
+      credit: 2.0,
+      scoreText: '优秀',
+      numericScore: 95,
+      gpa: 4.5,
+      courseCategory: '通识选修课',
+      examNature: '正常考试',
+      teacher: '赵海峰',
+      passed: true,
+    },
+  ];
+
+  return { courses, exams, grades, termLabel: `${term.label}（示例预览）` };
 }

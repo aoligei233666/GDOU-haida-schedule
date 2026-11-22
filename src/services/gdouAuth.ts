@@ -3,19 +3,21 @@ import {
   CourseItem,
   EphemeralCredentials,
   ExamItem,
+  GradeItem,
   SyncReceipt,
 } from '../types/models';
 import { encryptGdouPassword, purgeEphemeralCredentials } from './cryptoAes';
 import { parseZfExamResponse } from './examParser';
+import { parseZfGradesResponse } from './gradeParser';
 import { parseZfScheduleResponse } from './scheduleParser';
 
-const MOBILE_UA =
+const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 export interface PreparedAuthSession {
   entryFinalUrl: string;
-  authOrigin: string; // e.g. "https://wfw.gdou.edu.cn" or "https://authserver.gdou.edu.cn"
-  jwBaseUrl: string; // e.g. "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" or "https://jw.gdou.edu.cn"
+  authOrigin: string; // "https://authserver.gdou.edu.cn"
+  jwBaseUrl: string; // "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" or "https://jw.gdou.edu.cn"
   isWebVpn: boolean;
   serviceUrl: string;
   pwdEncryptSalt: string;
@@ -24,14 +26,28 @@ export interface PreparedAuthSession {
   alreadyLoggedIn: boolean;
 }
 
+export interface MfaChallengeState {
+  required: true;
+  reAuthUserId: string;
+  serviceUrl: string;
+  defaultReAuthType: '4' | '3'; // 4 = 企业微信验证码, 3 = 短信验证码
+  session: PreparedAuthSession;
+  previousSteps: string[];
+}
+
 export interface SyncResult {
   courses: CourseItem[];
   exams: ExamItem[];
+  grades: GradeItem[];
   termLabel: string;
   academicYear: string;
   semesterCode: string;
   receipt: SyncReceipt;
 }
+
+export type OneShotSyncOutcome =
+  | { status: 'completed'; result: SyncResult }
+  | { status: 'mfa_required'; mfa: MfaChallengeState };
 
 export interface SyncTermOverride {
   xnm?: string;
@@ -39,14 +55,12 @@ export interface SyncTermOverride {
 }
 
 function extractHiddenInput(html: string, idOrName: string): string {
-  // Match input tag containing id="X" or name="X" and extract value="..."
   const tagRegex = new RegExp(
     `<input[^>]+(?:id|name)=["']${idOrName}["'][^>]*>`,
     'gi'
   );
   const matches = html.match(tagRegex);
   if (!matches) return '';
-  // Prefer the one inside pwdFromId (last match usually belongs to username/password login form)
   for (let i = matches.length - 1; i >= 0; i--) {
     const valMatch = matches[i].match(/value=["']([^"']*)["']/i);
     if (valMatch && valMatch[1]) {
@@ -65,60 +79,77 @@ function extractServiceUrl(html: string): string {
 }
 
 function extractAuthError(html: string): string {
-  const tipMatch = html.match(/id=["']showErrorTip["'][^>]*>([\s\S]*?)<\/span>/i);
-  if (tipMatch && tipMatch[1]) {
-    const clean = tipMatch[1].replace(/<[^>]+>/g, '').trim();
-    if (clean) return clean;
-  }
-  const msgMatch = html.match(/id=["']msg["'][^>]*>([\s\S]*?)<\//i);
-  if (msgMatch && msgMatch[1]) {
-    const clean = msgMatch[1].replace(/<[^>]+>/g, '').trim();
-    if (clean) return clean;
+  for (const id of ['showErrorTip', 'formErrorTip2', 'formErrorTip', 'msg']) {
+    const m = html.match(new RegExp(`id=["']${id}["'][^>]*>([\\s\\S]*?)<\\/div>`, 'i')) ||
+              html.match(new RegExp(`id=["']${id}["'][^>]*>([\\s\\S]*?)<\\/span>`, 'i'));
+    if (m && m[1]) {
+      const clean = m[1].replace(/<[^>]+>/g, '').trim();
+      if (clean) return clean;
+    }
   }
   return '';
 }
 
-function resolveOrigin(url: string): string {
-  const m = url.match(/^(https?:\/\/[^/]+)/i);
-  return m ? m[1] : 'https://wfw.gdou.edu.cn';
-}
-
 /**
- * Step 1: Visit `https://netcheck.gdou.edu.cn/go.php?code=jw` and parse GDOU authserver
- * form tokens (`pwdEncryptSalt`, `execution`, `service`). Automatically adapts to
- * off-campus WebVPN (`wfw.gdou.edu.cn`) vs on-campus direct (`authserver.gdou.edu.cn`).
+ * Step 1: Probe `netcheck.gdou.edu.cn/go.php?code=jw` to initialize WebVPN session (`wfw.gdou.edu.cn`)
+ * if off-campus, then fetch `https://authserver.gdou.edu.cn/authserver/login` tokens directly.
  */
 export async function prepareGdouAuthSession(): Promise<PreparedAuthSession> {
-  const resp = await fetch(GDOU_ENTRY_URL, {
+  const netResp = await fetch(GDOU_ENTRY_URL, {
     method: 'GET',
     credentials: 'include',
     headers: {
-      'User-Agent': MOBILE_UA,
+      'User-Agent': DESKTOP_UA,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     },
   });
 
-  const finalUrl = resp.url || GDOU_ENTRY_URL;
-  const html = await resp.text();
-  const isWebVpn = finalUrl.includes('wfw.gdou.edu.cn');
-  const authOrigin = resolveOrigin(finalUrl);
+  const netFinalUrl = netResp.url || GDOU_ENTRY_URL;
+  const netHtml = await netResp.text();
+  const isWebVpn = netFinalUrl.includes('wfw.gdou.edu.cn');
   const jwBaseUrl = isWebVpn
     ? 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn'
     : 'https://jw.gdou.edu.cn';
 
-  const pwdEncryptSalt = extractHiddenInput(html, 'pwdEncryptSalt');
-  const execution = extractHiddenInput(html, 'execution');
-  const lt = extractHiddenInput(html, 'lt');
-  const serviceUrl = extractServiceUrl(html);
+  const serviceUrl = isWebVpn
+    ? 'https://wfw.gdou.edu.cn/'
+    : extractServiceUrl(netHtml);
+  const authOrigin = 'https://authserver.gdou.edu.cn';
+  const authLoginUrl = `${authOrigin}/authserver/login?service=${encodeURIComponent(serviceUrl)}`;
+
+  const authResp = await fetch(authLoginUrl, {
+    method: 'GET',
+    credentials: 'include',
+    headers: {
+      'User-Agent': DESKTOP_UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+
+  // Register device browser fingerprint cookie (MULTIFACTOR_BROWSER_FINGERPRINT) required by GDOU MFA
+  await fetch(`${authOrigin}/authserver/bfp/info?bfp=8f14e45fceea167a5a36dedd4bea2543`, {
+    method: 'GET',
+    credentials: 'include',
+    headers: { 'User-Agent': DESKTOP_UA },
+  }).catch(() => null);
+
+  const authHtml = await authResp.text();
+  const pwdEncryptSalt =
+    extractHiddenInput(authHtml, 'pwdEncryptSalt') ||
+    extractHiddenInput(netHtml, 'pwdEncryptSalt');
+  const execution =
+    extractHiddenInput(authHtml, 'execution') ||
+    extractHiddenInput(netHtml, 'execution');
+  const lt = extractHiddenInput(authHtml, 'lt') || extractHiddenInput(netHtml, 'lt');
 
   const looksLikeJwPortal =
-    !html.includes('pwdEncryptSalt') &&
-    (html.includes('xskbcx') ||
-      html.includes('教学管理信息服务平台') ||
-      html.includes('index_initMenu'));
+    !authHtml.includes('pwdEncryptSalt') &&
+    (authHtml.includes('xskbcx') ||
+      authHtml.includes('教学管理信息服务平台') ||
+      authHtml.includes('index_initMenu'));
 
   return {
-    entryFinalUrl: finalUrl,
+    entryFinalUrl: authLoginUrl,
     authOrigin,
     jwBaseUrl,
     isWebVpn,
@@ -131,8 +162,7 @@ export async function prepareGdouAuthSession(): Promise<PreparedAuthSession> {
 }
 
 /**
- * Step 2: Query GDOU authserver `checkNeedCaptcha.htl` for a username.
- * If captcha is required, fetches the image as a Base64 Data URI for display to the user.
+ * Step 2: Check whether username requires graphic captcha.
  */
 export async function checkGdouCaptcha(
   session: PreparedAuthSession,
@@ -149,7 +179,7 @@ export async function checkGdouCaptcha(
     const resp = await fetch(checkUrl, {
       method: 'GET',
       credentials: 'include',
-      headers: { 'User-Agent': MOBILE_UA },
+      headers: { 'User-Agent': DESKTOP_UA },
     });
     const data = (await resp.json()) as { isNeed?: boolean };
     if (!data?.isNeed) {
@@ -169,7 +199,7 @@ export async function fetchGdouCaptchaImage(
   const resp = await fetch(imgUrl, {
     method: 'GET',
     credentials: 'include',
-    headers: { 'User-Agent': MOBILE_UA },
+    headers: { 'User-Agent': DESKTOP_UA },
   });
   if (!resp.ok) return undefined;
   const buf = await resp.arrayBuffer();
@@ -217,9 +247,6 @@ function parseSelectedOption(html: string, selectId: string): string | null {
   return null;
 }
 
-/**
- * Resolve JWXT context prefix ("" vs "/jwglxt") and current term (xnm, xqm) from live portal.
- */
 async function detectJwPrefixAndTerm(
   jwBaseUrl: string,
   override?: SyncTermOverride
@@ -235,7 +262,7 @@ async function detectJwPrefixAndTerm(
       const resp = await fetch(url, {
         method: 'GET',
         credentials: 'include',
-        headers: { 'User-Agent': MOBILE_UA },
+        headers: { 'User-Agent': DESKTOP_UA },
       });
       if (!resp.ok) continue;
       const html = await resp.text();
@@ -259,7 +286,8 @@ async function detectJwPrefixAndTerm(
 
   const xnm = detectedXnm || derived.xnm;
   const xqm = detectedXqm || derived.xqm;
-  const semText = xqm === '3' ? '第1学期' : xqm === '12' ? '第2学期' : xqm === '16' ? '第3学期' : '当前学期';
+  const semText =
+    xqm === '3' ? '第1学期' : xqm === '12' ? '第2学期' : xqm === '16' ? '第3学期' : '当前学期';
   const yearNum = parseInt(xnm, 10);
   const termLabel = Number.isFinite(yearNum)
     ? `${yearNum}-${yearNum + 1}学年 ${semText}`
@@ -279,7 +307,7 @@ async function fetchJwScheduleJson(
     method: 'POST',
     credentials: 'include',
     headers: {
-      'User-Agent': MOBILE_UA,
+      'User-Agent': DESKTOP_UA,
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
       'X-Requested-With': 'XMLHttpRequest',
       Accept: 'application/json, text/javascript, */*; q=0.01',
@@ -287,8 +315,8 @@ async function fetchJwScheduleJson(
     body: encodeFormBody({ xnm, xqm, kzlx: 'ck', xsdm: '' }),
   });
   const text = await resp.text();
-  if (text.includes('统一身份认证平台') || text.includes('pwdEncryptSalt')) {
-    throw new Error('教务系统会话未生效，请重试或切换“官方无痕网页同步”');
+  if (text.includes('统一身份认证') || text.includes('pwdEncryptSalt')) {
+    throw new Error('教务系统会话尚未激活，请重试或切换“官方无痕网页同步”');
   }
   return JSON.parse(text);
 }
@@ -322,7 +350,6 @@ async function fetchJwExamJson(
       'queryModel.sortOrder': 'asc',
       time: '0',
     },
-    // Fallback: query full academic year in case exam semester filter differs
     {
       xnm,
       xqm: '',
@@ -338,7 +365,7 @@ async function fetchJwExamJson(
           method: 'POST',
           credentials: 'include',
           headers: {
-            'User-Agent': MOBILE_UA,
+            'User-Agent': DESKTOP_UA,
             'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
             'X-Requested-With': 'XMLHttpRequest',
             Accept: 'application/json, text/javascript, */*; q=0.01',
@@ -355,9 +382,8 @@ async function fetchJwExamJson(
             ? parsed.rows.length
             : 0;
         if (count > 0) return parsed;
-        // Keep searching if current variant returned 0 items
       } catch {
-        // Try next endpoint/variant
+        // Try next
       }
     }
   }
@@ -365,8 +391,54 @@ async function fetchJwExamJson(
 }
 
 /**
- * Unconditionally terminate server-side sessions (JWXT + CAS Authserver + WebVPN)
- * so no reusable session cookie survives after syncing schedule & exams.
+ * Fetch all historical & current semester course grades, credits, and GPAs from
+ * 正方教务 `/cjcx/cjcx_cxXsgrcj.html?doType=query&gnmkdm=N305005`.
+ */
+async function fetchJwGradesJson(jwBaseUrl: string, prefix: string): Promise<unknown> {
+  const endpoints = [
+    `${jwBaseUrl}${prefix}/cjcx/cjcx_cxXsgrcj.html?doType=query&gnmkdm=N305005`,
+    `${jwBaseUrl}${prefix}/cjcx/cjcx_cxDgXscj.html?doType=query&gnmkdm=N305005`,
+  ];
+
+  const body = encodeFormBody({
+    xnm: '',
+    xqm: '',
+    _search: 'false',
+    nd: String(Date.now()),
+    'queryModel.showCount': '5000',
+    'queryModel.currentPage': '1',
+    'queryModel.sortName': '',
+    'queryModel.sortOrder': 'asc',
+    time: '0',
+  });
+
+  for (const endpoint of endpoints) {
+    try {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'User-Agent': DESKTOP_UA,
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          Accept: 'application/json, text/javascript, */*; q=0.01',
+        },
+        body,
+      });
+      if (!resp.ok) continue;
+      const text = await resp.text();
+      if (text.trim().startsWith('{')) {
+        return JSON.parse(text);
+      }
+    } catch {
+      // Try next endpoint
+    }
+  }
+  return { items: [] };
+}
+
+/**
+ * Unconditionally terminate server-side sessions (JWXT + CAS Authserver + WebVPN).
  */
 export async function logoutEphemeralSession(
   jwBaseUrl: string,
@@ -379,6 +451,7 @@ export async function logoutEphemeralSession(
     `${authOrigin}/authserver/logout`,
   ];
   if (isWebVpn) {
+    logoutUrls.push('https://wfw.gdou.edu.cn/authserver/logout');
     logoutUrls.push('https://wfw.gdou.edu.cn/logout');
   }
 
@@ -389,11 +462,11 @@ export async function logoutEphemeralSession(
         await fetch(url, {
           method: 'GET',
           credentials: 'include',
-          headers: { 'User-Agent': MOBILE_UA },
+          headers: { 'User-Agent': DESKTOP_UA },
         });
         anySucceeded = true;
       } catch {
-        // Best-effort server-side session invalidation
+        // Best-effort
       }
     })
   );
@@ -401,133 +474,289 @@ export async function logoutEphemeralSession(
 }
 
 /**
+ * Send MFA verification code (企业微信验证码 `4` or 短信验证码 `3`) when GDOU requires reAuth.
+ */
+export async function requestGdouMfaDynamicCode(
+  mfa: MfaChallengeState,
+  reAuthType: '4' | '3'
+): Promise<string> {
+  const origin = mfa.session.authOrigin;
+  // Switch reAuthType first if needed
+  await fetch(`${origin}/authserver/reAuthCheck/changeReAuthType.do`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'User-Agent': DESKTOP_UA,
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: encodeFormBody({
+      isMultifactor: 'true',
+      reAuthType,
+      service: mfa.serviceUrl,
+    }),
+  }).catch(() => null);
+
+  const authCodeTypeName =
+    reAuthType === '4' ? 'reAuthWChatDynamicCodeType' : 'reAuthDynamicCodeType';
+
+  const resp = await fetch(`${origin}/authserver/dynamicCode/getDynamicCodeByReauth.do`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'User-Agent': DESKTOP_UA,
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: encodeFormBody({
+      userName: mfa.reAuthUserId,
+      authCodeTypeName,
+    }),
+  });
+
+  const data = (await resp.json()) as {
+    res?: string;
+    returnMessage?: string;
+    mobile?: string;
+  };
+  return (
+    [data.returnMessage, data.mobile].filter(Boolean).join(' ') ||
+    (reAuthType === '4' ? '企业微信验证码已发送，请查收' : '短信验证码已发送，请查收')
+  );
+}
+
+/**
+ * Submit MFA dynamic code and complete the one-shot JWXT schedule/exam/grade pull.
+ */
+export async function submitGdouMfaAndCompleteSync(
+  mfa: MfaChallengeState,
+  dynamicCode: string,
+  reAuthType: '4' | '3',
+  termOverride?: SyncTermOverride,
+  onProgress?: (step: string) => void
+): Promise<SyncResult> {
+  const steps = [...mfa.previousSteps];
+  const log = (msg: string) => {
+    steps.push(msg);
+    onProgress?.(msg);
+  };
+
+  try {
+    const origin = mfa.session.authOrigin;
+    const submitResp = await fetch(`${origin}/authserver/reAuthCheck/reAuthSubmit.do`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'User-Agent': DESKTOP_UA,
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: encodeFormBody({
+        service: mfa.serviceUrl,
+        reAuthType,
+        isMultifactor: 'true',
+        password: '',
+        dynamicCode: dynamicCode.trim(),
+        uuid: '',
+        answer1: '',
+        answer2: '',
+        otpCode: '',
+        skipTmpReAuth: 'true',
+      }),
+    });
+
+    const data = (await submitResp.json()) as { code?: string; msg?: string };
+    if (data.code === 'reAuth_failed' || data.code === 'reAuth_unauthorized') {
+      throw new Error(data.msg || '二次认证验证码错误或已过期');
+    }
+    log('4. 多因子二次认证通过，正在激活教务系统票据...');
+
+    await completeCasToJwHandoff(mfa.session);
+    return await pullAllJwDataAndBuildResult(mfa.session, steps, log, termOverride);
+  } finally {
+    await logoutEphemeralSession(
+      mfa.session.jwBaseUrl,
+      mfa.session.authOrigin,
+      mfa.session.isWebVpn
+    );
+    log('8. 服务端会话已注销，本地未写入任何账号/密码/验证码/Cookie（用完即删完成）');
+  }
+}
+
+async function completeCasToJwHandoff(session: PreparedAuthSession): Promise<void> {
+  // 1. Complete CAS service ticket redirect (to wfw.gdou.edu.cn/ off-campus or jw.gdou.edu.cn on-campus)
+  const ticketReqUrl = `${session.authOrigin}/authserver/login?service=${encodeURIComponent(
+    session.serviceUrl
+  )}`;
+  await fetch(ticketReqUrl, {
+    method: 'GET',
+    credentials: 'include',
+    headers: { 'User-Agent': DESKTOP_UA },
+  }).catch(() => null);
+
+  // 2. When off-campus via WebVPN (wfw.gdou.edu.cn), also activate the proxied jw.gdou.edu.cn SSO session
+  if (session.isWebVpn) {
+    await fetch('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'User-Agent': DESKTOP_UA },
+    }).catch(() => null);
+  }
+}
+
+async function pullAllJwDataAndBuildResult(
+  session: PreparedAuthSession,
+  steps: string[],
+  log: (msg: string) => void,
+  termOverride?: SyncTermOverride
+): Promise<SyncResult> {
+  const { prefix, xnm, xqm, termLabel } = await detectJwPrefixAndTerm(
+    session.jwBaseUrl,
+    termOverride
+  );
+  log(`5. 已锁定目标学期：${termLabel} (xnm=${xnm}, xqm=${xqm})`);
+
+  const rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm);
+  const parsedSchedule = parseZfScheduleResponse(rawSchedule);
+  log(`6. 课表解析完成：共 ${parsedSchedule.courses.length} 项教学安排`);
+
+  const rawExams = await fetchJwExamJson(session.jwBaseUrl, prefix, xnm, xqm);
+  const exams = parseZfExamResponse(rawExams);
+
+  const rawGrades = await fetchJwGradesJson(session.jwBaseUrl, prefix);
+  const grades = parseZfGradesResponse(rawGrades);
+  log(`7. 考试与成绩拉取完成：考试 ${exams.length} 场、成绩/学分记录 ${grades.length} 门`);
+
+  return {
+    courses: parsedSchedule.courses,
+    exams,
+    grades,
+    termLabel: parsedSchedule.termLabel || termLabel,
+    academicYear: xnm,
+    semesterCode: xqm,
+    receipt: {
+      syncedAtIso: new Date().toISOString(),
+      mode: 'direct',
+      networkRoute: session.isWebVpn ? 'wfw-webvpn' : 'campus-direct',
+      termLabel: parsedSchedule.termLabel || termLabel,
+      coursesCount: parsedSchedule.courses.length,
+      examsCount: exams.length,
+      gradesCount: grades.length,
+      credentialsPurged: true,
+      sessionLoggedOut: true,
+      steps,
+    },
+  };
+}
+
+/**
  * Step 3 (One-Shot Zero-Retention Sync):
- * Authenticates ONCE using ephemeral credentials, fetches courses & exams,
- * immediately purges credentials from memory, and logs out of all GDOU endpoints.
+ * Authenticates ONCE using ephemeral credentials. If GDOU triggers MFA (`reAuthLoginView.do`),
+ * pauses and returns `{ status: 'mfa_required', mfa }` (while still purging raw password immediately!);
+ * otherwise fetches courses, exams, and grades/GPA and logs out immediately.
  */
 export async function executeOneShotGdouSync(
   session: PreparedAuthSession,
   credentials: EphemeralCredentials,
   termOverride?: SyncTermOverride,
   onProgress?: (step: string) => void
-): Promise<SyncResult> {
+): Promise<OneShotSyncOutcome> {
   const steps: string[] = [];
   const log = (msg: string) => {
     steps.push(msg);
     onProgress?.(msg);
   };
 
-  let sessionLoggedOut = false;
+  let keepSessionForMfa = false;
 
   try {
     log(
       session.isWebVpn
-        ? '1. 已通过 netcheck 自动接入校外微门户反代 (wfw.gdou.edu.cn)'
-        : '1. 已通过 netcheck 自动接入校园网直连通道 (jw.gdou.edu.cn)'
+        ? '1. 已接入广海认证中心与校外微门户通道 (wfw.gdou.edu.cn)'
+        : '1. 已接入广海校园网直连通道 (jw.gdou.edu.cn)'
     );
 
-    if (!session.alreadyLoggedIn) {
-      if (!session.pwdEncryptSalt || !session.execution) {
-        throw new Error('未能获取广海统一身份认证加密盐值，请刷新重试或切换网页同步');
-      }
+    const username = credentials.username.trim();
+    const encryptedPwd = encryptGdouPassword(credentials.password, session.pwdEncryptSalt);
+    const captcha = (credentials.captcha ?? '').trim();
 
-      const username = credentials.username.trim();
-      const encryptedPwd = encryptGdouPassword(credentials.password, session.pwdEncryptSalt);
-      const captcha = (credentials.captcha ?? '').trim();
+    // Immediately wipe raw credentials from caller's object BEFORE network I/O completes
+    purgeEphemeralCredentials(credentials);
+    log('2. 密码已完成本地 AES-128-CBC 加密，明文密码已从内存清除');
 
-      // Immediately wipe raw credentials from the caller's object BEFORE network I/O completes
-      purgeEphemeralCredentials(credentials);
-      log('2. 密码已完成本地 AES-128-CBC 加密，明文凭据已从内存清除');
+    const loginAction = `${session.authOrigin}/authserver/login?service=${encodeURIComponent(
+      session.serviceUrl
+    )}`;
 
-      const loginAction = `${session.authOrigin}/authserver/login?service=${encodeURIComponent(
-        session.serviceUrl
-      )}`;
+    const loginResp = await fetch(loginAction, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'User-Agent': DESKTOP_UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: session.authOrigin,
+        Referer: session.entryFinalUrl,
+      },
+      body: encodeFormBody({
+        username,
+        password: encryptedPwd,
+        captcha,
+        _eventId: 'submit',
+        cllt: 'userNameLogin',
+        dllt: 'generalLogin',
+        lt: session.lt,
+        execution: session.execution,
+      }),
+    });
 
-      const loginResp = await fetch(loginAction, {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'User-Agent': MOBILE_UA,
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Origin: session.authOrigin,
-          Referer: session.entryFinalUrl,
+    const loginFinalUrl = loginResp.url || '';
+    const loginHtml = await loginResp.text();
+
+    // Check if GDOU redirected to Multi-Factor Re-Authentication (reAuthLoginView.do)
+    if (
+      loginFinalUrl.includes('reAuthLoginView.do') ||
+      loginHtml.includes('reAuthParams') ||
+      loginHtml.includes('多因子认证')
+    ) {
+      keepSessionForMfa = true;
+      const userIdMatch = loginHtml.match(/"reAuthUserId"\s*:\s*"([^"]+)"/);
+      const typeMatch = loginHtml.match(/"reAuthType"\s*:\s*"([34])"/);
+      log('3. 账号密码验证通过！广海安全策略要求首次设备完成多因子验证码校验');
+      return {
+        status: 'mfa_required',
+        mfa: {
+          required: true,
+          reAuthUserId: userIdMatch ? userIdMatch[1] : username,
+          serviceUrl: session.serviceUrl,
+          defaultReAuthType: (typeMatch?.[1] as '4' | '3') || '4',
+          session,
+          previousSteps: steps,
         },
-        body: encodeFormBody({
-          username,
-          password: encryptedPwd,
-          captcha,
-          _eventId: 'submit',
-          cllt: 'userNameLogin',
-          dllt: 'generalLogin',
-          lt: session.lt,
-          execution: session.execution,
-        }),
-      });
-
-      const loginHtml = await loginResp.text();
-      if (loginHtml.includes('pwdEncryptSalt') && loginHtml.includes('pwdFromId')) {
-        const errTip = extractAuthError(loginHtml);
-        throw new Error(errTip || '学号、密码或验证码错误，请核对后重试');
-      }
-      log('3. 广海统一身份认证通过，已建立一次性教务临时会话');
-    } else {
-      purgeEphemeralCredentials(credentials);
-      log('2. 检测到临时会话已就绪，跳过重复认证并清除输入缓存');
+      };
     }
 
-    const { prefix, xnm, xqm, termLabel } = await detectJwPrefixAndTerm(
-      session.jwBaseUrl,
-      termOverride
-    );
-    log(`4. 已锁定目标学期：${termLabel} (xnm=${xnm}, xqm=${xqm})`);
+    if (loginHtml.includes('pwdEncryptSalt') && (loginHtml.includes('pwdFromId') || loginHtml.includes('loginFromId'))) {
+      const errTip = extractAuthError(loginHtml);
+      throw new Error(errTip || '学号、密码或验证码错误，请核对后重试');
+    }
 
-    const rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm);
-    const parsedSchedule = parseZfScheduleResponse(rawSchedule);
-    log(`5. 课表解析完成：共 ${parsedSchedule.courses.length} 门/节教学安排`);
-
-    const rawExams = await fetchJwExamJson(session.jwBaseUrl, prefix, xnm, xqm);
-    const exams = parseZfExamResponse(rawExams);
-    log(`6. 考试安排拉取完成：共 ${exams.length} 场考试`);
-
-    return {
-      courses: parsedSchedule.courses,
-      exams,
-      termLabel: parsedSchedule.termLabel || termLabel,
-      academicYear: xnm,
-      semesterCode: xqm,
-      receipt: {
-        syncedAtIso: new Date().toISOString(),
-        mode: 'direct',
-        networkRoute: session.isWebVpn ? 'wfw-webvpn' : 'campus-direct',
-        termLabel: parsedSchedule.termLabel || termLabel,
-        coursesCount: parsedSchedule.courses.length,
-        examsCount: exams.length,
-        credentialsPurged: true,
-        sessionLoggedOut: true, // finalized in finally block
-        steps,
-      },
-    };
+    log('3. 广海统一身份认证通过，已建立一次性教务临时会话');
+    await completeCasToJwHandoff(session);
+    const result = await pullAllJwDataAndBuildResult(session, steps, log, termOverride);
+    return { status: 'completed', result };
   } finally {
-    // UNCONDITIONAL SELF-DESTRUCT: wipe credentials & log out even on error
     purgeEphemeralCredentials(credentials);
-    sessionLoggedOut = await logoutEphemeralSession(
-      session.jwBaseUrl,
-      session.authOrigin,
-      session.isWebVpn
-    );
-    log(
-      sessionLoggedOut
-        ? '7. 服务端会话已注销，本地未写入任何账号/密码/Cookie（用完即删完成）'
-        : '7. 已完成本地凭据销毁与临时会话清理（0 字节凭据落盘）'
-    );
+    if (!keepSessionForMfa) {
+      await logoutEphemeralSession(session.jwBaseUrl, session.authOrigin, session.isWebVpn);
+      log('8. 服务端会话已注销，本地未写入任何账号/密码/Cookie（用完即删完成）');
+    }
   }
 }
 
 /**
- * Builds the injected JS snippet for Mode B (Incognito Ephemeral WebView).
- * Once the user finishes login on GDOU's official page (supports captcha/SMS/QR),
- * this script fetches schedule & exams from the authenticated JWXT origin,
- * posts pure JSON back to React Native, and immediately triggers logout.
+ * Injected JS for Mode B (Incognito Ephemeral WebView).
+ * Pulls schedule, exams, AND grades/GPA/credits from the authenticated JWXT origin,
+ * posts pure JSON back to React Native, and immediately logs out.
  */
 export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): string {
   const overrideXnm = JSON.stringify(override?.xnm ?? '');
@@ -538,7 +767,10 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
       if (window.__GDOU_SYNC_RUNNING__) return;
       var href = String(window.location.href || '');
       var html = String(document.documentElement ? document.documentElement.innerHTML : '');
-      var isAuthPage = html.indexOf('pwdEncryptSalt') !== -1 || href.indexOf('/authserver/login') !== -1;
+      var isAuthPage =
+        html.indexOf('pwdEncryptSalt') !== -1 ||
+        href.indexOf('/authserver/login') !== -1 ||
+        href.indexOf('reAuthLoginView') !== -1;
       var isJwHost = href.indexOf('jw.gdou.edu.cn') !== -1;
       if (!isJwHost || isAuthPage) return;
 
@@ -551,7 +783,6 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
       }
 
       function computeJwRoot() {
-        var idx = href.indexOf('https://jw.gdou.edu.cn');
         if (href.indexOf('wfw.gdou.edu.cn') !== -1) {
           return 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn';
         }
@@ -560,11 +791,10 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
 
       async function run() {
         try {
-          post({ type: 'PROGRESS', message: '检测到教务登录成功，正在无痕提取课表与考试...' });
+          post({ type: 'PROGRESS', message: '检测到教务登录成功，正在无痕提取课表、考试与绩点学分...' });
           var root = computeJwRoot();
           var prefix = href.indexOf('/jwglxt/') !== -1 ? '/jwglxt' : '';
 
-          // Detect current term from xskbcx index page
           var xnm = ${overrideXnm};
           var xqm = ${overrideXqm};
           var prefixesToTry = prefix ? [prefix, ''] : ['', '/jwglxt'];
@@ -637,7 +867,35 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
             } catch (e) {}
           }
 
-          // Immediately invalidate server session inside the ephemeral WebView
+          post({ type: 'PROGRESS', message: '正在拉取全部学期成绩、绩点与学分...' });
+          var gradeJson = { items: [] };
+          var gradeUrls = [
+            root + prefix + '/cjcx/cjcx_cxXsgrcj.html?doType=query&gnmkdm=N305005',
+            root + prefix + '/cjcx/cjcx_cxDgXscj.html?doType=query&gnmkdm=N305005'
+          ];
+          for (var g = 0; g < gradeUrls.length; g++) {
+            try {
+              var grResp = await fetch(gradeUrls[g], {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                  'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: 'xnm=&xqm=&_search=false&queryModel.showCount=5000&queryModel.currentPage=1&time=0'
+              });
+              if (!grResp.ok) continue;
+              var grText = await grResp.text();
+              if (grText.trim().charAt(0) === '{') {
+                var grParsed = JSON.parse(grText);
+                if ((grParsed.items && grParsed.items.length > 0) || (grParsed.rows && grParsed.rows.length > 0)) {
+                  gradeJson = grParsed;
+                  break;
+                }
+              }
+            } catch (e) {}
+          }
+
           try { await fetch(root + prefix + '/logout', { credentials: 'include' }); } catch (e) {}
           try {
             var authLogout = href.indexOf('wfw.gdou.edu.cn') !== -1
@@ -651,7 +909,8 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
             xnm: xnm,
             xqm: xqm,
             scheduleRaw: kbJson,
-            examRaw: examJson
+            examRaw: examJson,
+            gradeRaw: gradeJson
           });
         } catch (err) {
           window.__GDOU_SYNC_RUNNING__ = false;

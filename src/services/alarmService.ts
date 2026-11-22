@@ -17,26 +17,30 @@ export const ALARM_CHANNEL_ID = 'gdou-alarm-channel';
  * Configure foreground notification behavior & Android high-priority alarm channel.
  */
 export async function initializeAlarmEngine(): Promise<void> {
-  Notifications.setNotificationHandler({
-    handleNotification: async () => ({
-      shouldPlaySound: true,
-      shouldSetBadge: true,
-      shouldShowBanner: true,
-      shouldShowList: true,
-    }),
-  });
-
-  if (Platform.OS === 'android') {
-    await Notifications.setNotificationChannelAsync(ALARM_CHANNEL_ID, {
-      name: '广海课表与考试闹钟',
-      description: '高优先级课前提醒、每日首课起床闹钟及考试倒计时提醒',
-      importance: Notifications.AndroidImportance.MAX,
-      sound: 'default',
-      vibrationPattern: [0, 400, 200, 400, 200, 600],
-      enableVibrate: true,
-      bypassDnd: true,
-      lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+  try {
+    Notifications.setNotificationHandler({
+      handleNotification: async () => ({
+        shouldPlaySound: true,
+        shouldSetBadge: true,
+        shouldShowBanner: true,
+        shouldShowList: true,
+      }),
     });
+
+    if (Platform.OS === 'android') {
+      await Notifications.setNotificationChannelAsync(ALARM_CHANNEL_ID, {
+        name: '海大课表与考试闹钟',
+        description: '高优先级课前提醒、每日首课起床闹钟及考试倒计时提醒',
+        importance: Notifications.AndroidImportance.MAX,
+        sound: 'default',
+        vibrationPattern: [0, 400, 200, 400, 200, 600],
+        enableVibrate: true,
+        bypassDnd: true,
+        lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+      });
+    }
+  } catch {
+    // Guard against ROM-specific notification channel initialization errors on startup
   }
 }
 

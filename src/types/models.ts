@@ -41,6 +41,34 @@ export interface ExamItem {
   isManual?: boolean;
 }
 
+export interface GradeItem {
+  id: string;
+  courseName: string;
+  courseCode: string;
+  academicYear: string; // e.g. "2025-2026"
+  semester: string; // "1" | "2" | "3"
+  termKey: string; // e.g. "2025-2026 第1学期"
+  credit: number; // xf
+  scoreText: string; // cj raw text ("92", "优秀", "合格")
+  numericScore: number | null; // bfzcj or converted numeric score
+  gpa: number; // jd
+  courseCategory: string; // kclbmc / kcxzmc e.g. "必修课", "专业核心课", "通识选修课"
+  examNature: string; // ksxz e.g. "正常考试", "补考一", "重修"
+  teacher: string;
+  passed: boolean;
+}
+
+export interface GpaSummary {
+  totalCreditsEarned: number;
+  totalCreditsAttempted: number;
+  weightedGpa: number;
+  requiredGpa: number;
+  weightedAvgScore: number;
+  totalCourses: number;
+  passedCourses: number;
+  byCategory: { category: string; credits: number; count: number }[];
+}
+
 export type AlarmKind = 'class' | 'morning_wakeup' | 'exam';
 
 export interface AlarmRule {
@@ -76,6 +104,7 @@ export interface SyncReceipt {
   termLabel: string;
   coursesCount: number;
   examsCount: number;
+  gradesCount: number;
   credentialsPurged: true;
   sessionLoggedOut: boolean;
   steps: string[];
@@ -89,9 +118,10 @@ export interface PersistedAppData {
   schemaVersion: number;
   courses: CourseItem[];
   exams: ExamItem[];
+  grades: GradeItem[];
   alarms: AlarmRule[];
   termLabel: string;
-  academicYear: string; // e.g. "2026"
+  academicYear: string; // e.g. "2025"
   semesterCode: string; // "3" (秋/第一学期) | "12" (春/第二学期) | "16" (第三学期)
   lastSyncedAt: string | null;
   lastSyncReceipt: SyncReceipt | null;

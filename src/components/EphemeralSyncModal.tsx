@@ -23,10 +23,15 @@ import {
   checkGdouCaptcha,
   executeOneShotGdouSync,
   fetchGdouCaptchaImage,
+  logoutEphemeralSession,
+  MfaChallengeState,
   PreparedAuthSession,
   prepareGdouAuthSession,
+  requestGdouMfaDynamicCode,
+  submitGdouMfaAndCompleteSync,
   SyncResult,
 } from '../services/gdouAuth';
+import { parseZfGradesResponse } from '../services/gradeParser';
 import { parseZfScheduleResponse } from '../services/scheduleParser';
 import { COLORS } from '../theme/colors';
 import { EphemeralCredentials } from '../types/models';
@@ -54,17 +59,25 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const [statusLog, setStatusLog] = useState<string[]>([]);
   const [errorText, setErrorText] = useState<string | null>(null);
 
-  // Optional semester override (empty = auto-detect from JWXT)
+  // MFA secondary verification state (企业微信验证码 '4' or 短信验证码 '3')
+  const [mfaChallenge, setMfaChallenge] = useState<MfaChallengeState | null>(null);
+  const [mfaType, setMfaType] = useState<'4' | '3'>('4');
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaHint, setMfaHint] = useState<string | null>(null);
+  const [sendingMfaCode, setSendingMfaCode] = useState(false);
+
+  // Optional semester override
   const [customTermOpen, setCustomTermOpen] = useState(false);
   const [xnmOverride, setXnmOverride] = useState('');
   const [xqmOverride, setXqmOverride] = useState('');
 
   // WebView ephemeral state
   const [webViewKey, setWebViewKey] = useState(0);
-  const [webViewStatus, setWebViewStatus] = useState('请在下方广海官方认证页完成登录，登录成功后将自动提取课表与考试并销毁页面');
+  const [webViewStatus, setWebViewStatus] = useState(
+    '请在下方海大官方认证页完成登录（支持短信/企业微信验证码），登录成功后将自动提取课表、考试与绩点学分并销毁页面'
+  );
   const webViewRef = useRef<WebView<object> | null>(null);
 
-  // Unconditionally wipe all credential inputs whenever the modal opens or closes
   const wipeFormInputs = () => {
     setUsername('');
     setPassword('');
@@ -72,19 +85,30 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     setShowPassword(false);
     setNeedCaptcha(false);
     setCaptchaUri(undefined);
+    setMfaCode('');
+    setMfaHint(null);
   };
 
   useEffect(() => {
     if (visible) {
       setErrorText(null);
       setStatusLog([]);
+      setMfaChallenge(null);
       if (mode === 'direct') {
         void initDirectSession();
       } else {
         setWebViewKey((k) => k + 1);
       }
     } else {
+      if (mfaChallenge) {
+        void logoutEphemeralSession(
+          mfaChallenge.session.jwBaseUrl,
+          mfaChallenge.session.authOrigin,
+          mfaChallenge.session.isWebVpn
+        );
+      }
       wipeFormInputs();
+      setMfaChallenge(null);
       setSession(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -98,7 +122,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setSession(prepared);
     } catch (err) {
       setErrorText(
-        `无法连接广海教务入口 (${GDOU_ENTRY_URL})：${
+        `无法连接海大教务入口 (${GDOU_ENTRY_URL})：${
           err instanceof Error ? err.message : String(err)
         }`
       );
@@ -144,7 +168,6 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setPreparing(false);
     }
 
-    // Snapshot into ephemeral object, then IMMEDIATELY clear React input state
     const ephemeral: EphemeralCredentials = {
       username: username.trim(),
       password,
@@ -157,7 +180,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     setStatusLog([]);
 
     try {
-      const result = await executeOneShotGdouSync(
+      const outcome = await executeOneShotGdouSync(
         activeSession,
         ephemeral,
         xnmOverride || xqmOverride
@@ -165,16 +188,66 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           : undefined,
         (step) => setStatusLog((prev) => [...prev, step])
       );
-      onSyncSuccess(result);
+
+      if (outcome.status === 'mfa_required') {
+        setMfaChallenge(outcome.mfa);
+        setMfaType(outcome.mfa.defaultReAuthType);
+        setMfaHint('海大统一认证检测到新设备登录，请选择「企业微信验证码」或「短信验证码」点击获取');
+        return;
+      }
+
+      onSyncSuccess(outcome.result);
       onClose();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorText(msg);
-      // Prepare fresh salt/execution for next attempt (CAS execution token is single-use)
       void initDirectSession();
     } finally {
       purgeEphemeralCredentials(ephemeral);
-      wipeFormInputs();
+      setSyncing(false);
+    }
+  };
+
+  const handleSendMfaCode = async () => {
+    if (!mfaChallenge) return;
+    setSendingMfaCode(true);
+    setErrorText(null);
+    try {
+      const msg = await requestGdouMfaDynamicCode(mfaChallenge, mfaType);
+      setMfaHint(msg);
+    } catch (err) {
+      setErrorText(`发送验证码失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSendingMfaCode(false);
+    }
+  };
+
+  const handleSubmitMfaCode = async () => {
+    if (!mfaChallenge || !mfaCode.trim()) {
+      setErrorText('请输入收到的 6 位动态验证码');
+      return;
+    }
+    const codeSnapshot = mfaCode.trim();
+    setMfaCode('');
+    setSyncing(true);
+    setErrorText(null);
+
+    try {
+      const result = await submitGdouMfaAndCompleteSync(
+        mfaChallenge,
+        codeSnapshot,
+        mfaType,
+        xnmOverride || xqmOverride
+          ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
+          : undefined,
+        (step) => setStatusLog((prev) => [...prev, step])
+      );
+      setMfaChallenge(null);
+      onSyncSuccess(result);
+      onClose();
+    } catch (err) {
+      setErrorText(err instanceof Error ? err.message : String(err));
+    } finally {
       setSyncing(false);
     }
   };
@@ -188,6 +261,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         xqm?: string;
         scheduleRaw?: unknown;
         examRaw?: unknown;
+        gradeRaw?: unknown;
       };
 
       if (data.type === 'PROGRESS' && data.message) {
@@ -203,6 +277,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       if (data.type === 'SYNC_COMPLETE') {
         const parsedSchedule = parseZfScheduleResponse(data.scheduleRaw);
         const parsedExams = parseZfExamResponse(data.examRaw);
+        const parsedGrades = parseZfGradesResponse(data.gradeRaw);
         const derived = deriveCurrentTermParams();
         const xnm = data.xnm || derived.xnm;
         const xqm = data.xqm || derived.xqm;
@@ -215,6 +290,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         const result: SyncResult = {
           courses: parsedSchedule.courses,
           exams: parsedExams,
+          grades: parsedGrades,
           termLabel: parsedSchedule.termLabel || fallbackLabel,
           academicYear: xnm,
           semesterCode: xqm,
@@ -225,23 +301,23 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
             termLabel: parsedSchedule.termLabel || fallbackLabel,
             coursesCount: parsedSchedule.courses.length,
             examsCount: parsedExams.length,
+            gradesCount: parsedGrades.length,
             credentialsPurged: true,
             sessionLoggedOut: true,
             steps: [
-              '1. 已在独立无痕沙箱 (incognito WebView) 打开广海教务入口',
+              '1. 已在独立无痕沙箱 (incognito WebView) 打开海大教务入口',
               '2. 用户通过官方统一身份认证完成一次性验证',
-              `3. 同源拉取课表 ${parsedSchedule.courses.length} 项、考试 ${parsedExams.length} 场`,
+              `3. 同源拉取课表 ${parsedSchedule.courses.length} 项、考试 ${parsedExams.length} 场、成绩 ${parsedGrades.length} 门`,
               '4. 已向教务与认证中心发起注销并立即销毁无痕 WebView 容器（0 字节凭据落盘）',
             ],
           },
         };
 
-        // Immediately destroy WebView and pass pure schedule/exam data upward
         onSyncSuccess(result);
         onClose();
       }
     } catch {
-      // Ignore non-JSON messages from page scripts
+      // Ignore non-JSON messages
     }
   };
 
@@ -269,8 +345,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         {/* Header */}
         <View style={styles.header}>
           <View>
-            <Text style={styles.headerTitle}>无痕同步广海教务</Text>
-            <Text style={styles.headerSub}>netcheck.gdou.edu.cn/go.php?code=jw</Text>
+            <Text style={styles.headerTitle}>无痕同步海大教务</Text>
+            <Text style={styles.headerSub}>课表 · 考试 · 绩点 · 学分 一键拉取</Text>
           </View>
           <TouchableOpacity onPress={handleClose} style={styles.closeBtn} hitSlop={10}>
             <Ionicons name="close" size={24} color={COLORS.textSecondary} />
@@ -283,7 +359,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           <View style={styles.privacyTextWrap}>
             <Text style={styles.privacyTitle}>凭据用完即删 · 零留存保护已开启</Text>
             <Text style={styles.privacyDesc}>
-              账号和密码仅在点击拉取的瞬间用于广海官方认证，拉取完成后立即注销服务端会话并清除内存，绝不保存任何账号、密码或 Cookie。
+              账号和密码仅在点击拉取的瞬间用于海大官方认证，拉取完成后立即注销服务端会话并清除内存，绝不保存任何账号、密码或 Cookie。
             </Text>
           </View>
         </View>
@@ -332,128 +408,215 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                   <Ionicons name="checkmark-circle" size={18} color={COLORS.emerald} />
                   <Text style={styles.routeText}>
                     {session.isWebVpn
-                      ? '已接入校外微门户安全通道 (wfw.gdou.edu.cn)'
-                      : '已接入校园网直连通道 (authserver.gdou.edu.cn)'}
+                      ? '已接入海大认证中心与校外微门户通道 (wfw.gdou.edu.cn)'
+                      : '已接入海大校园网直连通道 (authserver.gdou.edu.cn)'}
                   </Text>
                 </View>
               ) : (
                 <TouchableOpacity onPress={initDirectSession} style={styles.rowCenter}>
                   <Ionicons name="refresh" size={18} color={COLORS.coral} />
                   <Text style={[styles.routeText, { color: COLORS.coral }]}>
-                    点击重新连接广海认证入口
+                    点击重新连接海大认证入口
                   </Text>
                 </TouchableOpacity>
               )}
             </View>
 
-            {/* Credentials Form (autoComplete off + never persisted) */}
-            <Text style={styles.fieldLabel}>学号 / 统一身份认证账号</Text>
-            <View style={styles.inputRow}>
-              <Ionicons name="person-outline" size={18} color={COLORS.textMuted} />
-              <TextInput
-                style={styles.input}
-                placeholder="请输入广东海洋大学学号"
-                placeholderTextColor={COLORS.textMuted}
-                value={username}
-                onChangeText={setUsername}
-                onBlur={handleUsernameBlur}
-                autoCapitalize="none"
-                autoCorrect={false}
-                autoComplete="off"
-                textContentType="none"
-                editable={!syncing}
-              />
-            </View>
+            {mfaChallenge ? (
+              /* MFA Secondary Verification Step */
+              <View style={styles.mfaBox}>
+                <Text style={styles.mfaTitle}>🔐 海大多因子二次认证（账号：{mfaChallenge.reAuthUserId}）</Text>
+                <Text style={styles.mfaSub}>
+                  您的密码已验证通过并从内存销毁。首次设备登录教务需验证一次动态码：
+                </Text>
 
-            <Text style={styles.fieldLabel}>统一身份认证密码（仅本次使用）</Text>
-            <View style={styles.inputRow}>
-              <Ionicons name="lock-closed-outline" size={18} color={COLORS.textMuted} />
-              <TextInput
-                style={styles.input}
-                placeholder="请输入统一身份认证密码"
-                placeholderTextColor={COLORS.textMuted}
-                value={password}
-                onChangeText={setPassword}
-                secureTextEntry={!showPassword}
-                autoCapitalize="none"
-                autoCorrect={false}
-                autoComplete="off"
-                textContentType="none"
-                editable={!syncing}
-              />
-              <TouchableOpacity onPress={() => setShowPassword((v) => !v)} hitSlop={8}>
-                <Ionicons
-                  name={showPassword ? 'eye-off-outline' : 'eye-outline'}
-                  size={20}
-                  color={COLORS.textSecondary}
-                />
-              </TouchableOpacity>
-            </View>
+                <View style={styles.mfaTypeRow}>
+                  <TouchableOpacity
+                    style={[styles.mfaTypeChip, mfaType === '4' && styles.mfaTypeChipActive]}
+                    onPress={() => setMfaType('4')}
+                  >
+                    <Text style={[styles.mfaTypeText, mfaType === '4' && styles.mfaTypeTextActive]}>
+                      企业微信验证码
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.mfaTypeChip, mfaType === '3' && styles.mfaTypeChipActive]}
+                    onPress={() => setMfaType('3')}
+                  >
+                    <Text style={[styles.mfaTypeText, mfaType === '3' && styles.mfaTypeTextActive]}>
+                      手机短信验证码
+                    </Text>
+                  </TouchableOpacity>
+                </View>
 
-            {needCaptcha && (
-              <View style={styles.captchaBox}>
-                <Text style={styles.fieldLabel}>图形验证码</Text>
                 <View style={styles.captchaRow}>
-                  <TextInput
-                    style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}
-                    placeholder="输入右侧验证码"
-                    placeholderTextColor={COLORS.textMuted}
-                    value={captcha}
-                    onChangeText={setCaptcha}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                  />
-                  <TouchableOpacity onPress={handleRefreshCaptcha} style={styles.captchaImgWrap}>
-                    {captchaUri ? (
-                      <Image source={{ uri: captchaUri }} style={styles.captchaImg} resizeMode="contain" />
+                  <View style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}>
+                    <Ionicons name="keypad-outline" size={18} color={COLORS.textMuted} />
+                    <TextInput
+                      style={styles.input}
+                      placeholder="输入 6 位动态验证码"
+                      placeholderTextColor={COLORS.textMuted}
+                      keyboardType="number-pad"
+                      value={mfaCode}
+                      onChangeText={setMfaCode}
+                      maxLength={8}
+                    />
+                  </View>
+                  <TouchableOpacity
+                    style={styles.sendCodeBtn}
+                    onPress={handleSendMfaCode}
+                    disabled={sendingMfaCode}
+                  >
+                    {sendingMfaCode ? (
+                      <ActivityIndicator size="small" color={COLORS.white} />
                     ) : (
-                      <Text style={styles.captchaReload}>刷新</Text>
+                      <Text style={styles.sendCodeText}>获取验证码</Text>
                     )}
                   </TouchableOpacity>
                 </View>
+
+                {mfaHint && <Text style={styles.mfaHintText}>{mfaHint}</Text>}
+
+                <TouchableOpacity
+                  style={[styles.primaryBtn, syncing && styles.primaryBtnDisabled]}
+                  disabled={syncing}
+                  onPress={handleSubmitMfaCode}
+                >
+                  {syncing ? (
+                    <ActivityIndicator color={COLORS.white} />
+                  ) : (
+                    <>
+                      <Ionicons name="checkmark-done-outline" size={20} color={COLORS.white} />
+                      <Text style={styles.primaryBtnText}>验证并同步课表 / 考试 / 绩点学分</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
               </View>
-            )}
-
-            {/* Optional Term Override */}
-            <TouchableOpacity
-              style={styles.termToggle}
-              onPress={() => setCustomTermOpen((v) => !v)}
-            >
-              <Text style={styles.termToggleText}>
-                {customTermOpen ? '收起指定学年学期（默认自动识别当前学期）' : '高级选项：手动指定学年 / 学期'}
-              </Text>
-              <Ionicons
-                name={customTermOpen ? 'chevron-up' : 'chevron-down'}
-                size={16}
-                color={COLORS.oceanPrimary}
-              />
-            </TouchableOpacity>
-
-            {customTermOpen && (
-              <View style={styles.termRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.miniLabel}>学年起始年（如 2026）</Text>
+            ) : (
+              <>
+                <Text style={styles.fieldLabel}>学号 / 统一身份认证账号</Text>
+                <View style={styles.inputRow}>
+                  <Ionicons name="person-outline" size={18} color={COLORS.textMuted} />
                   <TextInput
-                    style={styles.miniInput}
-                    placeholder="自动"
+                    style={styles.input}
+                    placeholder="请输入广东海洋大学学号"
                     placeholderTextColor={COLORS.textMuted}
-                    keyboardType="number-pad"
-                    value={xnmOverride}
-                    onChangeText={setXnmOverride}
+                    value={username}
+                    onChangeText={setUsername}
+                    onBlur={handleUsernameBlur}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoComplete="off"
+                    textContentType="none"
+                    editable={!syncing}
                   />
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.miniLabel}>学期（3=秋 / 12=春）</Text>
+
+                <Text style={styles.fieldLabel}>统一身份认证密码（仅本次使用）</Text>
+                <View style={styles.inputRow}>
+                  <Ionicons name="lock-closed-outline" size={18} color={COLORS.textMuted} />
                   <TextInput
-                    style={styles.miniInput}
-                    placeholder="自动"
+                    style={styles.input}
+                    placeholder="请输入统一身份认证密码"
                     placeholderTextColor={COLORS.textMuted}
-                    keyboardType="number-pad"
-                    value={xqmOverride}
-                    onChangeText={setXqmOverride}
+                    value={password}
+                    onChangeText={setPassword}
+                    secureTextEntry={!showPassword}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoComplete="off"
+                    textContentType="none"
+                    editable={!syncing}
                   />
+                  <TouchableOpacity onPress={() => setShowPassword((v) => !v)} hitSlop={8}>
+                    <Ionicons
+                      name={showPassword ? 'eye-off-outline' : 'eye-outline'}
+                      size={20}
+                      color={COLORS.textSecondary}
+                    />
+                  </TouchableOpacity>
                 </View>
-              </View>
+
+                {needCaptcha && (
+                  <View style={styles.captchaBox}>
+                    <Text style={styles.fieldLabel}>图形验证码</Text>
+                    <View style={styles.captchaRow}>
+                      <TextInput
+                        style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}
+                        placeholder="输入右侧验证码"
+                        placeholderTextColor={COLORS.textMuted}
+                        value={captcha}
+                        onChangeText={setCaptcha}
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                      />
+                      <TouchableOpacity onPress={handleRefreshCaptcha} style={styles.captchaImgWrap}>
+                        {captchaUri ? (
+                          <Image source={{ uri: captchaUri }} style={styles.captchaImg} resizeMode="contain" />
+                        ) : (
+                          <Text style={styles.captchaReload}>刷新</Text>
+                        )}
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={styles.termToggle}
+                  onPress={() => setCustomTermOpen((v) => !v)}
+                >
+                  <Text style={styles.termToggleText}>
+                    {customTermOpen ? '收起指定学年学期（默认自动识别当前学期）' : '高级选项：手动指定学年 / 学期'}
+                  </Text>
+                  <Ionicons
+                    name={customTermOpen ? 'chevron-up' : 'chevron-down'}
+                    size={16}
+                    color={COLORS.oceanPrimary}
+                  />
+                </TouchableOpacity>
+
+                {customTermOpen && (
+                  <View style={styles.termRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.miniLabel}>学年起始年（如 2025）</Text>
+                      <TextInput
+                        style={styles.miniInput}
+                        placeholder="自动"
+                        placeholderTextColor={COLORS.textMuted}
+                        keyboardType="number-pad"
+                        value={xnmOverride}
+                        onChangeText={setXnmOverride}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.miniLabel}>学期（3=秋 / 12=春）</Text>
+                      <TextInput
+                        style={styles.miniInput}
+                        placeholder="自动"
+                        placeholderTextColor={COLORS.textMuted}
+                        keyboardType="number-pad"
+                        value={xqmOverride}
+                        onChangeText={setXqmOverride}
+                      />
+                    </View>
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={[styles.primaryBtn, (syncing || preparing) && styles.primaryBtnDisabled]}
+                  disabled={syncing || preparing}
+                  onPress={handleDirectSync}
+                >
+                  {syncing ? (
+                    <ActivityIndicator color={COLORS.white} />
+                  ) : (
+                    <>
+                      <Ionicons name="cloud-download-outline" size={20} color={COLORS.white} />
+                      <Text style={styles.primaryBtnText}>立即拉取课表 / 考试 / 绩点学分</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </>
             )}
 
             {errorText && (
@@ -474,24 +637,9 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               </View>
             )}
 
-            <TouchableOpacity
-              style={[styles.primaryBtn, (syncing || preparing) && styles.primaryBtnDisabled]}
-              disabled={syncing || preparing}
-              onPress={handleDirectSync}
-            >
-              {syncing ? (
-                <ActivityIndicator color={COLORS.white} />
-              ) : (
-                <>
-                  <Ionicons name="cloud-download-outline" size={20} color={COLORS.white} />
-                  <Text style={styles.primaryBtnText}>立即拉取课表与考试（用完即删）</Text>
-                </>
-              )}
-            </TouchableOpacity>
-
             <TouchableOpacity style={styles.fallbackHint} onPress={() => setMode('webview')}>
               <Text style={styles.fallbackHintText}>
-                遇到滑块验证、微信扫码或短信动态码？切换「官方无痕网页同步」 →
+                也可切换「官方无痕网页同步」在海大原网页内完成登录 →
               </Text>
             </TouchableOpacity>
           </ScrollView>
@@ -640,6 +788,69 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
     flex: 1,
   },
+  mfaBox: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: COLORS.oceanPrimary,
+    marginBottom: 12,
+    gap: 10,
+  },
+  mfaTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+  },
+  mfaSub: {
+    fontSize: 12.5,
+    color: COLORS.textSecondary,
+    lineHeight: 18,
+  },
+  mfaTypeRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  mfaTypeChip: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bg,
+    alignItems: 'center',
+  },
+  mfaTypeChipActive: {
+    backgroundColor: COLORS.oceanLight,
+    borderColor: COLORS.oceanPrimary,
+  },
+  mfaTypeText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  mfaTypeTextActive: {
+    color: COLORS.oceanPrimary,
+    fontWeight: '700',
+  },
+  sendCodeBtn: {
+    backgroundColor: COLORS.coral,
+    paddingHorizontal: 14,
+    height: 48,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sendCodeText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
+  mfaHintText: {
+    fontSize: 12,
+    color: COLORS.emerald,
+    fontWeight: '600',
+  },
   fieldLabel: {
     fontSize: 13,
     fontWeight: '600',
@@ -731,8 +942,8 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.dangerLight,
     padding: 12,
     borderRadius: 10,
-    marginTop: 6,
-    marginBottom: 10,
+    marginTop: 10,
+    marginBottom: 6,
   },
   errorText: {
     flex: 1,
@@ -744,8 +955,8 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.oceanTint,
     borderRadius: 10,
     padding: 12,
-    marginTop: 6,
-    marginBottom: 12,
+    marginTop: 10,
+    marginBottom: 8,
     borderWidth: 1,
     borderColor: COLORS.oceanLight,
   },

@@ -87,11 +87,24 @@ export const SettingsScreen: React.FC<Props> = ({
   return (
     <View style={styles.root}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>设置与零留存审计</Text>
-        <Text style={styles.headerSub}>广东海洋大学作息校历 · 隐私核验</Text>
+        <Text style={styles.headerTitle}>设置与关于</Text>
+        <Text style={styles.headerSub}>海大课表 · 作息校历 · 隐私核验 · powered by 种果仁</Text>
       </View>
 
       <ScrollView contentContainerStyle={styles.content}>
+        {/* About Card: 海大课表 · powered by 种果仁 */}
+        <View style={styles.aboutCard}>
+          <View style={styles.aboutBadge}>
+            <Ionicons name="school" size={24} color={COLORS.white} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.aboutAppName}>海大课表</Text>
+            <Text style={styles.aboutPowered}>powered by 种果仁</Text>
+            <Text style={styles.aboutDesc}>
+              专为广东海洋大学学子打造 · 支持课表、考试、绩点、学分查询、系统日历写入与智能早起闹钟（账号密码用完即删）
+            </Text>
+          </View>
+        </View>
         {/* Privacy Zero-Retention Audit Card */}
         <View style={[styles.card, styles.auditCard]}>
           <View style={styles.cardHeader}>
@@ -233,8 +246,13 @@ export const SettingsScreen: React.FC<Props> = ({
         {/* Danger Zone */}
         <TouchableOpacity style={styles.clearBtn} onPress={handleConfirmClear}>
           <Ionicons name="trash-outline" size={18} color={COLORS.danger} />
-          <Text style={styles.clearBtnText}>清空本地全部课表、考试与闹钟数据</Text>
+          <Text style={styles.clearBtnText}>清空本地全部课表、考试、成绩与闹钟数据</Text>
         </TouchableOpacity>
+
+        <View style={styles.footerAbout}>
+          <Text style={styles.footerTitle}>海大课表 v1.1.0</Text>
+          <Text style={styles.footerPowered}>powered by 种果仁</Text>
+        </View>
       </ScrollView>
     </View>
   );
@@ -289,6 +307,54 @@ const styles = StyleSheet.create({
     padding: 14,
     paddingBottom: 34,
     gap: 14,
+  },
+  aboutCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.oceanDeep,
+    borderRadius: 16,
+    padding: 16,
+    gap: 14,
+  },
+  aboutBadge: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: COLORS.oceanPrimary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  aboutAppName: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: COLORS.white,
+  },
+  aboutPowered: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#38BDF8',
+    marginTop: 2,
+  },
+  aboutDesc: {
+    fontSize: 11.5,
+    color: '#CBD5E1',
+    marginTop: 4,
+    lineHeight: 16,
+  },
+  footerAbout: {
+    alignItems: 'center',
+    paddingVertical: 10,
+    gap: 3,
+  },
+  footerTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+  },
+  footerPowered: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.oceanPrimary,
   },
   card: {
     backgroundColor: COLORS.surface,
