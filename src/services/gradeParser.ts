@@ -65,6 +65,7 @@ function normalizeAcademicYear(xnm?: string, xnmmc?: string): string {
 
 /**
  * Parse 正方教务 `/cjcx/cjcx_cxXsgrcj.html?doType=query` JSON response into GradeItem[].
+ * Marks `gpaEstimated` / `scoreEstimated` whenever official `jd`/`bfzcj` was absent and locally estimated.
  */
 export function parseZfGradesResponse(raw: unknown): GradeItem[] {
   if (!raw || typeof raw !== 'object') return [];
@@ -93,6 +94,7 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
     const bfzNum = parseFloat(String(item.bfzcj ?? item.cj ?? ''));
     const mapped = TEXT_SCORE_MAP[scoreText];
 
+    const scoreEstimated = !Number.isFinite(bfzNum) && Boolean(mapped);
     const numericScore = Number.isFinite(bfzNum)
       ? bfzNum
       : mapped
@@ -102,6 +104,7 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
     const rawJd = parseFloat(String(item.jd ?? ''));
     let gpa = 0;
     let passed = false;
+    let gpaEstimated = false;
 
     if (Number.isFinite(rawJd) && rawJd >= 0) {
       gpa = rawJd;
@@ -109,9 +112,11 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
     } else if (mapped) {
       gpa = mapped.gpa;
       passed = mapped.passed;
+      gpaEstimated = true;
     } else if (numericScore !== null) {
       gpa = scoreToGdouGpa(numericScore);
       passed = numericScore >= 60;
+      gpaEstimated = true;
     }
 
     const academicYear = normalizeAcademicYear(item.xnm, item.xnmmc);
@@ -136,6 +141,8 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
       scoreText: scoreText || '-',
       numericScore,
       gpa,
+      gpaEstimated,
+      scoreEstimated,
       courseCategory,
       examNature,
       teacher,
@@ -162,6 +169,7 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
       weightedAvgScore: 0,
       totalCourses: 0,
       passedCourses: 0,
+      hasEstimatedItems: false,
       byCategory: [],
     };
   }
@@ -188,10 +196,14 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
   let weightedScoreSum = 0;
   let scoreCreditsDenom = 0;
   let passedCourses = 0;
+  let hasEstimatedItems = false;
 
   const catMap = new Map<string, { credits: number; count: number }>();
 
   for (const g of effective) {
+    if (g.gpaEstimated || g.scoreEstimated) {
+      hasEstimatedItems = true;
+    }
     totalCreditsAttempted += g.credit;
     if (g.passed) {
       totalCreditsEarned += g.credit;
@@ -241,6 +253,7 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
         : 0,
     totalCourses: effective.length,
     passedCourses,
+    hasEstimatedItems,
     byCategory,
   };
 }

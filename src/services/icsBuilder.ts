@@ -1,43 +1,141 @@
 import { getActivePeriods } from '../constants/gdouTimetable';
 import { AppSettings, CourseItem, ExamItem } from '../types/models';
-import { parseExamIsoLocal } from './examParser';
-import { getCourseOccurrences } from './scheduleParser';
+import { getCourseWallClockOccurrences } from './scheduleParser';
 
-function formatIcsLocalDate(date: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
+const pad2 = (n: number) => String(n).padStart(2, '0');
+
+function formatIcsUtcStamp(date: Date): string {
   return (
-    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}` +
-    `T${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+    `${date.getUTCFullYear()}${pad2(date.getUTCMonth() + 1)}${pad2(date.getUTCDate())}` +
+    `T${pad2(date.getUTCHours())}${pad2(date.getUTCMinutes())}${pad2(date.getUTCSeconds())}Z`
   );
 }
 
+function formatWallClockParts(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second = 0
+): string {
+  return `${year}${pad2(month)}${pad2(day)}T${pad2(hour)}${pad2(minute)}${pad2(second)}`;
+}
+
 function escapeIcsText(text: string): string {
-  return text
+  return String(text ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
     .replace(/\\/g, '\\\\')
     .replace(/\n/g, '\\n')
     .replace(/,/g, '\\,')
     .replace(/;/g, '\\;');
 }
 
+function sanitizeUidSegment(raw: string): string {
+  const ascii = String(raw ?? '').replace(/[^A-Za-z0-9._-]/g, '');
+  if (ascii.length > 0) return ascii.slice(0, 48);
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) {
+    hash = (hash * 31 + raw.charCodeAt(i)) >>> 0;
+  }
+  return `h${hash.toString(16)}`;
+}
+
+function utf8CodePointByteLength(cp: number): number {
+  if (cp <= 0x7f) return 1;
+  if (cp <= 0x7ff) return 2;
+  if (cp <= 0xffff) return 3;
+  return 4;
+}
+
 /**
- * Pure RFC 5545 iCalendar (.ics) generator containing courses and exams with VALARM alerts.
+ * RFC 5545 Section 3.1 content line folding:
+ * folds lines strictly at <= 75 UTF-8 octets without splitting multi-byte UTF-8 characters.
+ */
+export function foldIcsLine(line: string, maxOctets = 75): string {
+  const segments: string[] = [];
+  let current = '';
+  let currentBytes = 0;
+
+  for (const ch of line) {
+    const cp = ch.codePointAt(0) ?? 0;
+    const chBytes = utf8CodePointByteLength(cp);
+    const limit = segments.length === 0 ? maxOctets : maxOctets - 1; // continuation starts with 1-byte space
+    if (currentBytes + chBytes > limit && current.length > 0) {
+      segments.push(current);
+      current = ch;
+      currentBytes = chBytes;
+    } else {
+      current += ch;
+      currentBytes += chBytes;
+    }
+  }
+  if (current.length > 0 || segments.length === 0) {
+    segments.push(current);
+  }
+  return segments.join('\r\n ');
+}
+
+function parseIsoWallClock(iso: string): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+} | null {
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return null;
+  return {
+    year: parseInt(m[1], 10),
+    month: parseInt(m[2], 10),
+    day: parseInt(m[3], 10),
+    hour: parseInt(m[4], 10),
+    minute: parseInt(m[5], 10),
+  };
+}
+
+function addMinutesWallClock(
+  parts: { year: number; month: number; day: number; hour: number; minute: number },
+  deltaMinutes: number
+): { year: number; month: number; day: number; hour: number; minute: number } {
+  const utc = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute + deltaMinutes, 0)
+  );
+  return {
+    year: utc.getUTCFullYear(),
+    month: utc.getUTCMonth() + 1,
+    day: utc.getUTCDate(),
+    hour: utc.getUTCHours(),
+    minute: utc.getUTCMinutes(),
+  };
+}
+
+/**
+ * RFC 5545 compliant iCalendar (.ics) generator containing courses and exams with VALARM alerts:
+ * - UTC DTSTAMP with trailing Z
+ * - Explicit Asia/Shanghai wall-clock timestamps independent of host device timezone
+ * - Stable deterministic UIDs (re-importing updates existing events instead of duplicating)
+ * - Strict 75-octet UTF-8-boundary line folding
  */
 export function buildGdouIcsContent(
   courses: CourseItem[],
   exams: ExamItem[],
   settings: AppSettings,
-  termLabel: string
+  termLabel: string,
+  now: Date = new Date()
 ): string {
   const periods = getActivePeriods(settings);
-  const dtStamp = formatIcsLocalDate(new Date());
+  const dtStamp = formatIcsUtcStamp(now);
   const reminderMin = Math.max(5, settings.defaultCalendarReminderMinutes || 15);
+  const safeTermStart = sanitizeUidSegment(settings.termStartDate);
 
-  const lines: string[] = [
+  const rawLines: string[] = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//GDOU Schedule//Guangdong Ocean University//CN',
     'CALSCALE:GREGORIAN',
-    `X-WR-CALNAME:${escapeIcsText(`广海课表 - ${termLabel}`)}`,
+    `X-WR-CALNAME:${escapeIcsText(`海大课表 - ${termLabel}`)}`,
     'X-WR-TIMEZONE:Asia/Shanghai',
     'BEGIN:VTIMEZONE',
     'TZID:Asia/Shanghai',
@@ -50,20 +148,19 @@ export function buildGdouIcsContent(
     'END:VTIMEZONE',
   ];
 
-  let seq = 1;
-
   for (const course of courses) {
-    const occurrences = getCourseOccurrences(course, settings.termStartDate, periods);
+    const occurrences = getCourseWallClockOccurrences(course, settings.termStartDate, periods);
+    const courseKey = sanitizeUidSegment(course.id || `${course.name}-${course.dayOfWeek}-${course.startSection}`);
     for (const occ of occurrences) {
-      const uid = `gdou-course-${seq++}-${occ.week}@schedule.gdou.edu.cn`;
+      const uid = `gdou-course-${courseKey}-w${occ.week}-${safeTermStart}@schedule.gdou.edu.cn`;
       const location = [course.campus, course.location].filter(Boolean).join(' ');
       const desc = `教师: ${course.teacher} | 第${course.startSection}-${course.endSection}节 | 第${occ.week}周 (${course.weekText})`;
-      lines.push(
+      rawLines.push(
         'BEGIN:VEVENT',
         `UID:${uid}`,
         `DTSTAMP:${dtStamp}`,
-        `DTSTART;TZID=Asia/Shanghai:${formatIcsLocalDate(occ.start)}`,
-        `DTEND;TZID=Asia/Shanghai:${formatIcsLocalDate(occ.end)}`,
+        `DTSTART;TZID=Asia/Shanghai:${formatWallClockParts(occ.year, occ.month, occ.day, occ.startHour, occ.startMinute)}`,
+        `DTEND;TZID=Asia/Shanghai:${formatWallClockParts(occ.year, occ.month, occ.day, occ.endHour, occ.endMinute)}`,
         `SUMMARY:${escapeIcsText(course.name)}`,
         `LOCATION:${escapeIcsText(location)}`,
         `DESCRIPTION:${escapeIcsText(desc)}`,
@@ -79,21 +176,24 @@ export function buildGdouIcsContent(
 
   for (const exam of exams) {
     if (!exam.startIso) continue;
-    const start = parseExamIsoLocal(exam.startIso);
-    const end = exam.endIso
-      ? parseExamIsoLocal(exam.endIso)
-      : new Date(start.getTime() + 2 * 3600 * 1000);
-    const uid = `gdou-exam-${seq++}@schedule.gdou.edu.cn`;
+    const startParts = parseIsoWallClock(exam.startIso);
+    if (!startParts) continue;
+    const endParts =
+      (exam.endIso ? parseIsoWallClock(exam.endIso) : null) ??
+      addMinutesWallClock(startParts, 120);
+
+    const examKey = sanitizeUidSegment(exam.id || `${exam.courseName}-${exam.dateText}`);
+    const uid = `gdou-exam-${examKey}-${sanitizeUidSegment(exam.dateText || 'tbd')}@schedule.gdou.edu.cn`;
     const location = `${[exam.campus, exam.location].filter(Boolean).join(' ')}${
       exam.seatNumber ? ` 座位${exam.seatNumber}` : ''
     }`;
     const desc = `考试性质: ${exam.examType} | 座位号: ${exam.seatNumber || '待公布'} | ${exam.rawTimeText}`;
-    lines.push(
+    rawLines.push(
       'BEGIN:VEVENT',
       `UID:${uid}`,
       `DTSTAMP:${dtStamp}`,
-      `DTSTART;TZID=Asia/Shanghai:${formatIcsLocalDate(start)}`,
-      `DTEND;TZID=Asia/Shanghai:${formatIcsLocalDate(end)}`,
+      `DTSTART;TZID=Asia/Shanghai:${formatWallClockParts(startParts.year, startParts.month, startParts.day, startParts.hour, startParts.minute)}`,
+      `DTEND;TZID=Asia/Shanghai:${formatWallClockParts(endParts.year, endParts.month, endParts.day, endParts.hour, endParts.minute)}`,
       `SUMMARY:${escapeIcsText(`【${exam.examType}】${exam.courseName}`)}`,
       `LOCATION:${escapeIcsText(location)}`,
       `DESCRIPTION:${escapeIcsText(desc)}`,
@@ -111,6 +211,6 @@ export function buildGdouIcsContent(
     );
   }
 
-  lines.push('END:VCALENDAR');
-  return lines.join('\r\n');
+  rawLines.push('END:VCALENDAR');
+  return rawLines.map((line) => foldIcsLine(line)).join('\r\n');
 }

@@ -6,8 +6,31 @@ on:
     branches: [ main, master ]
 
 jobs:
+  quality-gate:
+    name: Typecheck & Offline Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+
+      - name: TypeScript strict typecheck
+        run: npm run typecheck
+
+      - name: Offline security, parser & RFC 5545 verification
+        run: npm run verify
+
   build-android-apk:
     name: Build Android Release APK
+    needs: quality-gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -25,13 +48,44 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - name: Install dependencies
-        run: npm ci || npm install
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
 
-      - name: Ensure Android project exists (preserve committed native CookieJar)
+      - name: Prebuild Android native project via Expo Config Plugin
+        run: npx expo prebuild --platform android --clean
+
+      - name: Verify Android zero-retention native code & hardened manifest survived prebuild
         run: |
-          if [ ! -d "android" ]; then
-            npx expo prebuild --platform android
+          grep -q "GdouEphemeralCookieJar" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
+          grep -q "X-Gdou-Clear-Cookies-After" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
+          grep -q 'android:allowBackup="false"' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:usesCleartextTraffic="false"' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.intent.action.SET_ALARM' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.SYSTEM_ALERT_WINDOW" tools:node="remove"' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.READ_EXTERNAL_STORAGE" tools:node="remove"' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove"' android/app/src/main/AndroidManifest.xml
+          grep -q "android.enableMinifyInReleaseBuilds=true" android/gradle.properties
+          grep -q "EX_DEV_CLIENT_NETWORK_INSPECTOR=false" android/gradle.properties
+
+      - name: Prepare optional release signing keystore from GitHub Secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          APP_VERSION=$(node -p "require('./app.json').expo.version")
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_STORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/gdou-release.jks"
+            echo "GDOU_RELEASE_STORE_FILE=$RUNNER_TEMP/gdou-release.jks" >> "$GITHUB_ENV"
+            echo "GDOU_RELEASE_STORE_PASSWORD=$ANDROID_STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "GDOU_RELEASE_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "GDOU_RELEASE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "APK_SIGNED=true" >> "$GITHUB_ENV"
+          else
+            echo "No release signing secrets configured; building unsigned release APK (never debug.keystore)."
+            echo "APK_SIGNED=false" >> "$GITHUB_ENV"
           fi
 
       - name: Build Android Release APK
@@ -39,16 +93,24 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86_64 --no-daemon
+          mkdir -p ../dist
+          if [ "$APK_SIGNED" = "true" ]; then
+            cp app/build/outputs/apk/release/app-release.apk "../dist/haida-schedule-v${APP_VERSION}-android.apk"
+          else
+            cp app/build/outputs/apk/release/app-release-unsigned.apk "../dist/haida-schedule-v${APP_VERSION}-android-unsigned.apk"
+          fi
+          ls -lh ../dist
 
       - name: Upload Android APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: haida-schedule-android-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: dist/haida-schedule-v*-android*.apk
           if-no-files-found: error
 
   build-ios-ipa:
     name: Build iOS Unsigned IPA (Sideloadly / AltStore / TrollStore)
+    needs: quality-gate
     runs-on: macos-15
     steps:
       - name: Checkout repository
@@ -60,11 +122,27 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci || npm install
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
 
-      - name: Prebuild iOS project
+      - name: Prebuild iOS native project via Expo Config Plugin
         run: npx expo prebuild --platform ios --clean
+
+      - name: Verify iOS zero-retention ephemeral networking survived prebuild
+        run: |
+          APP_VERSION=$(node -p "require('./app.json').expo.version")
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          SWIFT_FILE=$(find ios -maxdepth 2 -name "GdouEphemeralNetworking.swift" | head -n 1)
+          if [ -z "$SWIFT_FILE" ]; then
+            echo "ERROR: GdouEphemeralNetworking.swift not generated!"
+            exit 1
+          fi
+          grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
+          grep -q "URLSessionConfiguration.ephemeral" "$SWIFT_FILE"
+          grep -q "X-Gdou-Clear-Cookies-After" "$SWIFT_FILE"
+          grep -q "GdouEphemeralNetworking.install()" ios/*/AppDelegate.swift
+          grep -q "RCTHTTPRequestHandler.h" ios/*/*-Bridging-Header.h
+          grep -q "GdouEphemeralNetworking.swift" ios/*.xcodeproj/project.pbxproj
 
       - name: Install CocoaPods
         working-directory: ios
@@ -95,15 +173,18 @@ jobs:
             echo "ERROR: .app bundle not found"
             exit 1
           fi
-          rm -rf Payload haida-schedule-ios-unsigned.ipa
+          OUT_NAME="haida-schedule-v${APP_VERSION}-ios-unsigned.ipa"
+          rm -rf Payload "$OUT_NAME"
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          zip -qry haida-schedule-ios-unsigned.ipa Payload
-          ls -lh haida-schedule-ios-unsigned.ipa
+          zip -qry "$OUT_NAME" Payload
+          mkdir -p ../dist
+          cp "$OUT_NAME" "../dist/$OUT_NAME"
+          ls -lh "../dist/$OUT_NAME"
 
       - name: Upload iOS IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: haida-schedule-ios-unsigned-ipa
-          path: ios/haida-schedule-ios-unsigned.ipa
+          path: dist/haida-schedule-v*-ios-unsigned.ipa
           if-no-files-found: error

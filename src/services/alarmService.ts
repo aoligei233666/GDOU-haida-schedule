@@ -3,12 +3,15 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 import { DAY_FULL_LABELS, getActivePeriods } from '../constants/gdouTimetable';
 import { AlarmRule, AppSettings, CourseItem, ExamItem } from '../types/models';
+import { generateSecureHex } from './cryptoAes';
 import { parseExamIsoLocal } from './examParser';
 import {
   applyTimeToDate,
   getCourseTimeSpan,
   getDateForWeekAndDay,
   getFirstClassPerDayInWeek,
+  isCourseSchedulable,
+  parseLocalDateStrict,
 } from './scheduleParser';
 
 export const ALARM_CHANNEL_ID = 'gdou-alarm-channel';
@@ -39,23 +42,49 @@ export async function initializeAlarmEngine(): Promise<void> {
         lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
       });
     }
-  } catch {
-    // Guard against ROM-specific notification channel initialization errors on startup
+  } catch (err) {
+    console.warn('Alarm engine initialization warning:', err);
   }
 }
 
-export async function ensureNotificationPermission(): Promise<void> {
+export async function ensureNotificationPermission(): Promise<{ exactAlarmHint?: string }> {
   const existing = await Notifications.getPermissionsAsync();
-  if (existing.status === 'granted') return;
-  const req = await Notifications.requestPermissionsAsync({
-    ios: {
-      allowAlert: true,
-      allowSound: true,
-      allowBadge: true,
-    },
-  });
-  if (req.status !== 'granted') {
-    throw new Error('未开启通知权限，请在系统设置中允许“广海课表”发送闹钟与提醒通知');
+  let status = existing.status;
+  if (status !== 'granted') {
+    const req = await Notifications.requestPermissionsAsync({
+      ios: {
+        allowAlert: true,
+        allowSound: true,
+        allowBadge: true,
+      },
+    });
+    status = req.status;
+  }
+  if (status !== 'granted') {
+    throw new Error('未开启通知权限，请在系统设置中允许“海大课表”发送闹钟与提醒通知');
+  }
+
+  // Android 12+ (API 31+): SCHEDULE_EXACT_ALARM may require manual approval in Alarms & Reminders settings
+  if (Platform.OS === 'android' && Number(Platform.Version) >= 31) {
+    return {
+      exactAlarmHint:
+        '提示：Android 12+ 若发现提醒延迟，请在系统“设置 -> 应用 -> 海大课表 -> 闹钟和提醒”中允许精确闹钟权限。',
+    };
+  }
+  return {};
+}
+
+export async function openAndroidExactAlarmSettings(): Promise<void> {
+  if (Platform.OS !== 'android') return;
+  try {
+    await IntentLauncher.startActivityAsync('android.settings.REQUEST_SCHEDULE_EXACT_ALARM', {
+      data: 'package:cn.edu.gdou.schedule',
+    });
+  } catch {
+    await IntentLauncher.startActivityAsync(
+      IntentLauncher.ActivityAction.APPLICATION_DETAILS_SETTINGS,
+      { data: 'package:cn.edu.gdou.schedule' }
+    );
   }
 }
 
@@ -85,6 +114,12 @@ async function scheduleLocalAlarmNotification(
   });
 }
 
+async function rollbackNotifications(notificationIds: string[]): Promise<void> {
+  await Promise.allSettled(
+    notificationIds.map((id) => Notifications.cancelScheduledNotificationAsync(id))
+  );
+}
+
 /**
  * Schedule an advance reminder alarm for a specific course in a specific week.
  */
@@ -94,6 +129,13 @@ export async function createClassAlarm(
   advanceMinutes: number,
   settings: AppSettings
 ): Promise<AlarmRule> {
+  if (!isCourseSchedulable(course)) {
+    throw new Error(`《${course.name}》缺少有效上课时间信息，无法设定闹钟`);
+  }
+  if (!parseLocalDateStrict(settings.termStartDate)) {
+    throw new Error(`开学基准日期无效（${settings.termStartDate}），请先在设置页修正`);
+  }
+
   const periods = getActivePeriods(settings);
   const { startText } = getCourseTimeSpan(course, periods);
   const dayDate = getDateForWeekAndDay(settings.termStartDate, week, course.dayOfWeek);
@@ -105,7 +147,7 @@ export async function createClassAlarm(
   const notificationId = await scheduleLocalAlarmNotification(title, body, triggerDate);
 
   return {
-    id: `alarm-cls-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    id: `alarm-cls-${Date.now()}-${generateSecureHex(4)}`,
     kind: 'class',
     title,
     body,
@@ -121,23 +163,32 @@ export async function createClassAlarm(
 }
 
 /**
- * Smart Morning Wake-Up Generator:
- * Scans the selected week, finds the earliest class for each day, and schedules
- * a wake-up alarm `wakeupMinutesBefore` minutes prior to that first class.
+ * Smart Morning Wake-Up Generator (transactional batch):
+ * Uses Promise.allSettled so only genuinely scheduled OS alarms are returned;
+ * if any alarm fails to schedule and rollbackOnPartialError is enabled, rolls back partial notifications.
  */
 export async function createWeeklyMorningWakeupAlarms(
   courses: CourseItem[],
   week: number,
   wakeupMinutesBefore: number,
   settings: AppSettings
-): Promise<{ created: AlarmRule[]; skippedPast: number }> {
-  await ensureNotificationPermission();
+): Promise<{ created: AlarmRule[]; skippedPast: number; failed: number; exactAlarmHint?: string }> {
+  if (!parseLocalDateStrict(settings.termStartDate)) {
+    throw new Error(`开学基准日期无效（${settings.termStartDate}），请先在设置页修正`);
+  }
+  const { exactAlarmHint } = await ensureNotificationPermission();
   const periods = getActivePeriods(settings);
   const firstPerDay = getFirstClassPerDayInWeek(courses, week);
   const nowMs = Date.now();
 
-  const created: AlarmRule[] = [];
   let skippedPast = 0;
+  const tasks: {
+    dayOfWeek: number;
+    firstCourse: CourseItem;
+    triggerDate: Date;
+    title: string;
+    body: string;
+  }[] = [];
 
   for (const [dayOfWeek, firstCourse] of firstPerDay.entries()) {
     const { startText } = getCourseTimeSpan(firstCourse, periods);
@@ -153,41 +204,73 @@ export async function createWeeklyMorningWakeupAlarms(
     const dayLabel = DAY_FULL_LABELS[dayOfWeek - 1] ?? `周${dayOfWeek}`;
     const title = `🌅 ${dayLabel}早起闹钟（首课 ${startText}）`;
     const body = `第 ${week} 周首节课：${firstCourse.name} · 教室 ${firstCourse.location}，距离上课还有 ${wakeupMinutesBefore} 分钟`;
-    const notificationId = await scheduleLocalAlarmNotification(title, body, triggerDate);
-
-    created.push({
-      id: `alarm-wake-${week}-${dayOfWeek}-${Date.now()}`,
-      kind: 'morning_wakeup',
-      title,
-      body,
-      targetId: firstCourse.id,
-      triggerIso: triggerDate.toISOString(),
-      weekday: dayOfWeek,
-      hour: triggerDate.getHours(),
-      minute: triggerDate.getMinutes(),
-      advanceMinutes: wakeupMinutesBefore,
-      enabled: true,
-      notificationId,
-    });
+    tasks.push({ dayOfWeek, firstCourse, triggerDate, title, body });
   }
 
-  return { created, skippedPast };
+  const settled = await Promise.allSettled(
+    tasks.map(async (t) => {
+      const notificationId = await scheduleLocalAlarmNotification(t.title, t.body, t.triggerDate);
+      const rule: AlarmRule = {
+        id: `alarm-wake-${week}-${t.dayOfWeek}-${Date.now()}-${generateSecureHex(3)}`,
+        kind: 'morning_wakeup',
+        title: t.title,
+        body: t.body,
+        targetId: t.firstCourse.id,
+        triggerIso: t.triggerDate.toISOString(),
+        weekday: t.dayOfWeek,
+        hour: t.triggerDate.getHours(),
+        minute: t.triggerDate.getMinutes(),
+        advanceMinutes: wakeupMinutesBefore,
+        enabled: true,
+        notificationId,
+      };
+      return rule;
+    })
+  );
+
+  const created: AlarmRule[] = [];
+  let failed = 0;
+  let firstError: unknown = null;
+  for (const res of settled) {
+    if (res.status === 'fulfilled') {
+      created.push(res.value);
+    } else {
+      failed++;
+      if (!firstError) firstError = res.reason;
+    }
+  }
+
+  // If every single scheduling attempt failed, roll back and surface real error
+  if (tasks.length > 0 && created.length === 0) {
+    throw firstError instanceof Error ? firstError : new Error('系统闹钟通知注册失败');
+  }
+
+  return { created, skippedPast, failed, exactAlarmHint };
 }
 
 /**
- * Schedule dual exam alarms for each upcoming exam:
- * 1) Eve reminder at 20:00 the day before the exam
- * 2) Exam-day departure alarm `examAdvanceMinutes` (default 90 min) before exam start
+ * Schedule dual exam alarms for each upcoming exam using Promise.allSettled
+ * with automatic rollback if an exam fails completely, ensuring UI/OS parity.
  */
 export async function createExamAlarms(
   exams: ExamItem[],
   settings: AppSettings
-): Promise<{ created: AlarmRule[]; skipped: number }> {
-  await ensureNotificationPermission();
+): Promise<{ created: AlarmRule[]; skipped: number; failed: number; exactAlarmHint?: string }> {
+  const { exactAlarmHint } = await ensureNotificationPermission();
   const advanceMin = settings.examAdvanceMinutes || 90;
   const nowMs = Date.now();
-  const created: AlarmRule[] = [];
   let skipped = 0;
+
+  interface ExamAlarmCandidate {
+    exam: ExamItem;
+    suffix: 'eve' | 'pre';
+    triggerDate: Date;
+    title: string;
+    body: string;
+    advanceMinutes: number;
+  }
+
+  const candidates: ExamAlarmCandidate[] = [];
 
   for (const exam of exams) {
     if (!exam.startIso) {
@@ -197,7 +280,6 @@ export async function createExamAlarms(
     const examStart = parseExamIsoLocal(exam.startIso);
     const seatInfo = exam.seatNumber ? ` · 座位 ${exam.seatNumber}` : '';
 
-    // 1. Eve 20:00 reminder
     const eve = new Date(
       examStart.getFullYear(),
       examStart.getMonth(),
@@ -208,59 +290,81 @@ export async function createExamAlarms(
       0
     );
     if (eve.getTime() > nowMs + 5000) {
-      const title = `📝 明日考试提醒：${exam.courseName}`;
-      const body = `明天 ${exam.startTimeText} 开考 · 考场：${exam.location}${seatInfo}，请带好学生证/身份证与文具`;
-      const notificationId = await scheduleLocalAlarmNotification(title, body, eve);
-      created.push({
-        id: `alarm-exam-eve-${exam.id}-${Date.now()}`,
-        kind: 'exam',
-        title,
-        body,
-        targetId: exam.id,
-        triggerIso: eve.toISOString(),
-        weekday: eve.getDay() === 0 ? 7 : eve.getDay(),
-        hour: eve.getHours(),
-        minute: eve.getMinutes(),
+      candidates.push({
+        exam,
+        suffix: 'eve',
+        triggerDate: eve,
+        title: `📝 明日考试提醒：${exam.courseName}`,
+        body: `明天 ${exam.startTimeText} 开考 · 考场：${exam.location}${seatInfo}，请带好学生证/身份证与文具`,
         advanceMinutes: 24 * 60,
-        enabled: true,
-        notificationId,
       });
     }
 
-    // 2. Pre-exam countdown alarm
     const preExam = new Date(examStart.getTime() - advanceMin * 60 * 1000);
     if (preExam.getTime() > nowMs + 5000) {
-      const title = `🚨 考前出发闹钟：${exam.courseName}`;
-      const body = `距离开考还有 ${advanceMin} 分钟（${exam.startTimeText}）· 考场：${exam.location}${seatInfo}`;
-      const notificationId = await scheduleLocalAlarmNotification(title, body, preExam);
-      created.push({
-        id: `alarm-exam-pre-${exam.id}-${Date.now()}`,
-        kind: 'exam',
-        title,
-        body,
-        targetId: exam.id,
-        triggerIso: preExam.toISOString(),
-        weekday: preExam.getDay() === 0 ? 7 : preExam.getDay(),
-        hour: preExam.getHours(),
-        minute: preExam.getMinutes(),
+      candidates.push({
+        exam,
+        suffix: 'pre',
+        triggerDate: preExam,
+        title: `🚨 考前出发闹钟：${exam.courseName}`,
+        body: `距离开考还有 ${advanceMin} 分钟（${exam.startTimeText}）· 考场：${exam.location}${seatInfo}`,
         advanceMinutes: advanceMin,
-        enabled: true,
-        notificationId,
       });
     } else {
       skipped++;
     }
   }
 
-  return { created, skipped };
+  const settled = await Promise.allSettled(
+    candidates.map(async (c) => {
+      const notificationId = await scheduleLocalAlarmNotification(c.title, c.body, c.triggerDate);
+      const rule: AlarmRule = {
+        id: `alarm-exam-${c.suffix}-${c.exam.id}-${Date.now()}-${generateSecureHex(3)}`,
+        kind: 'exam',
+        title: c.title,
+        body: c.body,
+        targetId: c.exam.id,
+        triggerIso: c.triggerDate.toISOString(),
+        weekday: c.triggerDate.getDay() === 0 ? 7 : c.triggerDate.getDay(),
+        hour: c.triggerDate.getHours(),
+        minute: c.triggerDate.getMinutes(),
+        advanceMinutes: c.advanceMinutes,
+        enabled: true,
+        notificationId,
+      };
+      return rule;
+    })
+  );
+
+  const created: AlarmRule[] = [];
+  const scheduledIds: string[] = [];
+  let failed = 0;
+  let firstError: unknown = null;
+
+  for (const res of settled) {
+    if (res.status === 'fulfilled') {
+      created.push(res.value);
+      if (res.value.notificationId) scheduledIds.push(res.value.notificationId);
+    } else {
+      failed++;
+      if (!firstError) firstError = res.reason;
+    }
+  }
+
+  if (candidates.length > 0 && created.length === 0) {
+    await rollbackNotifications(scheduledIds);
+    throw firstError instanceof Error ? firstError : new Error('系统考试闹钟注册失败');
+  }
+
+  return { created, skipped, failed, exactAlarmHint };
 }
 
 export async function cancelScheduledAlarm(alarm: AlarmRule): Promise<void> {
   if (alarm.notificationId) {
     try {
       await Notifications.cancelScheduledNotificationAsync(alarm.notificationId);
-    } catch {
-      // Ignore if already fired or dismissed
+    } catch (err) {
+      console.warn('Cancel scheduled alarm warning:', err);
     }
   }
 }

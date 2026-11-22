@@ -58,26 +58,29 @@ export const AlarmsScreen: React.FC<Props> = ({
 
   const handleGenerateWakeup = async () => {
     if (courses.length === 0) {
-      Alert.alert('暂无课表', '请先同步广海教务课表或加载示例课表。');
+      Alert.alert('暂无课表', '请先同步海大教务课表或加载示例课表。');
       return;
     }
     setBusy('wakeup');
     try {
-      const { created, skippedPast } = await createWeeklyMorningWakeupAlarms(
-        courses,
-        targetWeek,
-        wakeupMinutes,
-        settings
-      );
+      const { created, skippedPast, failed, exactAlarmHint } =
+        await createWeeklyMorningWakeupAlarms(
+          courses,
+          targetWeek,
+          wakeupMinutes,
+          settings
+        );
       if (created.length > 0) {
         onAlarmsUpdated([...created, ...alarms]);
       }
+      const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
+      const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
       Alert.alert(
         '早起闹钟生成结果',
         created.length > 0
           ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${
               skippedPast > 0 ? `，已跳过 ${skippedPast} 个过期时段` : ''
-            }。`
+            }${failNote}。${hintNote}`
           : `第 ${targetWeek} 周所有首课时间均已过去，请切换到下一周再生成。`
       );
     } catch (err) {
@@ -96,17 +99,21 @@ export const AlarmsScreen: React.FC<Props> = ({
     try {
       let courseCount = 0;
       let examCount = 0;
+      let totalFailed = 0;
       if (courses.length > 0) {
         const cRes = await syncAllCoursesToCalendar(courses, settings, { replaceExisting: true });
         courseCount = cRes.eventsCreated;
+        totalFailed += cRes.failed;
       }
       if (exams.length > 0) {
         const eRes = await syncExamsToCalendar(exams);
         examCount = eRes.eventsCreated;
+        totalFailed += eRes.failed;
       }
+      const failNote = totalFailed > 0 ? `\n• 写入失败：${totalFailed} 条` : '';
       Alert.alert(
         '系统日历同步成功',
-        `已在手机系统日历中更新「广海课表 (GDOU)」：\n• 上课日程：${courseCount} 条\n• 考试日程：${examCount} 条`
+        `已在手机系统日历中更新「海大课表 (GDOU)」：\n• 上课日程：${courseCount} 条\n• 考试日程：${examCount} 条${failNote}`
       );
     } catch (err) {
       Alert.alert('日历同步失败', err instanceof Error ? err.message : String(err));
@@ -131,7 +138,7 @@ export const AlarmsScreen: React.FC<Props> = ({
   };
 
   const handleClearGdouCalendar = async () => {
-    Alert.alert('移除广海专属日历', '将仅删除由本应用创建的「广海课表 (GDOU)」日历，不影响您的其他系统日程。确定继续？', [
+    Alert.alert('移除海大专属日历', '将仅删除由本应用创建的「海大课表 (GDOU)」日历，不影响您的其他系统日程。确定继续？', [
       { text: '取消', style: 'cancel' },
       {
         text: '移除',
@@ -139,7 +146,7 @@ export const AlarmsScreen: React.FC<Props> = ({
         onPress: async () => {
           try {
             const removed = await deleteGdouCalendar();
-            Alert.alert('完成', removed ? '已移除「广海课表 (GDOU)」系统日历。' : '未找到已创建的广海课表日历。');
+            Alert.alert('完成', removed ? '已移除「海大课表 (GDOU)」系统日历。' : '未找到已创建的海大课表日历。');
           } catch (err) {
             Alert.alert('移除失败', err instanceof Error ? err.message : String(err));
           }
@@ -205,7 +212,7 @@ export const AlarmsScreen: React.FC<Props> = ({
             <Text style={styles.cardTitle}>系统日历同步（iOS / Android）</Text>
           </View>
           <Text style={styles.cardDesc}>
-            自动创建独立的「广海课表 (GDOU)」日历，一次性写入整学期所有周次课程与考试座位提醒，不弄乱您的个人日程。
+            自动创建独立的「海大课表 (GDOU)」日历，一次性写入整学期所有周次课程与考试座位提醒，不弄乱您的个人日程。
           </Text>
 
           <View style={styles.btnRow}>

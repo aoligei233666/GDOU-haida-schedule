@@ -1,8 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Image,
   KeyboardAvoidingView,
   Modal,
@@ -15,8 +14,16 @@ import {
   View,
 } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import {
+  GDOU_AUTH_ORIGIN,
+  GDOU_AUTH_PATHS,
+  GDOU_JW_SSO_SERVICE,
+  GDOU_WFW_ORIGIN,
+  isAllowedWebViewNavigationUrl,
+  isTrustedWebViewMessageUrl,
+} from '../constants/gdouEndpoints';
 import { deriveCurrentTermParams, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
-import { purgeEphemeralCredentials } from '../services/cryptoAes';
+import { generateSecureHex, purgeEphemeralCredentials } from '../services/cryptoAes';
 import { parseZfExamResponse } from '../services/examParser';
 import {
   buildIncognitoWebViewSyncScript,
@@ -24,10 +31,13 @@ import {
   clearPendingMfaSecret,
   executeOneShotGdouSync,
   fetchGdouCaptchaImage,
+  flushNativeEphemeralCookies,
+  isAccountLockedMessage,
   logoutEphemeralSession,
   MfaChallengeState,
   PreparedAuthSession,
   prepareGdouAuthSession,
+  probeGdouNetworkRoute,
   requestGdouMfaDynamicCode,
   submitGdouMfaAndCompleteSync,
   SyncResult,
@@ -35,7 +45,7 @@ import {
 import { parseZfGradesResponse } from '../services/gradeParser';
 import { parseZfScheduleResponse } from '../services/scheduleParser';
 import { COLORS } from '../theme/colors';
-import { EphemeralCredentials } from '../types/models';
+import { EphemeralCredentials, LogoutVerificationDetails } from '../types/models';
 
 interface Props {
   visible: boolean;
@@ -44,6 +54,7 @@ interface Props {
 }
 
 type AuthMode = 'direct' | 'webview';
+type WebViewRoutePref = 'auto' | 'wfw' | 'campus';
 
 export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSuccess }) => {
   const [mode, setMode] = useState<AuthMode>('direct');
@@ -73,16 +84,37 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const [xnmOverride, setXnmOverride] = useState('');
   const [xqmOverride, setXqmOverride] = useState('');
 
-  // WebView ephemeral state
+  // WebView ephemeral state + route detection
   const [webViewKey, setWebViewKey] = useState(0);
   const [webViewProgress, setWebViewProgress] = useState(0);
+  const [webViewRoutePref, setWebViewRoutePref] = useState<WebViewRoutePref>('auto');
+  const [probedWebViewIsVpn, setProbedWebViewIsVpn] = useState<boolean | null>(null);
+  const [probingWebViewRoute, setProbingWebViewRoute] = useState(false);
+  const [bridgeToken, setBridgeToken] = useState<string>(() => generateSecureHex(16));
   const [webViewStatus, setWebViewStatus] = useState(
     '第 1 步：请完成海大统一身份认证（用完即删，自动同步）'
   );
+
   const webViewRef = useRef<WebView<object> | null>(null);
   const scrollViewRef = useRef<React.ComponentRef<typeof ScrollView> | null>(null);
-  // Tracks which (session + username) pair has already checked captcha so onBlur never overwrites it
   const captchaSessionKeyRef = useRef<string>('');
+  const activeAbortRef = useRef<AbortController | null>(null);
+  const bridgeTokenRef = useRef<string>(bridgeToken);
+  bridgeTokenRef.current = bridgeToken;
+
+  const abortActiveRequests = () => {
+    if (activeAbortRef.current) {
+      activeAbortRef.current.abort();
+      activeAbortRef.current = null;
+    }
+  };
+
+  const createFreshAbortController = (): AbortController => {
+    abortActiveRequests();
+    const ac = new AbortController();
+    activeAbortRef.current = ac;
+    return ac;
+  };
 
   const wipeFormInputs = (keepUsername = false) => {
     if (!keepUsername) setUsername('');
@@ -96,6 +128,18 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     captchaSessionKeyRef.current = '';
   };
 
+  const cleanupWebViewStorage = () => {
+    try {
+      webViewRef.current?.injectJavaScript(
+        'try{sessionStorage.clear();localStorage.clear();}catch(e){}true;'
+      );
+      webViewRef.current?.clearCache?.(true);
+    } catch {
+      // Ignore if WebView already unmounted
+    }
+    void flushNativeEphemeralCookies();
+  };
+
   useEffect(() => {
     if (visible) {
       setErrorText(null);
@@ -104,11 +148,15 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       if (mode === 'direct') {
         void initDirectSession();
       } else {
-        setWebViewStatus('请完成海大官方登录（用完即删，自动提取课表/考试/绩点）');
+        const freshToken = generateSecureHex(16);
+        setBridgeToken(freshToken);
+        setWebViewStatus('正在探测校内 / 校外网络通道（无痕沙箱）...');
         setWebViewProgress(0.15);
         setWebViewKey((k) => k + 1);
+        void ensureWebViewRouteProbed();
       }
     } else {
+      abortActiveRequests();
       clearPendingMfaSecret();
       if (mfaChallenge) {
         void logoutEphemeralSession(
@@ -117,40 +165,77 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           mfaChallenge.session.isWebVpn
         );
       }
+      if (mode === 'webview') {
+        cleanupWebViewStorage();
+      }
       wipeFormInputs(false);
+      setSyncing(false);
       setMfaChallenge(null);
       setSession(null);
     }
+    return () => {
+      abortActiveRequests();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, mode]);
+
+  const ensureWebViewRouteProbed = async () => {
+    if (session !== null) {
+      setProbedWebViewIsVpn(session.isWebVpn);
+      return;
+    }
+    setProbingWebViewRoute(true);
+    const ac = createFreshAbortController();
+    try {
+      const res = await probeGdouNetworkRoute({ signal: ac.signal, timeoutMs: 10_000 });
+      setProbedWebViewIsVpn(res.isWebVpn);
+      setWebViewStatus(
+        res.isWebVpn
+          ? '第 1 步（校外微门户）：请完成海大统一身份认证'
+          : '第 1 步（校园网直连）：请完成海大统一身份认证'
+      );
+    } catch {
+      // Fall back safely to off-campus WebVPN entry if probe fails
+      setProbedWebViewIsVpn(true);
+      setWebViewStatus('第 1 步：请完成海大统一身份认证（如在校园网可点上方切换“校园网直连”）');
+    } finally {
+      setProbingWebViewRoute(false);
+    }
+  };
 
   const initDirectSession = async (
     autoCheckUsername?: string,
     preserveError = false,
     forceFetchCaptcha = false
   ) => {
+    const ac = createFreshAbortController();
     setPreparing(true);
     if (!preserveError) {
       setErrorText(null);
       setNeedCaptcha(false);
     }
-    // CRITICAL: Reset any stale captcha image whenever a brand-new JSESSIONID is initialized
     setCaptchaUri(undefined);
     setCaptcha('');
     captchaSessionKeyRef.current = '';
     try {
-      const prepared = await prepareGdouAuthSession();
+      const prepared = await prepareGdouAuthSession({ signal: ac.signal });
       setSession(prepared);
+      setProbedWebViewIsVpn(prepared.isWebVpn);
       const targetUser = (autoCheckUsername ?? '').trim();
       if (targetUser) {
         setCheckingCaptcha(true);
         try {
-          const res = await checkGdouCaptcha(prepared, targetUser);
+          const res = await checkGdouCaptcha(prepared, targetUser, { signal: ac.signal });
+          if (res.checkFailed && res.errorMessage && !preserveError) {
+            setErrorText(res.errorMessage);
+          }
           if (res.isNeed && res.imageDataUri) {
             setNeedCaptcha(true);
             setCaptchaUri(res.imageDataUri);
           } else if (forceFetchCaptcha) {
-            const uri = await fetchGdouCaptchaImage(prepared).catch(() => undefined);
+            const uri = await fetchGdouCaptchaImage(prepared, { signal: ac.signal }).catch(
+              () => undefined
+            );
             if (uri) {
               setNeedCaptcha(true);
               setCaptchaUri(uri);
@@ -159,13 +244,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
             setNeedCaptcha(res.isNeed);
             setCaptchaUri(res.imageDataUri);
           }
-          captchaSessionKeyRef.current = `${prepared.pwdEncryptSalt}|${prepared.execution}|${targetUser}`;
+          if (!res.checkFailed) {
+            captchaSessionKeyRef.current = `${prepared.pwdEncryptSalt}|${prepared.execution}|${targetUser}`;
+          }
         } finally {
           setCheckingCaptcha(false);
         }
       }
       return prepared;
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return null;
       setErrorText(
         `无法连接海大教务入口 (${GDOU_ENTRY_URL})：${
           err instanceof Error ? err.message : String(err)
@@ -177,27 +265,30 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     }
   };
 
-  // If user finished typing username while session was still preparing, check captcha once session is ready
   useEffect(() => {
     if (!visible || mode !== 'direct' || !session || preparing || syncing) return;
     const trimmed = username.trim();
     if (!trimmed) return;
     const key = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
     if (captchaSessionKeyRef.current === key) return;
-    let cancelled = false;
+    const ac = new AbortController();
     setCheckingCaptcha(true);
-    void checkGdouCaptcha(session, trimmed)
+    void checkGdouCaptcha(session, trimmed, { signal: ac.signal })
       .then((res) => {
-        if (cancelled) return;
+        if (ac.signal.aborted) return;
         setNeedCaptcha(res.isNeed);
         setCaptchaUri(res.imageDataUri);
-        captchaSessionKeyRef.current = key;
+        if (res.checkFailed && res.errorMessage) {
+          setErrorText(res.errorMessage);
+        } else {
+          captchaSessionKeyRef.current = key;
+        }
       })
       .finally(() => {
-        if (!cancelled) setCheckingCaptcha(false);
+        if (!ac.signal.aborted) setCheckingCaptcha(false);
       });
     return () => {
-      cancelled = true;
+      ac.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session]);
@@ -206,16 +297,20 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     const trimmed = username.trim();
     if (!session || !trimmed || preparing || syncing) return;
     const key = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
-    // Never silently re-fetch & overwrite an already displayed captcha for this exact JSESSIONID
     if (captchaSessionKeyRef.current === key && (!needCaptcha || captchaUri)) {
       return;
     }
+    const ac = createFreshAbortController();
     setCheckingCaptcha(true);
     try {
-      const res = await checkGdouCaptcha(session, trimmed);
+      const res = await checkGdouCaptcha(session, trimmed, { signal: ac.signal });
       setNeedCaptcha(res.isNeed);
       setCaptchaUri(res.imageDataUri);
-      captchaSessionKeyRef.current = key;
+      if (res.checkFailed && res.errorMessage) {
+        setErrorText(res.errorMessage);
+      } else {
+        captchaSessionKeyRef.current = key;
+      }
     } finally {
       setCheckingCaptcha(false);
     }
@@ -224,19 +319,34 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const handleRefreshCaptcha = async () => {
     if (!session || preparing || syncing) return;
     setCaptcha('');
+    const ac = createFreshAbortController();
     setCheckingCaptcha(true);
     try {
-      const uri = await fetchGdouCaptchaImage(session);
+      const uri = await fetchGdouCaptchaImage(session, { signal: ac.signal });
       if (uri) {
         setCaptchaUri(uri);
         const trimmed = username.trim();
         if (trimmed) {
           captchaSessionKeyRef.current = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
         }
+      } else {
+        setErrorText('刷新图形验证码失败，请稍后重试');
+      }
+    } catch (err) {
+      if (!(err instanceof Error && err.name === 'AbortError')) {
+        setErrorText(`刷新验证码失败：${err instanceof Error ? err.message : String(err)}`);
       }
     } finally {
       setCheckingCaptcha(false);
     }
+  };
+
+  const handleCancelSync = () => {
+    abortActiveRequests();
+    wipeFormInputs(true);
+    setSyncing(false);
+    setErrorText('已取消本次同步并释放内存中的凭据引用');
+    void flushNativeEphemeralCookies();
   };
 
   const handleDirectSync = async () => {
@@ -252,14 +362,18 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       if (!activeSession) return;
     }
 
-    // If captcha requirement wasn't checked yet for this (session, username), check BEFORE submitting
     const expectedKey = `${activeSession.pwdEncryptSalt}|${activeSession.execution}|${trimmedUser}`;
     if (captchaSessionKeyRef.current !== expectedKey) {
+      const checkAc = createFreshAbortController();
       setCheckingCaptcha(true);
       try {
-        const res = await checkGdouCaptcha(activeSession, trimmedUser);
+        const res = await checkGdouCaptcha(activeSession, trimmedUser, { signal: checkAc.signal });
         setNeedCaptcha(res.isNeed);
         setCaptchaUri(res.imageDataUri);
+        if (res.checkFailed) {
+          setErrorText(res.errorMessage || '验证码状态检测失败，请重试或切换「官网无痕网页」');
+          return;
+        }
         captchaSessionKeyRef.current = expectedKey;
         if (res.isNeed && !captcha.trim()) {
           setErrorText('海大认证要求输入图形验证码，请输入上方 4 位验证码后再次点击拉取');
@@ -280,11 +394,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       password,
       captcha: captcha.trim(),
     };
-    // Wipe password & captcha immediately before network I/O; keep username only if retry is needed (wiped on success/close)
     setPassword('');
     setCaptcha('');
     setShowPassword(false);
 
+    const syncAc = createFreshAbortController();
     setSyncing(true);
     setErrorText(null);
     setStatusLog([]);
@@ -296,7 +410,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         xnmOverride || xqmOverride
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
-        (step) => setStatusLog((prev) => [...prev, step])
+        (step) => setStatusLog((prev) => [...prev, step]),
+        { signal: syncAc.signal }
       );
 
       if (outcome.status === 'mfa_required') {
@@ -313,7 +428,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorText(msg);
-      // Re-initialize a brand-new JSESSIONID and fetch its exact matching captcha image WITHOUT erasing errorText!
+      // Circuit breaker: NEVER auto-reinitialize/hit authserver when user aborted or account is locked!
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
+      if (isAccountLockedMessage(msg)) {
+        setSession(null);
+        return;
+      }
       const needForceCaptcha = msg.includes('验证码') || msg.includes('动态码');
       await initDirectSession(trimmedUser, true, needForceCaptcha);
       setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 120);
@@ -325,13 +447,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
 
   const handleSendMfaCode = async () => {
     if (!mfaChallenge) return;
+    const ac = createFreshAbortController();
     setSendingMfaCode(true);
     setErrorText(null);
     try {
-      const msg = await requestGdouMfaDynamicCode(mfaChallenge, mfaType);
+      const msg = await requestGdouMfaDynamicCode(mfaChallenge, mfaType, { signal: ac.signal });
       setMfaHint(msg);
     } catch (err) {
-      setErrorText(`发送验证码失败：${err instanceof Error ? err.message : String(err)}`);
+      if (!(err instanceof Error && err.name === 'AbortError')) {
+        setErrorText(`发送验证码失败：${err instanceof Error ? err.message : String(err)}`);
+      }
     } finally {
       setSendingMfaCode(false);
     }
@@ -344,6 +469,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     }
     const codeSnapshot = mfaCode.trim();
     setMfaCode('');
+    const ac = createFreshAbortController();
     setSyncing(true);
     setErrorText(null);
 
@@ -355,7 +481,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         xnmOverride || xqmOverride
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
-        (step) => setStatusLog((prev) => [...prev, step])
+        (step) => setStatusLog((prev) => [...prev, step]),
+        { signal: ac.signal }
       );
       setMfaChallenge(null);
       onSyncSuccess(result);
@@ -368,16 +495,29 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   };
 
   const handleWebViewMessage = (event: WebViewMessageEvent) => {
+    // 1. Strict sender origin allowlist verification (prevents spoofed messages from untrusted pages)
+    if (!isTrustedWebViewMessageUrl(event.nativeEvent.url)) {
+      return;
+    }
+
     try {
       const data = JSON.parse(event.nativeEvent.data) as {
         type: string;
+        bridgeToken?: string;
         message?: string;
         xnm?: string;
         xqm?: string;
+        isWebVpn?: boolean;
         scheduleRaw?: unknown;
         examRaw?: unknown;
         gradeRaw?: unknown;
+        logoutDetails?: LogoutVerificationDetails;
       };
+
+      // 2. Verify per-session CSPRNG bridge nonce
+      if (!data.bridgeToken || data.bridgeToken !== bridgeTokenRef.current) {
+        return;
+      }
 
       if (data.type === 'PROGRESS' && data.message) {
         setWebViewStatus(data.message);
@@ -402,6 +542,27 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           ? `${yearNum}-${yearNum + 1}学年 ${semText}`
           : derived.label;
 
+        // Clean up WebView storage + native cookies immediately upon receiving data
+        cleanupWebViewStorage();
+
+        const logoutDetails: LogoutVerificationDetails = data.logoutDetails ?? {
+          attempted: 0,
+          succeeded: 0,
+          casLoggedOut: false,
+          failedEndpoints: ['未收到注销回执'],
+        };
+        const sessionLoggedOut =
+          logoutDetails.casLoggedOut &&
+          logoutDetails.succeeded > 0 &&
+          logoutDetails.failedEndpoints.length === 0;
+
+        const warnings = [...parsedSchedule.warnings];
+        if (!sessionLoggedOut) {
+          warnings.push(
+            `无痕网页注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项，本地 WebView 容器与 Cookie 已清理，但建议确认官网退出状态`
+          );
+        }
+
         const result: SyncResult = {
           courses: parsedSchedule.courses,
           exams: parsedExams,
@@ -412,18 +573,22 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           receipt: {
             syncedAtIso: new Date().toISOString(),
             mode: 'webview',
-            networkRoute: 'webview-auto',
+            networkRoute: data.isWebVpn === false ? 'campus-direct' : 'wfw-webvpn',
             termLabel: parsedSchedule.termLabel || fallbackLabel,
             coursesCount: parsedSchedule.courses.length,
             examsCount: parsedExams.length,
             gradesCount: parsedGrades.length,
             credentialsPurged: true,
-            sessionLoggedOut: true,
+            sessionLoggedOut,
+            logoutDetails,
+            warnings: warnings.length > 0 ? warnings : undefined,
             steps: [
-              '1. 已在独立无痕沙箱 (incognito WebView) 打开海大教务入口',
+              '1. 已在独立无痕沙箱 (incognito WebView + 域名白名单) 打开海大教务入口',
               '2. 用户通过官方统一身份认证完成一次性验证',
               `3. 同源拉取课表 ${parsedSchedule.courses.length} 项、考试 ${parsedExams.length} 场、成绩 ${parsedGrades.length} 门`,
-              '4. 已向教务与认证中心发起注销并立即销毁无痕 WebView 容器（0 字节凭据落盘）',
+              sessionLoggedOut
+                ? `4. 已向教务与认证中心确认注销（${logoutDetails.succeeded}/${logoutDetails.attempted} 项 HTTP 确认）并销毁容器及 WebStorage`
+                : `4. 本地容器与 WebStorage 已清理，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议核对官网退出）`,
             ],
           },
         };
@@ -432,24 +597,60 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         onClose();
       }
     } catch {
-      // Ignore non-JSON messages
+      // Ignore malformed messages
     }
   };
 
+  /**
+   * Always allow closing the modal, even during an in-flight sync:
+   * aborts active network calls, wipes inputs, and flushes ephemeral cookies.
+   */
   const handleClose = () => {
-    if (syncing) {
-      Alert.alert('正在同步中', '请稍候，拉取完成后将自动销毁本次登录凭据。');
-      return;
+    abortActiveRequests();
+    clearPendingMfaSecret();
+    if (mode === 'webview') {
+      cleanupWebViewStorage();
+    } else if (syncing || mfaChallenge) {
+      void flushNativeEphemeralCookies();
     }
-    wipeFormInputs();
+    setSyncing(false);
+    setMfaChallenge(null);
+    wipeFormInputs(false);
     onClose();
   };
 
-  const injectedWebViewJs = buildIncognitoWebViewSyncScript(
-    xnmOverride || xqmOverride
-      ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
-      : undefined
+  const effectiveWebViewUrl = useMemo(() => {
+    const useCampusDirect =
+      webViewRoutePref === 'campus' ||
+      (webViewRoutePref === 'auto' && probedWebViewIsVpn === false);
+    if (useCampusDirect) {
+      return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+        GDOU_JW_SSO_SERVICE
+      )}`;
+    }
+    return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+      `${GDOU_WFW_ORIGIN}/`
+    )}`;
+  }, [webViewRoutePref, probedWebViewIsVpn]);
+
+  const injectedWebViewJs = useMemo(
+    () =>
+      buildIncognitoWebViewSyncScript(
+        xnmOverride || xqmOverride
+          ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
+          : undefined,
+        bridgeToken
+      ),
+    [xnmOverride, xqmOverride, bridgeToken]
   );
+
+  const reloadWebView = (nextPref?: WebViewRoutePref) => {
+    if (nextPref) setWebViewRoutePref(nextPref);
+    setErrorText(null);
+    setBridgeToken(generateSecureHex(16));
+    setWebViewProgress(0.15);
+    setWebViewKey((k) => k + 1);
+  };
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={handleClose}>
@@ -457,7 +658,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         style={styles.root}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        {/* Header (compact in WebView mode so official page has max viewport) */}
+        {/* Header */}
         <View style={[styles.header, mode === 'webview' && styles.headerCompact]}>
           <View style={{ flex: 1 }}>
             <Text style={[styles.headerTitle, mode === 'webview' && { fontSize: 16 }]}>
@@ -472,14 +673,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           </TouchableOpacity>
         </View>
 
-        {/* Zero-Retention Privacy Guarantee Banner (compact so form + captcha + error + submit fit cleanly) */}
+        {/* Zero-Retention Privacy Banner */}
         {mode === 'direct' && (
           <View style={styles.privacyBanner}>
             <Ionicons name="shield-checkmark" size={18} color={COLORS.emerald} />
             <View style={styles.privacyTextWrap}>
-              <Text style={styles.privacyTitle}>凭据用完即删 · 零留存保护已开启</Text>
+              <Text style={styles.privacyTitle}>凭据用完即删 · 双端内存隔离已开启</Text>
               <Text style={styles.privacyDesc}>
-                账号密码仅用于本次拉取，完成后立即注销会话并销毁内存，绝不落盘。
+                账号密码仅用于本次拉取，双端纯内存 Cookie 隔离，同步完自动校验注销并释放引用，绝不落盘。
               </Text>
             </View>
           </View>
@@ -554,11 +755,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
             </View>
 
             {mfaChallenge ? (
-              /* MFA Secondary Verification Step */
               <View style={styles.mfaBox}>
                 <Text style={styles.mfaTitle}>🔐 海大多因子二次认证（账号：{mfaChallenge.reAuthUserId}）</Text>
                 <Text style={styles.mfaSub}>
-                  您的密码已验证通过并从内存销毁。首次设备登录教务需验证一次动态码：
+                  密码引用已立即释放（内存零留存）。请获取并输入动态验证码完成本次校验：
                 </Text>
 
                 <View style={styles.mfaTypeRow}>
@@ -771,6 +971,13 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               </>
             )}
 
+            {syncing && (
+              <TouchableOpacity style={styles.cancelSyncBtn} onPress={handleCancelSync}>
+                <Ionicons name="stop-circle-outline" size={17} color={COLORS.danger} />
+                <Text style={styles.cancelSyncText}>取消本次同步并清理会话</Text>
+              </TouchableOpacity>
+            )}
+
             {mfaChallenge && errorText && (
               <View style={styles.errorBox}>
                 <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
@@ -791,16 +998,40 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
 
             <TouchableOpacity style={styles.fallbackHint} onPress={() => setMode('webview')}>
               <Text style={styles.fallbackHintText}>
-                也可切换「官方无痕网页同步」在海大原网页内完成登录 →
+                也可切换「官网无痕网页同步」支持手机短信验证码免密码登录 →
               </Text>
             </TouchableOpacity>
           </ScrollView>
         ) : (
           <View style={styles.webViewWrap}>
+            {/* Route selector for campus-direct vs off-campus WebVPN */}
+            <View style={styles.webViewRouteBar}>
+              {(
+                [
+                  { key: 'auto', label: probedWebViewIsVpn === false ? '自动(校内)' : '自动探测' },
+                  { key: 'wfw', label: '校外微门户' },
+                  { key: 'campus', label: '校园网直连' },
+                ] as { key: WebViewRoutePref; label: string }[]
+              ).map((item) => {
+                const active = webViewRoutePref === item.key;
+                return (
+                  <TouchableOpacity
+                    key={item.key}
+                    style={[styles.routePill, active && styles.routePillActive]}
+                    onPress={() => reloadWebView(item.key)}
+                  >
+                    <Text style={[styles.routePillText, active && styles.routePillTextActive]}>
+                      {item.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
             <View style={styles.webViewStatusBar}>
               <Ionicons name="shield-checkmark" size={15} color={COLORS.emerald} />
               <Text style={styles.webViewStatusText} numberOfLines={1}>
-                {webViewStatus}
+                {probingWebViewRoute ? '正在探测网络通道...' : webViewStatus}
               </Text>
               <TouchableOpacity
                 onPress={() => webViewRef.current?.goBack()}
@@ -810,10 +1041,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                 <Ionicons name="arrow-back" size={16} color={COLORS.textSecondary} />
               </TouchableOpacity>
               <TouchableOpacity
-                onPress={() => {
-                  setErrorText(null);
-                  setWebViewKey((k) => k + 1);
-                }}
+                onPress={() => reloadWebView()}
                 style={styles.webViewActionBtn}
                 hitSlop={6}
               >
@@ -832,32 +1060,32 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               </View>
             )}
             <WebView<object>
-              key={webViewKey}
+              key={`${webViewKey}-${effectiveWebViewUrl}`}
               ref={webViewRef}
-              source={{
-                uri:
-                  session?.isWebVpn === false
-                    ? GDOU_ENTRY_URL
-                    : 'https://authserver.gdou.edu.cn/authserver/login?service=' +
-                      encodeURIComponent('https://wfw.gdou.edu.cn/'),
-              }}
+              source={{ uri: effectiveWebViewUrl }}
               incognito={true}
               cacheEnabled={false}
               saveFormDataDisabled={true}
               sharedCookiesEnabled={false}
-              thirdPartyCookiesEnabled={true}
+              thirdPartyCookiesEnabled={false}
               javaScriptEnabled={true}
               domStorageEnabled={true}
               scalesPageToFit={false}
               setBuiltInZoomControls={false}
-              mixedContentMode="compatibility"
+              mixedContentMode="never"
               injectedJavaScript={injectedWebViewJs}
+              onShouldStartLoadWithRequest={(req) => {
+                if (!isAllowedWebViewNavigationUrl(req.url)) {
+                  setErrorText(`已拦截非海大官方 HTTPS 链接：${req.url.slice(0, 60)}`);
+                  return false;
+                }
+                return true;
+              }}
               onLoadProgress={({ nativeEvent }) => {
                 setWebViewProgress(nativeEvent.progress);
               }}
               onLoadEnd={() => {
                 setWebViewProgress(1);
-                webViewRef.current?.injectJavaScript(injectedWebViewJs);
               }}
               onMessage={handleWebViewMessage}
               style={styles.webView}
@@ -1101,9 +1329,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingVertical: 8,
+    marginTop: 4,
   },
   termToggleText: {
-    fontSize: 13,
+    fontSize: 12.5,
     color: COLORS.oceanPrimary,
     fontWeight: '600',
   },
@@ -1113,54 +1342,34 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   miniLabel: {
-    fontSize: 12,
+    fontSize: 11.5,
     color: COLORS.textSecondary,
     marginBottom: 4,
   },
   miniInput: {
+    height: 40,
     backgroundColor: COLORS.surface,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 10,
     paddingHorizontal: 10,
-    height: 40,
     fontSize: 14,
     color: COLORS.textPrimary,
   },
   errorBox: {
     flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
+    alignItems: 'flex-start',
     backgroundColor: COLORS.dangerLight,
-    padding: 12,
     borderRadius: 10,
-    marginTop: 10,
-    marginBottom: 6,
+    padding: 10,
+    marginTop: 6,
+    marginBottom: 8,
+    gap: 8,
   },
   errorText: {
     flex: 1,
-    fontSize: 13,
+    fontSize: 12.5,
     color: COLORS.danger,
-    lineHeight: 18,
-  },
-  logBox: {
-    backgroundColor: COLORS.oceanTint,
-    borderRadius: 10,
-    padding: 12,
-    marginTop: 10,
-    marginBottom: 8,
-    borderWidth: 1,
-    borderColor: COLORS.oceanLight,
-  },
-  logTitle: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLORS.oceanDeep,
-    marginBottom: 6,
-  },
-  logLine: {
-    fontSize: 12,
-    color: COLORS.textSecondary,
     lineHeight: 18,
   },
   primaryBtn: {
@@ -1170,64 +1379,123 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.oceanPrimary,
     height: 50,
     borderRadius: 14,
-    marginTop: 8,
+    marginTop: 10,
     gap: 8,
   },
   primaryBtnDisabled: {
-    opacity: 0.65,
+    opacity: 0.6,
   },
   primaryBtnText: {
     fontSize: 15,
     fontWeight: '700',
     color: COLORS.white,
   },
-  fallbackHint: {
-    marginTop: 14,
+  cancelSyncBtn: {
+    flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 6,
+    justifyContent: 'center',
+    backgroundColor: COLORS.dangerLight,
+    height: 40,
+    borderRadius: 10,
+    marginTop: 8,
+    gap: 6,
+  },
+  cancelSyncText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.danger,
+  },
+  logBox: {
+    marginTop: 14,
+    backgroundColor: COLORS.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 12,
+  },
+  logTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+    marginBottom: 6,
+  },
+  logLine: {
+    fontSize: 11.5,
+    color: COLORS.textSecondary,
+    lineHeight: 18,
+  },
+  fallbackHint: {
+    alignItems: 'center',
+    paddingVertical: 14,
   },
   fallbackHintText: {
-    fontSize: 13,
+    fontSize: 12.5,
     color: COLORS.oceanPrimary,
+    fontWeight: '600',
   },
   webViewWrap: {
     flex: 1,
     marginTop: 8,
   },
+  webViewRouteBar: {
+    flexDirection: 'row',
+    paddingHorizontal: 12,
+    paddingBottom: 6,
+    gap: 6,
+  },
+  routePill: {
+    flex: 1,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+  },
+  routePillActive: {
+    backgroundColor: COLORS.oceanLight,
+    borderColor: COLORS.oceanPrimary,
+  },
+  routePillText: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  routePillTextActive: {
+    color: COLORS.oceanPrimary,
+    fontWeight: '700',
+  },
   webViewStatusBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    backgroundColor: COLORS.emeraldLight,
     paddingHorizontal: 12,
     paddingVertical: 7,
+    backgroundColor: COLORS.emeraldLight,
     borderTopWidth: 1,
     borderBottomWidth: 1,
     borderColor: '#A7F3D0',
+    gap: 6,
   },
   webViewStatusText: {
     flex: 1,
-    fontSize: 12,
+    fontSize: 11.5,
     color: '#065F46',
     fontWeight: '600',
   },
   webViewActionBtn: {
-    paddingHorizontal: 6,
-    paddingVertical: 4,
+    padding: 4,
     borderRadius: 6,
-    backgroundColor: 'rgba(255,255,255,0.85)',
+    backgroundColor: 'rgba(255,255,255,0.7)',
   },
   progressTrack: {
-    height: 2.5,
+    height: 2,
     backgroundColor: COLORS.borderLight,
-    width: '100%',
   },
   progressFill: {
-    height: 2.5,
+    height: 2,
     backgroundColor: COLORS.oceanPrimary,
   },
   webView: {
     flex: 1,
-    backgroundColor: COLORS.white,
   },
 });

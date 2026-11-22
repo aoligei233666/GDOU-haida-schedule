@@ -22,6 +22,7 @@ import {
   getCourseTimeSpan,
   getDateForWeekAndDay,
   getTodayDayOfWeek,
+  isCourseSchedulable,
 } from '../services/scheduleParser';
 import { COLORS, COURSE_PALETTE } from '../theme/colors';
 import { AlarmRule, AppSettings, CourseItem } from '../types/models';
@@ -69,29 +70,42 @@ export const ScheduleScreen: React.FC<Props> = ({
   );
 
   const weekCourses = useMemo(
-    () => courses.filter((c) => c.weeks.includes(selectedWeek)),
+    () => courses.filter((c) => isCourseSchedulable(c) && c.weeks.includes(selectedWeek)),
     [courses, selectedWeek]
+  );
+
+  const unparsedCourses = useMemo(
+    () => courses.filter((c) => !isCourseSchedulable(c)),
+    [courses]
   );
 
   const todayCourses = useMemo(
     () =>
       courses
-        .filter((c) => c.weeks.includes(currentWeek) && c.dayOfWeek === todayDow)
+        .filter((c) => isCourseSchedulable(c) && c.weeks.includes(currentWeek) && c.dayOfWeek === todayDow)
         .sort((a, b) => a.startSection - b.startSection),
     [courses, currentWeek, todayDow]
   );
 
   const handleQuickCalendarSync = async () => {
     if (courses.length === 0) {
-      Alert.alert('暂无课表', '请先同步广海教务课表或加载示例预览。');
+      Alert.alert('暂无课表', '请先同步海大教务课表或加载示例预览。');
       return;
     }
     setBusyAction('calendar');
     try {
       const res = await syncAllCoursesToCalendar(courses, settings, { replaceExisting: true });
+      const extra = [
+        res.skippedUnparsed > 0 ? `已跳过 ${res.skippedUnparsed} 门时间未解析课程` : '',
+        res.failed > 0 ? `有 ${res.failed} 条日程写入失败` : '',
+      ]
+        .filter(Boolean)
+        .join('；');
       Alert.alert(
         '整学期课表已导入系统日历',
-        `已创建「广海课表 (GDOU)」专属日历并写入 ${res.eventsCreated} 条上课日程，均已配置课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。`
+        `已更新「海大课表 (GDOU)」专属日历（保留原有考试安排），写入 ${res.eventsCreated} 条上课日程，均已配置课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。${
+          extra ? `\n\n注：${extra}` : ''
+        }`
       );
     } catch (err) {
       Alert.alert('同步日历失败', err instanceof Error ? err.message : String(err));
@@ -107,21 +121,24 @@ export const ScheduleScreen: React.FC<Props> = ({
     }
     setBusyAction('alarm');
     try {
-      const { created, skippedPast } = await createWeeklyMorningWakeupAlarms(
-        courses,
-        selectedWeek,
-        settings.defaultWakeupMinutes,
-        settings
-      );
+      const { created, skippedPast, failed, exactAlarmHint } =
+        await createWeeklyMorningWakeupAlarms(
+          courses,
+          selectedWeek,
+          settings.defaultWakeupMinutes,
+          settings
+        );
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
+      const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
+      const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
       Alert.alert(
         '早起闹钟生成完成',
         created.length > 0
           ? `已为第 ${selectedWeek} 周生成 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${
               skippedPast > 0 ? `，已自动跳过 ${skippedPast} 个过去时段` : ''
-            }。`
+            }${failNote}。${hintNote}`
           : `第 ${selectedWeek} 周的所有课程时间均已过去，请切换到未来周次后生成。`
       );
     } catch (err) {
@@ -220,6 +237,27 @@ export const ScheduleScreen: React.FC<Props> = ({
         </View>
       ) : (
         <>
+          {/* Unparsed courses explicit warning banner */}
+          {unparsedCourses.length > 0 && (
+            <View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                backgroundColor: COLORS.amberLight,
+                paddingHorizontal: 12,
+                paddingVertical: 6,
+                gap: 6,
+              }}
+            >
+              <Ionicons name="warning-outline" size={14} color={COLORS.amber} />
+              <Text style={{ flex: 1, fontSize: 11, color: '#92400E' }} numberOfLines={2}>
+                有 {unparsedCourses.length} 门课程缺少星期/节次/周次（
+                {unparsedCourses.map((c) => c.name).slice(0, 2).join('、')}
+                ），已跳过网格与日历导出。
+              </Text>
+            </View>
+          )}
+
           {/* Today's Spotlight */}
           {todayCourses.length > 0 && (
             <View style={styles.todayBanner}>

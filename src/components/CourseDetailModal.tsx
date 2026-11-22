@@ -52,7 +52,7 @@ export const CourseDetailModal: React.FC<Props> = ({
       const res = await addSingleCourseToCalendar(course, settings);
       Alert.alert(
         '已添加到系统日历',
-        `已将《${course.name}》的全部 ${res.eventsCreated} 次上课安排写入「广海课表 (GDOU)」日历，并附带课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。`
+        `已将《${course.name}》的全部 ${res.eventsCreated} 次上课安排更新至「海大课表 (GDOU)」日历（已自动去重），并附带课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。`
       );
     } catch (err) {
       Alert.alert('写入日历失败', err instanceof Error ? err.message : String(err));

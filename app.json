@@ -2,7 +2,7 @@
   "expo": {
     "name": "海大课表",
     "slug": "gdou-schedule-app",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -13,8 +13,10 @@
     },
     "ios": {
       "bundleIdentifier": "cn.edu.gdou.schedule",
+      "buildNumber": "2",
       "supportsTablet": true,
       "infoPlist": {
+        "CFBundleDisplayName": "海大课表",
         "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",
         "NSCalendarsFullAccessUsageDescription": "用于创建并同步“海大课表”专属系统日历及考试提醒",
         "NSRemindersUsageDescription": "用于设置课前提醒与考前提醒事项",
@@ -23,6 +25,7 @@
     },
     "android": {
       "package": "cn.edu.gdou.schedule",
+      "versionCode": 2,
       "adaptiveIcon": {
         "backgroundColor": "#0B3954",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -38,6 +41,11 @@
         "android.permission.RECEIVE_BOOT_COMPLETED",
         "android.permission.VIBRATE",
         "com.android.alarm.permission.SET_ALARM"
+      ],
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
       ]
     },
     "plugins": [
@@ -53,7 +61,8 @@
           "color": "#0284C7",
           "defaultChannel": "gdou-alarm-channel"
         }
-      ]
+      ],
+      "./plugins/withGdouZeroRetention"
     ],
     "web": {
       "favicon": "./assets/favicon.png"

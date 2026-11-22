@@ -1,9 +1,0 @@
-# Add project specific ProGuard rules here.
--keep class com.swmansion.reanimated.** { *; }
--keep class com.facebook.react.** { *; }
--keep class com.facebook.hermes.** { *; }
--keep class com.facebook.jni.** { *; }
--keep class expo.modules.** { *; }
--keep class com.reactnativecommunity.** { *; }
--keep class com.th3rdwave.safeareacontext.** { *; }
--keep class cn.edu.gdou.schedule.** { *; }

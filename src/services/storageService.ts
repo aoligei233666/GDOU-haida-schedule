@@ -1,46 +1,16 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createDefaultSettings, deriveCurrentTermParams } from '../constants/gdouTimetable';
 import { PersistedAppData } from '../types/models';
+import {
+  findForbiddenCredentialKeys,
+  FORBIDDEN_CREDENTIAL_KEYS,
+  sanitizeForZeroRetention,
+} from './zeroRetentionSanitizer';
+
+export { FORBIDDEN_CREDENTIAL_KEYS, findForbiddenCredentialKeys, sanitizeForZeroRetention };
 
 const STORAGE_KEY = '@gdou_schedule_data_v1';
 const SCHEMA_VERSION = 1;
-
-/**
- * Defense-in-depth denylist: guarantees NO credential or session key can ever
- * be serialized into local storage even by accident.
- */
-const FORBIDDEN_CREDENTIAL_KEYS = new Set([
-  'username',
-  'password',
-  'pwd',
-  'passwd',
-  'cookie',
-  'cookies',
-  'token',
-  'jsessionid',
-  'wfwsessid',
-  'tgc',
-  'pwdEncryptSalt',
-  'execution',
-  'salt',
-]);
-
-export function sanitizeForZeroRetention<T>(value: T): T {
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeForZeroRetention(item)) as unknown as T;
-  }
-  if (value && typeof value === 'object') {
-    const clean: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (FORBIDDEN_CREDENTIAL_KEYS.has(k.toLowerCase()) || FORBIDDEN_CREDENTIAL_KEYS.has(k)) {
-        continue;
-      }
-      clean[k] = sanitizeForZeroRetention(v);
-    }
-    return clean as T;
-  }
-  return value;
-}
 
 export function createInitialAppData(now: Date = new Date()): PersistedAppData {
   const term = deriveCurrentTermParams(now);
@@ -93,7 +63,7 @@ export async function clearAllLocalData(): Promise<void> {
 
 /**
  * Audit helper shown in Settings -> Privacy Verification:
- * inspects actual persisted JSON keys to prove zero credentials exist on disk.
+ * inspects actual persisted JSON keys recursively to prove zero credentials exist on disk.
  */
 export async function auditLocalStorageZeroCredentials(): Promise<{
   hasStoredData: boolean;
@@ -104,23 +74,11 @@ export async function auditLocalStorageZeroCredentials(): Promise<{
   if (!raw) {
     return { hasStoredData: false, byteSize: 0, credentialKeysFound: [] };
   }
-  const found: string[] = [];
-  const inspect = (obj: unknown) => {
-    if (Array.isArray(obj)) {
-      obj.forEach(inspect);
-    } else if (obj && typeof obj === 'object') {
-      for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-        if (FORBIDDEN_CREDENTIAL_KEYS.has(k.toLowerCase())) {
-          found.push(k);
-        }
-        inspect(v);
-      }
-    }
-  };
+  let found: string[] = [];
   try {
-    inspect(JSON.parse(raw));
+    found = findForbiddenCredentialKeys(JSON.parse(raw));
   } catch {
-    // ignore
+    found = [];
   }
   return {
     hasStoredData: true,

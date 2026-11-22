@@ -1,4 +1,4 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# Learn more https://docs.github.com/get-started/getting-started-with-git/ignoring-files
 
 # dependencies
 node_modules/
@@ -9,14 +9,16 @@ dist/
 web-build/
 expo-env.d.ts
 
-# Native
+# Native & Signing Secrets
 .kotlin/
 *.orig.*
 *.jks
+*.keystore
 *.p8
 *.p12
 *.key
 *.mobileprovision
+keystore.properties
 
 # Metro
 .metro-health-check*
@@ -36,11 +38,6 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders (keep android/ native source tracked for GdouEphemeralCookieJar)
+# generated native folders (reproduced deterministically via Expo CNG + plugins/withGdouZeroRetention.js)
 /ios
-/android/build/
-/android/.gradle/
-/android/.kotlin/
-/android/local.properties
-/android/app/build/
-/android/app/.cxx/
+/android

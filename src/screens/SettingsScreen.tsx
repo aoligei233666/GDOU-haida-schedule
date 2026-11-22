@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import React, { useEffect, useState } from 'react';
 import {
   Alert,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -9,10 +10,15 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import appConfig from '../../app.json';
 import { CAMPUS_PRESETS, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
+import { openAndroidExactAlarmSettings } from '../services/alarmService';
+import { parseLocalDateStrict } from '../services/scheduleParser';
 import { auditLocalStorageZeroCredentials } from '../services/storageService';
 import { COLORS } from '../theme/colors';
 import { AppSettings, CampusPresetKey, SyncReceipt } from '../types/models';
+
+const APP_VERSION = appConfig.expo.version;
 
 interface Props {
   settings: AppSettings;
@@ -58,8 +64,8 @@ export const SettingsScreen: React.FC<Props> = ({
 
   const handleSaveTermDate = () => {
     const trimmed = termDateInput.trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-      Alert.alert('日期格式错误', '请输入 YYYY-MM-DD 格式的开学第一周周一日期，例如 2026-09-07。');
+    if (!parseLocalDateStrict(trimmed)) {
+      Alert.alert('日期格式错误', '请输入有效的 YYYY-MM-DD 开学第一周周一日期，例如 2026-09-07。');
       return;
     }
     onUpdateSettings({ ...settings, termStartDate: trimmed });
@@ -132,7 +138,19 @@ export const SettingsScreen: React.FC<Props> = ({
               <Text style={styles.metricLabel}>课表缓存大小</Text>
             </View>
             <View style={styles.metricBox}>
-              <Text style={[styles.metricValue, { color: COLORS.emerald }]}>PASS</Text>
+              <Text
+                style={[
+                  styles.metricValue,
+                  {
+                    color:
+                      !auditInfo || auditInfo.credentialKeysFound.length === 0
+                        ? COLORS.emerald
+                        : COLORS.danger,
+                  },
+                ]}
+              >
+                {!auditInfo || auditInfo.credentialKeysFound.length === 0 ? 'PASS' : 'FAIL'}
+              </Text>
               <Text style={styles.metricLabel}>零留存检测</Text>
             </View>
           </View>
@@ -142,11 +160,35 @@ export const SettingsScreen: React.FC<Props> = ({
               <Text style={styles.receiptTitle}>
                 最近同步回执（{new Date(lastSyncReceipt.syncedAtIso).toLocaleString()}）
               </Text>
+              <Text
+                style={[
+                  styles.receiptLine,
+                  {
+                    fontWeight: '700',
+                    color: lastSyncReceipt.sessionLoggedOut ? COLORS.emerald : COLORS.coral,
+                    marginBottom: 4,
+                  },
+                ]}
+              >
+                凭据引用清除：{lastSyncReceipt.credentialsPurged ? '已校验' : '未确认'} · 远端注销：
+                {lastSyncReceipt.sessionLoggedOut
+                  ? `已确认 (${lastSyncReceipt.logoutDetails?.succeeded ?? 1}/${
+                      lastSyncReceipt.logoutDetails?.attempted ?? 1
+                    })`
+                  : `未完全确认 (${lastSyncReceipt.logoutDetails?.succeeded ?? 0}/${
+                      lastSyncReceipt.logoutDetails?.attempted ?? 0
+                    })`}
+              </Text>
               {lastSyncReceipt.steps.map((s, idx) => (
                 <Text key={idx} style={styles.receiptLine}>
                   {s}
                 </Text>
               ))}
+              {lastSyncReceipt.warnings && lastSyncReceipt.warnings.length > 0 && (
+                <Text style={[styles.receiptLine, { color: COLORS.coral, marginTop: 4 }]}>
+                  告警：{lastSyncReceipt.warnings.join('；')}
+                </Text>
+              )}
             </View>
           )}
 
@@ -241,6 +283,18 @@ export const SettingsScreen: React.FC<Props> = ({
             options={[60, 90, 120]}
             onSelect={(v) => onUpdateSettings({ ...settings, examAdvanceMinutes: v })}
           />
+
+          {Platform.OS === 'android' && Number(Platform.Version) >= 31 && (
+            <TouchableOpacity
+              style={[styles.auditBtn, { marginTop: 12, borderColor: COLORS.oceanLight }]}
+              onPress={() => void openAndroidExactAlarmSettings()}
+            >
+              <Ionicons name="alarm-outline" size={15} color={COLORS.oceanPrimary} />
+              <Text style={[styles.auditBtnText, { color: COLORS.oceanPrimary }]}>
+                检查 Android 12+ 精确闹钟权限
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* Danger Zone */}
@@ -250,7 +304,7 @@ export const SettingsScreen: React.FC<Props> = ({
         </TouchableOpacity>
 
         <View style={styles.footerAbout}>
-          <Text style={styles.footerTitle}>海大课表 v1.1.0</Text>
+          <Text style={styles.footerTitle}>海大课表 v{APP_VERSION}</Text>
           <Text style={styles.footerPowered}>powered by 种果仁</Text>
         </View>
       </ScrollView>

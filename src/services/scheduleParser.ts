@@ -53,13 +53,13 @@ export function parseWeekExpression(zcd: string): number[] {
 
 /**
  * Parse 正方教务 section fields (`jcs`, `jc`, `jcor`) into { startSection, endSection }.
- * Examples: jcs="1-2", jc="1-2节", jcor="3-4" or "5"
+ * Returns null if unparseable (never silently fabricates 1-2节).
  */
 export function parseSectionRange(
   jc?: string,
   jcs?: string,
   jcor?: string
-): { startSection: number; endSection: number } {
+): { startSection: number; endSection: number } | null {
   const candidates = [jcs, jc, jcor].filter((v): v is string => Boolean(v && String(v).trim()));
   for (const raw of candidates) {
     const cleaned = String(raw).replace(/节|第/g, '').trim();
@@ -79,7 +79,7 @@ export function parseSectionRange(
       }
     }
   }
-  return { startSection: 1, endSection: 2 };
+  return null;
 }
 
 function stableColorIndex(courseName: string): number {
@@ -90,10 +90,15 @@ function stableColorIndex(courseName: string): number {
   return hash % COURSE_PALETTE.length;
 }
 
-function parseDayOfWeek(xqj: unknown): number {
+/**
+ * Parse weekday into 1..7 (Monday..Sunday), or null if unparseable (never silently guesses Monday).
+ */
+export function parseDayOfWeek(xqj: unknown): number | null {
   const str = String(xqj ?? '').trim();
-  const num = parseInt(str, 10);
-  if (num >= 1 && num <= 7) return num;
+  if (!str) return null;
+  if (/^[1-7]$/.test(str)) {
+    return parseInt(str, 10);
+  }
   const map: Record<string, number> = {
     星期一: 1, 周一: 1, 一: 1,
     星期二: 2, 周二: 2, 二: 2,
@@ -103,7 +108,7 @@ function parseDayOfWeek(xqj: unknown): number {
     星期六: 6, 周六: 6, 六: 6,
     星期日: 7, 星期天: 7, 周日: 7, 周天: 7, 日: 7, 天: 7,
   };
-  return map[str] ?? 1;
+  return map[str] ?? null;
 }
 
 interface RawZfCourse {
@@ -130,19 +135,23 @@ interface RawZfCourse {
  * Parse 正方新教务系统 `/kbcx/xskbcx_cxXsgrkb.html` JSON payload into normalized CourseItem[].
  * Note: Intentionally discards personal student identifiers (`xsxx.xh`, `xsxx.xm`, etc.)
  * to adhere strictly to data minimization.
+ * Unparseable time fields are flagged explicitly in `warnings` and `course.parseWarning`
+ * instead of silently fabricating bogus Mondays/sections/weeks.
  */
 export function parseZfScheduleResponse(raw: unknown): {
   courses: CourseItem[];
   termLabel?: string;
+  warnings: string[];
 } {
   if (!raw || typeof raw !== 'object') {
-    return { courses: [] };
+    return { courses: [], warnings: [] };
   }
   const obj = raw as Record<string, unknown>;
   const kbList = Array.isArray(obj.kbList) ? (obj.kbList as RawZfCourse[]) : [];
 
   const seen = new Set<string>();
   const courses: CourseItem[] = [];
+  const warnings: string[] = [];
 
   for (let idx = 0; idx < kbList.length; idx++) {
     const item = kbList[idx];
@@ -150,7 +159,7 @@ export function parseZfScheduleResponse(raw: unknown): {
     if (!name) continue;
 
     const dayOfWeek = parseDayOfWeek(item.xqj ?? item.xqjmc);
-    const { startSection, endSection } = parseSectionRange(item.jc, item.jcs, item.jcor);
+    const sectionRange = parseSectionRange(item.jc, item.jcs, item.jcor);
     const weekText = String(item.zcd ?? '').trim();
     const weeks = parseWeekExpression(weekText);
     const location = String(item.cdmc ?? item.jgmc ?? '待定教室').trim();
@@ -160,25 +169,43 @@ export function parseZfScheduleResponse(raw: unknown): {
     const credit = String(item.xf ?? '').trim();
     const classGroup = String(item.jxbmc ?? item.skbj ?? '').trim();
 
-    const dedupKey = `${name}|${dayOfWeek}|${startSection}-${endSection}|${weekText}|${location}`;
+    const missingParts: string[] = [];
+    if (dayOfWeek === null) missingParts.push(`星期(${String(item.xqj ?? item.xqjmc ?? '空')})`);
+    if (sectionRange === null) missingParts.push(`节次(${String(item.jcs ?? item.jc ?? item.jcor ?? '空')})`);
+    if (weeks.length === 0) missingParts.push(`周次(${weekText || '空'})`);
+
+    const parseWarning =
+      missingParts.length > 0
+        ? `时间字段未解析：${missingParts.join('、')}，已跳过日历/闹钟自动导出`
+        : undefined;
+    if (parseWarning) {
+      warnings.push(`《${name}》${parseWarning}`);
+    }
+
+    const effDay = dayOfWeek ?? 0;
+    const effStart = sectionRange?.startSection ?? 0;
+    const effEnd = sectionRange?.endSection ?? 0;
+
+    const dedupKey = `${name}|${effDay}|${effStart}-${effEnd}|${weekText}|${location}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
 
     courses.push({
-      id: `c-${idx}-${dayOfWeek}-${startSection}-${endSection}-${code || stableColorIndex(name)}`,
+      id: `c-${code || stableColorIndex(name)}-${effDay}-${effStart}-${effEnd}-${idx}`,
       name,
       code,
       teacher,
       location,
       campus,
-      dayOfWeek,
-      startSection,
-      endSection,
-      weeks: weeks.length > 0 ? weeks : Array.from({ length: 16 }, (_, i) => i + 1),
-      weekText: weekText || '1-16周',
+      dayOfWeek: effDay,
+      startSection: effStart,
+      endSection: effEnd,
+      weeks,
+      weekText: weekText || '周次待定',
       credit,
       classGroup,
       colorIndex: stableColorIndex(name),
+      parseWarning,
     });
   }
 
@@ -189,27 +216,44 @@ export function parseZfScheduleResponse(raw: unknown): {
   }
 
   courses.sort((a, b) => a.dayOfWeek - b.dayOfWeek || a.startSection - b.startSection);
-  return { courses, termLabel };
+  return { courses, termLabel, warnings };
 }
 
 /**
- * Parse YYYY-MM-DD strictly as local midnight to avoid UTC off-by-one-day bugs.
+ * Strictly parse YYYY-MM-DD as local midnight, returning null for malformed or impossible dates
+ * (e.g., "2026-02-31"). Never silently substitutes today's date.
+ */
+export function parseLocalDateStrict(ymd: string): Date | null {
+  const m = String(ymd ?? '').trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!m) return null;
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  const day = parseInt(m[3], 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = new Date(year, month - 1, day, 0, 0, 0, 0);
+  if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) {
+    return null;
+  }
+  return d;
+}
+
+/**
+ * Parse YYYY-MM-DD strictly as local midnight; throws if invalid so callers cannot silently use today.
  */
 export function parseLocalDate(ymd: string): Date {
-  const m = ymd.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-  if (!m) {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
+  const strict = parseLocalDateStrict(ymd);
+  if (!strict) {
+    throw new Error(`无效的日期格式：${ymd}（期望 YYYY-MM-DD）`);
   }
-  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10), 0, 0, 0, 0);
+  return strict;
 }
 
 /**
  * Compute 1-based academic week number from termStartDate (Week 1 Monday).
  */
 export function computeTermWeek(termStartDate: string, now: Date = new Date()): number {
-  const start = parseLocalDate(termStartDate);
+  const start = parseLocalDateStrict(termStartDate);
+  if (!start) return 1;
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
   const diffDays = Math.floor((today.getTime() - start.getTime()) / (24 * 60 * 60 * 1000));
   if (diffDays < 0) return 1;
@@ -224,7 +268,10 @@ export function getDateForWeekAndDay(
   week: number,
   dayOfWeek: number
 ): Date {
-  const base = parseLocalDate(termStartDate);
+  const base = parseLocalDateStrict(termStartDate);
+  if (!base) {
+    throw new Error(`开学基准日期无效：${termStartDate}`);
+  }
   base.setDate(base.getDate() + (week - 1) * 7 + (dayOfWeek - 1));
   return base;
 }
@@ -266,14 +313,82 @@ export interface CourseOccurrence {
   end: Date;
 }
 
+export interface CourseWallClockOccurrence {
+  week: number;
+  year: number;
+  month: number; // 1..12
+  day: number; // 1..31
+  startHour: number;
+  startMinute: number;
+  endHour: number;
+  endMinute: number;
+}
+
+export function isCourseSchedulable(course: CourseItem): boolean {
+  return (
+    !course.parseWarning &&
+    course.dayOfWeek >= 1 &&
+    course.dayOfWeek <= 7 &&
+    course.startSection >= 1 &&
+    course.endSection >= course.startSection &&
+    course.weeks.length > 0
+  );
+}
+
+/**
+ * Expand a course into timezone-independent Asia/Shanghai wall-clock occurrences
+ * using UTC calendar arithmetic so device timezone abroad cannot shift dates.
+ */
+export function getCourseWallClockOccurrences(
+  course: CourseItem,
+  termStartDate: string,
+  periods: PeriodTime[]
+): CourseWallClockOccurrence[] {
+  if (!isCourseSchedulable(course)) return [];
+  const startMatch = String(termStartDate ?? '').trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!startMatch) return [];
+  const baseYear = parseInt(startMatch[1], 10);
+  const baseMonth = parseInt(startMatch[2], 10);
+  const baseDay = parseInt(startMatch[3], 10);
+  const check = new Date(Date.UTC(baseYear, baseMonth - 1, baseDay));
+  if (
+    check.getUTCFullYear() !== baseYear ||
+    check.getUTCMonth() !== baseMonth - 1 ||
+    check.getUTCDate() !== baseDay
+  ) {
+    return [];
+  }
+
+  const { startText, endText } = getCourseTimeSpan(course, periods);
+  const [sh, sm] = startText.split(':').map((v) => parseInt(v, 10));
+  const [eh, em] = endText.split(':').map((v) => parseInt(v, 10));
+
+  return course.weeks.map((week) => {
+    const dt = new Date(Date.UTC(baseYear, baseMonth - 1, baseDay + (week - 1) * 7 + (course.dayOfWeek - 1)));
+    return {
+      week,
+      year: dt.getUTCFullYear(),
+      month: dt.getUTCMonth() + 1,
+      day: dt.getUTCDate(),
+      startHour: Number.isFinite(sh) ? sh : 8,
+      startMinute: Number.isFinite(sm) ? sm : 10,
+      endHour: Number.isFinite(eh) ? eh : 9,
+      endMinute: Number.isFinite(em) ? em : 50,
+    };
+  });
+}
+
 /**
  * Expand a course into exact calendar Date ranges across all of its teaching weeks.
+ * Skips unparsed/unschedulable courses cleanly.
  */
 export function getCourseOccurrences(
   course: CourseItem,
   termStartDate: string,
   periods: PeriodTime[]
 ): CourseOccurrence[] {
+  if (!isCourseSchedulable(course)) return [];
+  if (!parseLocalDateStrict(termStartDate)) return [];
   const { startText, endText } = getCourseTimeSpan(course, periods);
   return course.weeks.map((week) => {
     const dayDate = getDateForWeekAndDay(termStartDate, week, course.dayOfWeek);
@@ -286,7 +401,7 @@ export function getCourseOccurrences(
 }
 
 /**
- * Find the earliest class for each day of the week (1..7) during a specific week.
+ * Find the earliest schedulable class for each day of the week (1..7) during a specific week.
  * Used for generating automatic smart morning wake-up alarms.
  */
 export function getFirstClassPerDayInWeek(
@@ -294,7 +409,7 @@ export function getFirstClassPerDayInWeek(
   week: number
 ): Map<number, CourseItem> {
   const map = new Map<number, CourseItem>();
-  const active = courses.filter((c) => c.weeks.includes(week));
+  const active = courses.filter((c) => isCourseSchedulable(c) && c.weeks.includes(week));
   for (const c of active) {
     const prev = map.get(c.dayOfWeek);
     if (!prev || c.startSection < prev.startSection) {

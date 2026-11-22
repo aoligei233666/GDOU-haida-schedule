@@ -13,14 +13,15 @@ export interface CourseItem {
   teacher: string;
   location: string;
   campus: string;
-  dayOfWeek: number; // 1 = Monday .. 7 = Sunday
-  startSection: number; // 1 .. 12
-  endSection: number; // 1 .. 12
-  weeks: number[]; // sorted unique teaching week numbers
+  dayOfWeek: number; // 1 = Monday .. 7 = Sunday (0 if unparsed)
+  startSection: number; // 1 .. 16 (0 if unparsed)
+  endSection: number; // 1 .. 16 (0 if unparsed)
+  weeks: number[]; // sorted unique teaching week numbers (empty if unparsed)
   weekText: string; // original display string e.g. "1-16周(单)"
   credit: string;
   classGroup: string;
   colorIndex: number;
+  parseWarning?: string;
 }
 
 export interface ExamItem {
@@ -52,6 +53,8 @@ export interface GradeItem {
   scoreText: string; // cj raw text ("92", "优秀", "合格")
   numericScore: number | null; // bfzcj or converted numeric score
   gpa: number; // jd
+  gpaEstimated?: boolean; // true when jd was absent and mapped locally
+  scoreEstimated?: boolean; // true when numericScore was mapped from text label
   courseCategory: string; // kclbmc / kcxzmc e.g. "必修课", "专业核心课", "通识选修课"
   examNature: string; // ksxz e.g. "正常考试", "补考一", "重修"
   teacher: string;
@@ -66,6 +69,7 @@ export interface GpaSummary {
   weightedAvgScore: number;
   totalCourses: number;
   passedCourses: number;
+  hasEstimatedItems: boolean;
   byCategory: { category: string; credits: number; count: number }[];
 }
 
@@ -97,6 +101,13 @@ export interface AppSettings {
   examAdvanceMinutes: number;
 }
 
+export interface LogoutVerificationDetails {
+  attempted: number;
+  succeeded: number;
+  casLoggedOut: boolean;
+  failedEndpoints: string[];
+}
+
 export interface SyncReceipt {
   syncedAtIso: string;
   mode: 'direct' | 'webview';
@@ -105,8 +116,10 @@ export interface SyncReceipt {
   coursesCount: number;
   examsCount: number;
   gradesCount: number;
-  credentialsPurged: true;
+  credentialsPurged: boolean;
   sessionLoggedOut: boolean;
+  logoutDetails?: LogoutVerificationDetails;
+  warnings?: string[];
   steps: string[];
 }
 
@@ -130,7 +143,7 @@ export interface PersistedAppData {
 
 /**
  * Ephemeral credentials object that exists ONLY inside an active login call
- * and is overwritten immediately after building the encrypted auth payload.
+ * and has its references cleared immediately after constructing the encrypted payload.
  */
 export interface EphemeralCredentials {
   username: string;

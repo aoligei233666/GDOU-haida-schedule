@@ -143,6 +143,16 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
               </View>
             )}
 
+            {/* Estimated GPA disclosure when local grade-to-GPA fallback was used */}
+            {summary.hasEstimatedItems && (
+              <View style={styles.estimateBanner}>
+                <Ionicons name="information-circle-outline" size={16} color={COLORS.amber} />
+                <Text style={styles.estimateText}>
+                  注：标注「估算」的课程因教务未返回官方绩点/百分制字段，已按五级制与海大常规规则估算，仅供参考，以教务系统官方成绩单为准。
+                </Text>
+              </View>
+            )}
+
             {/* Course Grade Items */}
             {filteredGrades.map((item) => {
               const scoreBadge = !item.passed
@@ -166,7 +176,10 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
                           <Text style={styles.tagText}>{item.credit} 学分</Text>
                         </View>
                         <View style={styles.tag}>
-                          <Text style={styles.tagText}>绩点 {item.gpa.toFixed(2)}</Text>
+                          <Text style={styles.tagText}>
+                            绩点 {item.gpa.toFixed(2)}
+                            {item.gpaEstimated ? ' (估算)' : ''}
+                          </Text>
                         </View>
                         {item.examNature && item.examNature !== '正常考试' && (
                           <View style={[styles.tag, { backgroundColor: COLORS.coralLight }]}>
@@ -364,6 +377,21 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
     marginBottom: 2,
+  },
+  estimateBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: COLORS.amberLight,
+    borderRadius: 10,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    gap: 6,
+  },
+  estimateText: {
+    flex: 1,
+    fontSize: 11.5,
+    color: '#92400E',
+    lineHeight: 16,
   },
   catHeader: {
     flexDirection: 'row',

@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
-import React, { Component, ErrorInfo, ReactNode, useEffect, useState } from 'react';
+import React, { Component, ErrorInfo, ReactNode, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -48,11 +48,11 @@ const TABS: {
 
 class RootErrorBoundary extends Component<
   { children: ReactNode },
-  { hasError: boolean; message: string }
+  { hasError: boolean; message: string; resetKey: number }
 > {
   constructor(props: { children: ReactNode }) {
     super(props);
-    this.state = { hasError: false, message: '' };
+    this.state = { hasError: false, message: '', resetKey: 0 };
   }
 
   static getDerivedStateFromError(error: Error) {
@@ -71,7 +71,13 @@ class RootErrorBoundary extends Component<
           <Text style={styles.errorBoundaryDesc}>{this.state.message}</Text>
           <TouchableOpacity
             style={styles.errorBoundaryBtn}
-            onPress={() => this.setState({ hasError: false, message: '' })}
+            onPress={() =>
+              this.setState((prev) => ({
+                hasError: false,
+                message: '',
+                resetKey: prev.resetKey + 1,
+              }))
+            }
           >
             <Text style={styles.errorBoundaryBtnText}>重新加载页面</Text>
           </TouchableOpacity>
@@ -79,31 +85,42 @@ class RootErrorBoundary extends Component<
         </View>
       );
     }
-    return this.props.children;
+    return <React.Fragment key={this.state.resetKey}>{this.props.children}</React.Fragment>;
   }
 }
 
 function MainApp() {
   const [ready, setReady] = useState(false);
   const [activeTab, setActiveTab] = useState<TabKey>('schedule');
+  const [visitedTabs, setVisitedTabs] = useState<Record<TabKey, boolean>>({
+    schedule: true,
+    exams: false,
+    grades: false,
+    alarms: false,
+    settings: false,
+  });
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [appData, setAppData] = useState<PersistedAppData>(() => createInitialAppData());
+
+  // Tracks user-initiated mutations so useEffect persists outside React's state updater
+  const dirtyVersionRef = useRef(0);
+  const savedVersionRef = useRef(0);
 
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
         await initializeAlarmEngine();
-      } catch {
-        // Non-fatal on startup
+      } catch (err) {
+        console.warn('Alarm init warning:', err);
       }
       try {
         const loaded = await loadPersistedData();
         if (mounted) {
           setAppData(loaded);
         }
-      } catch {
-        // Use initial defaults if storage is corrupted
+      } catch (err) {
+        console.warn('Load persisted data warning:', err);
       } finally {
         if (mounted) {
           setReady(true);
@@ -115,16 +132,45 @@ function MainApp() {
     };
   }, []);
 
-  const persistUpdate = (updater: (prev: PersistedAppData) => PersistedAppData) => {
-    setAppData((prev) => {
-      const next = updater(prev);
-      void savePersistedData(next);
-      return next;
-    });
+  // Side-effect safe persistence outside setState updater (StrictMode compliant)
+  useEffect(() => {
+    if (!ready) return;
+    const versionToSave = dirtyVersionRef.current;
+    if (versionToSave === savedVersionRef.current) return;
+
+    let cancelled = false;
+    void savePersistedData(appData)
+      .then(() => {
+        if (!cancelled) {
+          savedVersionRef.current = versionToSave;
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          Alert.alert(
+            '本地保存失败',
+            `无法写入本地存储：${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [appData, ready]);
+
+  const mutateAppData = (updater: (prev: PersistedAppData) => PersistedAppData) => {
+    dirtyVersionRef.current += 1;
+    setAppData(updater);
+  };
+
+  const handleSelectTab = (key: TabKey) => {
+    setActiveTab(key);
+    setVisitedTabs((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
   };
 
   const handleSyncSuccess = (result: SyncResult) => {
-    persistUpdate((prev) => {
+    mutateAppData((prev) => {
       const manualExams = prev.exams.filter((e) => e.isManual);
       return {
         ...prev,
@@ -139,15 +185,31 @@ function MainApp() {
       };
     });
 
+    const { receipt } = result;
+    const logoutText = receipt.sessionLoggedOut
+      ? '教务与统一认证会话已通过 HTTP 校验注销。'
+      : `远端注销仅确认 ${receipt.logoutDetails?.succeeded ?? 0}/${
+          receipt.logoutDetails?.attempted ?? 0
+        } 项（可能因网络超时），建议留意官网登录状态。`;
+    const purgeText = receipt.credentialsPurged
+      ? '本地未保存任何账号密码与 Cookie。'
+      : '请前往「关于设置 -> 零留存检测」复核本地状态。';
+    const warningBlock =
+      receipt.warnings && receipt.warnings.length > 0
+        ? `\n\n注意事项：\n• ${receipt.warnings.slice(0, 3).join('\n• ')}`
+        : '';
+
     Alert.alert(
-      '同步完成 · 凭据已销毁',
-      `成功拉取：\n• 课程安排：${result.courses.length} 项\n• 考试日程：${result.exams.length} 场\n• 成绩与学分：${result.grades.length} 门\n（${result.termLabel}）\n\n您的学号与密码已从内存中彻底清除，教务会话已注销，本地未保存任何登录凭据。`
+      receipt.sessionLoggedOut && receipt.credentialsPurged
+        ? '同步完成 · 已核验注销'
+        : '同步完成 · 请留意回执',
+      `成功拉取：\n• 课程安排：${result.courses.length} 项\n• 考试日程：${result.exams.length} 场\n• 成绩与学分：${result.grades.length} 门\n（${result.termLabel}）\n\n${logoutText}\n${purgeText}${warningBlock}`
     );
   };
 
   const handleLoadSample = () => {
     const sample = buildSampleGdouData();
-    persistUpdate((prev) => ({
+    mutateAppData((prev) => ({
       ...prev,
       courses: sample.courses,
       exams: sample.exams,
@@ -157,35 +219,35 @@ function MainApp() {
   };
 
   const handleAddAlarms = (newAlarms: AlarmRule[]) => {
-    persistUpdate((prev) => ({
+    mutateAppData((prev) => ({
       ...prev,
       alarms: [...newAlarms, ...prev.alarms],
     }));
   };
 
   const handleReplaceAlarms = (alarms: AlarmRule[]) => {
-    persistUpdate((prev) => ({
+    mutateAppData((prev) => ({
       ...prev,
       alarms,
     }));
   };
 
   const handleAddManualExam = (exam: ExamItem) => {
-    persistUpdate((prev) => ({
+    mutateAppData((prev) => ({
       ...prev,
       exams: [...prev.exams, exam],
     }));
   };
 
   const handleDeleteExam = (examId: string) => {
-    persistUpdate((prev) => ({
+    mutateAppData((prev) => ({
       ...prev,
       exams: prev.exams.filter((e) => e.id !== examId),
     }));
   };
 
   const handleUpdateSettings = (settings: AppSettings) => {
-    persistUpdate((prev) => ({
+    mutateAppData((prev) => ({
       ...prev,
       settings,
     }));
@@ -194,12 +256,21 @@ function MainApp() {
   const handleClearAll = async () => {
     try {
       await cancelAllScheduledAlarms();
-    } catch {
-      // ignore
+    } catch (err) {
+      console.warn('Cancel alarms during clear warning:', err);
     }
-    await clearAllLocalData();
-    setAppData(createInitialAppData());
-    Alert.alert('已清空', '本地课表、考试、成绩和闹钟数据已全部清除。');
+    try {
+      await clearAllLocalData();
+      const fresh = createInitialAppData();
+      savedVersionRef.current = dirtyVersionRef.current;
+      setAppData(fresh);
+      Alert.alert('已清空', '本地课表、考试、成绩和闹钟数据已全部清除。');
+    } catch (err) {
+      Alert.alert(
+        '清空失败',
+        `无法清除本地存储：${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   };
 
   if (!ready) {
@@ -217,55 +288,66 @@ function MainApp() {
     <SafeAreaView style={styles.safeRoot} edges={['top', 'left', 'right']}>
       <StatusBar style="light" />
 
+      {/* Keep visited tabs mounted (display toggle) to preserve scroll & filter state */}
       <View style={styles.screenContainer}>
-        {activeTab === 'schedule' && (
-          <ScheduleScreen
-            courses={appData.courses}
-            termLabel={appData.termLabel}
-            settings={appData.settings}
-            onOpenSync={() => setSyncModalOpen(true)}
-            onLoadSampleData={handleLoadSample}
-            onAlarmsAdded={handleAddAlarms}
-          />
+        {visitedTabs.schedule && (
+          <View style={[styles.tabPane, activeTab !== 'schedule' && styles.tabPaneHidden]}>
+            <ScheduleScreen
+              courses={appData.courses}
+              termLabel={appData.termLabel}
+              settings={appData.settings}
+              onOpenSync={() => setSyncModalOpen(true)}
+              onLoadSampleData={handleLoadSample}
+              onAlarmsAdded={handleAddAlarms}
+            />
+          </View>
         )}
 
-        {activeTab === 'exams' && (
-          <ExamsScreen
-            exams={appData.exams}
-            settings={appData.settings}
-            onOpenSync={() => setSyncModalOpen(true)}
-            onAddManualExam={handleAddManualExam}
-            onDeleteExam={handleDeleteExam}
-            onAlarmsAdded={handleAddAlarms}
-          />
+        {visitedTabs.exams && (
+          <View style={[styles.tabPane, activeTab !== 'exams' && styles.tabPaneHidden]}>
+            <ExamsScreen
+              exams={appData.exams}
+              settings={appData.settings}
+              onOpenSync={() => setSyncModalOpen(true)}
+              onAddManualExam={handleAddManualExam}
+              onDeleteExam={handleDeleteExam}
+              onAlarmsAdded={handleAddAlarms}
+            />
+          </View>
         )}
 
-        {activeTab === 'grades' && (
-          <GradesScreen
-            grades={appData.grades}
-            onOpenSync={() => setSyncModalOpen(true)}
-          />
+        {visitedTabs.grades && (
+          <View style={[styles.tabPane, activeTab !== 'grades' && styles.tabPaneHidden]}>
+            <GradesScreen
+              grades={appData.grades}
+              onOpenSync={() => setSyncModalOpen(true)}
+            />
+          </View>
         )}
 
-        {activeTab === 'alarms' && (
-          <AlarmsScreen
-            courses={appData.courses}
-            exams={appData.exams}
-            alarms={appData.alarms}
-            termLabel={appData.termLabel}
-            settings={appData.settings}
-            onAlarmsUpdated={handleReplaceAlarms}
-          />
+        {visitedTabs.alarms && (
+          <View style={[styles.tabPane, activeTab !== 'alarms' && styles.tabPaneHidden]}>
+            <AlarmsScreen
+              courses={appData.courses}
+              exams={appData.exams}
+              alarms={appData.alarms}
+              termLabel={appData.termLabel}
+              settings={appData.settings}
+              onAlarmsUpdated={handleReplaceAlarms}
+            />
+          </View>
         )}
 
-        {activeTab === 'settings' && (
-          <SettingsScreen
-            settings={appData.settings}
-            lastSyncReceipt={appData.lastSyncReceipt}
-            onUpdateSettings={handleUpdateSettings}
-            onClearAllData={handleClearAll}
-            onOpenSync={() => setSyncModalOpen(true)}
-          />
+        {visitedTabs.settings && (
+          <View style={[styles.tabPane, activeTab !== 'settings' && styles.tabPaneHidden]}>
+            <SettingsScreen
+              settings={appData.settings}
+              lastSyncReceipt={appData.lastSyncReceipt}
+              onUpdateSettings={handleUpdateSettings}
+              onClearAllData={handleClearAll}
+              onOpenSync={() => setSyncModalOpen(true)}
+            />
+          </View>
         )}
       </View>
 
@@ -278,7 +360,7 @@ function MainApp() {
               <TouchableOpacity
                 key={tab.key}
                 style={styles.tabItem}
-                onPress={() => setActiveTab(tab.key)}
+                onPress={() => handleSelectTab(tab.key)}
               >
                 <Ionicons
                   name={focused ? tab.activeIcon : tab.icon}
@@ -321,6 +403,12 @@ const styles = StyleSheet.create({
   screenContainer: {
     flex: 1,
     backgroundColor: COLORS.bg,
+  },
+  tabPane: {
+    flex: 1,
+  },
+  tabPaneHidden: {
+    display: 'none',
   },
   splash: {
     flex: 1,

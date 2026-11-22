@@ -22,6 +22,20 @@ interface RawZfExam {
   jklsmc?: string;
 }
 
+function isValidYmd(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
+function isValidHm(hhmm: string): boolean {
+  const m = hhmm.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return false;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  return h >= 0 && h <= 23 && min >= 0 && min <= 59;
+}
+
 /**
  * Parse 正方考试时间 formats such as:
  * - "2026-06-18(09:00-11:00)"
@@ -50,11 +64,18 @@ export function parseExamDateTime(
   const dateMatch = combined.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
   const timeMatch = combined.match(/(\d{1,2}:\d{2})\s*[-~至]\s*(\d{1,2}:\d{2})/);
 
-  const dateText = dateMatch
-    ? `${dateMatch[1]}-${dateMatch[2].padStart(2, '0')}-${dateMatch[3].padStart(2, '0')}`
-    : '';
-  const startTimeText = timeMatch ? padTime(timeMatch[1]) : '';
-  const endTimeText = timeMatch ? padTime(timeMatch[2]) : '';
+  let dateText = '';
+  if (dateMatch) {
+    const y = parseInt(dateMatch[1], 10);
+    const m = parseInt(dateMatch[2], 10);
+    const d = parseInt(dateMatch[3], 10);
+    if (isValidYmd(y, m, d)) {
+      dateText = `${dateMatch[1]}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+
+  const startTimeText = timeMatch && isValidHm(timeMatch[1]) ? padTime(timeMatch[1]) : '';
+  const endTimeText = timeMatch && isValidHm(timeMatch[2]) ? padTime(timeMatch[2]) : '';
 
   const startIso = dateText && startTimeText ? `${dateText}T${startTimeText}:00` : null;
   const endIso = dateText && endTimeText ? `${dateText}T${endTimeText}:00` : null;
@@ -89,14 +110,22 @@ export function parseZfExamResponse(raw: unknown): ExamItem[] {
     const courseName = String(item.kcmc ?? '').trim();
     if (!courseName) continue;
 
-    const rawTimeText = String(
-      item.kssj ?? [item.ksrq, item.qzsj].filter(Boolean).join(' ') ?? ''
-    ).trim();
+    // Properly fall back when kssj is empty string "" while ksrq/qzsj are provided
+    const kssjClean = String(item.kssj ?? '').trim();
+    const fallbackCombined = [item.ksrq, item.qzsj]
+      .map((v) => String(v ?? '').trim())
+      .filter(Boolean)
+      .join(' ');
     const { dateText, startTimeText, endTimeText, startIso, endIso } = parseExamDateTime(
-      item.kssj,
+      kssjClean || undefined,
       item.ksrq,
       item.qzsj
     );
+    const derivedFormatted =
+      dateText && startTimeText && endTimeText
+        ? `${dateText}(${startTimeText}-${endTimeText})`
+        : dateText;
+    const rawTimeText = kssjClean || fallbackCombined || derivedFormatted;
 
     const location = String(item.cdmc ?? item.jsmc ?? item.ksdd ?? '考场待公布').trim();
     const seatNumber = String(item.zwh ?? item.jsz ?? '').trim();
@@ -112,7 +141,7 @@ export function parseZfExamResponse(raw: unknown): ExamItem[] {
     seen.add(dedup);
 
     exams.push({
-      id: `exam-${i}-${courseCode || courseName}-${dateText || i}`,
+      id: `exam-${courseCode || courseName}-${dateText || i}-${i}`,
       courseName,
       courseCode,
       examType,
@@ -130,8 +159,8 @@ export function parseZfExamResponse(raw: unknown): ExamItem[] {
   }
 
   exams.sort((a, b) => {
-    const ta = a.startIso ? new Date(a.startIso).getTime() : Number.MAX_SAFE_INTEGER;
-    const tb = b.startIso ? new Date(b.startIso).getTime() : Number.MAX_SAFE_INTEGER;
+    const ta = a.startIso ? parseExamIsoLocal(a.startIso).getTime() : Number.MAX_SAFE_INTEGER;
+    const tb = b.startIso ? parseExamIsoLocal(b.startIso).getTime() : Number.MAX_SAFE_INTEGER;
     return ta - tb;
   });
 
@@ -149,7 +178,9 @@ export function getExamCountdown(exam: ExamItem, now: Date = new Date()): ExamCo
     return { status: 'tbd', daysLeft: 999, label: '时间待定' };
   }
   const examStart = parseExamIsoLocal(exam.startIso);
-  const examEnd = exam.endIso ? parseExamIsoLocal(exam.endIso) : new Date(examStart.getTime() + 2 * 3600 * 1000);
+  const examEnd = exam.endIso
+    ? parseExamIsoLocal(exam.endIso)
+    : new Date(examStart.getTime() + 2 * 3600 * 1000);
 
   if (now.getTime() > examEnd.getTime()) {
     return { status: 'past', daysLeft: -1, label: '已结束' };
