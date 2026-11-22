@@ -74,13 +74,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
 
   // WebView ephemeral state
   const [webViewKey, setWebViewKey] = useState(0);
+  const [webViewProgress, setWebViewProgress] = useState(0);
   const [webViewStatus, setWebViewStatus] = useState(
-    '请在下方海大官方认证页完成登录（支持短信/企业微信验证码），登录成功后将自动提取课表、考试与绩点学分并销毁页面'
+    '请完成海大官方登录（用完即删，自动提取课表/考试/绩点）'
   );
   const webViewRef = useRef<WebView<object> | null>(null);
+  // Tracks which (session + username) pair has already fetched its captcha so onBlur never overwrites it
+  const captchaSessionKeyRef = useRef<string>('');
 
-  const wipeFormInputs = () => {
-    setUsername('');
+  const wipeFormInputs = (keepUsername = false) => {
+    if (!keepUsername) setUsername('');
     setPassword('');
     setCaptcha('');
     setShowPassword(false);
@@ -88,6 +91,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     setCaptchaUri(undefined);
     setMfaCode('');
     setMfaHint(null);
+    captchaSessionKeyRef.current = '';
   };
 
   useEffect(() => {
@@ -98,6 +102,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       if (mode === 'direct') {
         void initDirectSession();
       } else {
+        setWebViewStatus('请完成海大官方登录（用完即删，自动提取课表/考试/绩点）');
+        setWebViewProgress(0.15);
         setWebViewKey((k) => k + 1);
       }
     } else {
@@ -109,45 +115,78 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           mfaChallenge.session.isWebVpn
         );
       }
-      wipeFormInputs();
+      wipeFormInputs(false);
       setMfaChallenge(null);
       setSession(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, mode]);
 
-  const initDirectSession = async () => {
+  const initDirectSession = async (autoCheckUsername?: string) => {
     setPreparing(true);
     setErrorText(null);
+    // CRITICAL: Reset any stale captcha image whenever a brand-new JSESSIONID is initialized
+    setNeedCaptcha(false);
+    setCaptchaUri(undefined);
+    setCaptcha('');
+    captchaSessionKeyRef.current = '';
     try {
       const prepared = await prepareGdouAuthSession();
       setSession(prepared);
+      const targetUser = (autoCheckUsername ?? '').trim();
+      if (targetUser) {
+        const res = await checkGdouCaptcha(prepared, targetUser);
+        if (res.isNeed) {
+          setNeedCaptcha(true);
+          setCaptchaUri(res.imageDataUri);
+          captchaSessionKeyRef.current = `${prepared.pwdEncryptSalt}|${prepared.execution}|${targetUser}`;
+        }
+      }
+      return prepared;
     } catch (err) {
       setErrorText(
         `无法连接海大教务入口 (${GDOU_ENTRY_URL})：${
           err instanceof Error ? err.message : String(err)
         }`
       );
+      return null;
     } finally {
       setPreparing(false);
     }
   };
 
   const handleUsernameBlur = async () => {
-    if (!session || !username.trim()) return;
-    const res = await checkGdouCaptcha(session, username.trim());
+    const trimmed = username.trim();
+    if (!session || !trimmed || preparing || syncing) return;
+    const key = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
+    // Never silently re-fetch & overwrite an already displayed captcha for this exact JSESSIONID
+    if (captchaSessionKeyRef.current === key && needCaptcha && captchaUri) {
+      return;
+    }
+    const res = await checkGdouCaptcha(session, trimmed);
     setNeedCaptcha(res.isNeed);
     setCaptchaUri(res.imageDataUri);
+    if (res.isNeed && res.imageDataUri) {
+      captchaSessionKeyRef.current = key;
+    }
   };
 
   const handleRefreshCaptcha = async () => {
-    if (!session) return;
+    if (!session || preparing || syncing) return;
+    setCaptcha('');
     const uri = await fetchGdouCaptchaImage(session);
-    if (uri) setCaptchaUri(uri);
+    if (uri) {
+      setCaptchaUri(uri);
+      const trimmed = username.trim();
+      if (trimmed) {
+        captchaSessionKeyRef.current = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
+      }
+    }
   };
 
   const handleDirectSync = async () => {
-    if (!username.trim() || !password) {
+    const trimmedUser = username.trim();
+    if (!trimmedUser || !password) {
       setErrorText('请输入学号和密码（仅用于本次即时拉取，用完立即销毁）');
       return;
     }
@@ -158,24 +197,19 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
 
     let activeSession = session;
     if (!activeSession) {
-      setPreparing(true);
-      try {
-        activeSession = await prepareGdouAuthSession();
-        setSession(activeSession);
-      } catch (err) {
-        setPreparing(false);
-        setErrorText(`连接认证入口失败：${err instanceof Error ? err.message : String(err)}`);
-        return;
-      }
-      setPreparing(false);
+      activeSession = await initDirectSession();
+      if (!activeSession) return;
     }
 
     const ephemeral: EphemeralCredentials = {
-      username: username.trim(),
+      username: trimmedUser,
       password,
       captcha: captcha.trim(),
     };
-    wipeFormInputs();
+    // Wipe password & captcha immediately before network I/O; keep username only if retry is needed (wiped on success/close)
+    setPassword('');
+    setCaptcha('');
+    setShowPassword(false);
 
     setSyncing(true);
     setErrorText(null);
@@ -192,24 +226,27 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       );
 
       if (outcome.status === 'mfa_required') {
+        wipeFormInputs(false);
         setMfaChallenge(outcome.mfa);
         setMfaType(outcome.mfa.defaultReAuthType);
         setMfaHint('海大统一认证检测到新设备登录，请选择「企业微信验证码」或「短信验证码」点击获取');
         return;
       }
 
+      wipeFormInputs(false);
       onSyncSuccess(outcome.result);
       onClose();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorText(msg);
-      const refreshed = await prepareGdouAuthSession().catch(() => null);
-      if (refreshed) {
-        setSession(refreshed);
-        if (msg.includes('验证码') || msg.includes('动态码')) {
-          const uri = await fetchGdouCaptchaImage(refreshed).catch(() => undefined);
+      // Re-initialize a brand-new JSESSIONID and fetch its exact matching captcha image atomically
+      const refreshed = await initDirectSession(trimmedUser);
+      if (refreshed && (msg.includes('验证码') || msg.includes('动态码')) && !captchaSessionKeyRef.current) {
+        const uri = await fetchGdouCaptchaImage(refreshed).catch(() => undefined);
+        if (uri) {
           setNeedCaptcha(true);
           setCaptchaUri(uri);
+          captchaSessionKeyRef.current = `${refreshed.pwdEncryptSalt}|${refreshed.execution}|${trimmedUser}`;
         }
       }
     } finally {
@@ -352,40 +389,49 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         style={styles.root}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        {/* Header */}
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.headerTitle}>无痕同步海大教务</Text>
-            <Text style={styles.headerSub}>课表 · 考试 · 绩点 · 学分 一键拉取</Text>
+        {/* Header (compact in WebView mode so official page has max viewport) */}
+        <View style={[styles.header, mode === 'webview' && styles.headerCompact]}>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.headerTitle, mode === 'webview' && { fontSize: 16 }]}>
+              无痕同步海大教务
+            </Text>
+            {mode === 'direct' && (
+              <Text style={styles.headerSub}>课表 · 考试 · 绩点 · 学分 一键拉取</Text>
+            )}
           </View>
           <TouchableOpacity onPress={handleClose} style={styles.closeBtn} hitSlop={10}>
             <Ionicons name="close" size={24} color={COLORS.textSecondary} />
           </TouchableOpacity>
         </View>
 
-        {/* Zero-Retention Privacy Guarantee Banner */}
-        <View style={styles.privacyBanner}>
-          <Ionicons name="shield-checkmark" size={20} color={COLORS.emerald} />
-          <View style={styles.privacyTextWrap}>
-            <Text style={styles.privacyTitle}>凭据用完即删 · 零留存保护已开启</Text>
-            <Text style={styles.privacyDesc}>
-              账号和密码仅在点击拉取的瞬间用于海大官方认证，拉取完成后立即注销服务端会话并清除内存，绝不保存任何账号、密码或 Cookie。
-            </Text>
+        {/* Zero-Retention Privacy Guarantee Banner (full on direct tab; compact status strip on WebView tab) */}
+        {mode === 'direct' && (
+          <View style={styles.privacyBanner}>
+            <Ionicons name="shield-checkmark" size={20} color={COLORS.emerald} />
+            <View style={styles.privacyTextWrap}>
+              <Text style={styles.privacyTitle}>凭据用完即删 · 零留存保护已开启</Text>
+              <Text style={styles.privacyDesc}>
+                账号和密码仅在点击拉取的瞬间用于海大官方认证，拉取完成后立即注销服务端会话并清除内存，绝不保存任何账号、密码或 Cookie。
+              </Text>
+            </View>
           </View>
-        </View>
+        )}
 
         {/* Mode Switcher */}
-        <View style={styles.modeTabs}>
+        <View style={[styles.modeTabs, mode === 'webview' && { marginTop: 8 }]}>
           <TouchableOpacity
             style={[styles.modeTab, mode === 'direct' && styles.modeTabActive]}
             onPress={() => setMode('direct')}
           >
             <Ionicons
               name="flash-outline"
-              size={16}
+              size={15}
               color={mode === 'direct' ? COLORS.white : COLORS.textSecondary}
             />
-            <Text style={[styles.modeTabText, mode === 'direct' && styles.modeTabTextActive]}>
+            <Text
+              style={[styles.modeTabText, mode === 'direct' && styles.modeTabTextActive]}
+              numberOfLines={1}
+            >
               极速直连登录
             </Text>
           </TouchableOpacity>
@@ -395,11 +441,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           >
             <Ionicons
               name="globe-outline"
-              size={16}
+              size={15}
               color={mode === 'webview' ? COLORS.white : COLORS.textSecondary}
             />
-            <Text style={[styles.modeTabText, mode === 'webview' && styles.modeTabTextActive]}>
-              官方无痕网页（支持扫码/短信）
+            <Text
+              style={[styles.modeTabText, mode === 'webview' && styles.modeTabTextActive]}
+              numberOfLines={1}
+            >
+              官网无痕网页
             </Text>
           </TouchableOpacity>
         </View>
@@ -423,7 +472,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                   </Text>
                 </View>
               ) : (
-                <TouchableOpacity onPress={initDirectSession} style={styles.rowCenter}>
+                <TouchableOpacity onPress={() => void initDirectSession(username)} style={styles.rowCenter}>
                   <Ionicons name="refresh" size={18} color={COLORS.coral} />
                   <Text style={[styles.routeText, { color: COLORS.coral }]}>
                     点击重新连接海大认证入口
@@ -549,16 +598,17 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
 
                 {needCaptcha && (
                   <View style={styles.captchaBox}>
-                    <Text style={styles.fieldLabel}>图形验证码</Text>
+                    <Text style={styles.fieldLabel}>图形验证码（点击图片可刷新）</Text>
                     <View style={styles.captchaRow}>
                       <TextInput
                         style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}
-                        placeholder="输入右侧验证码"
+                        placeholder="输入右侧 4 位验证码"
                         placeholderTextColor={COLORS.textMuted}
                         value={captcha}
                         onChangeText={setCaptcha}
                         autoCapitalize="none"
                         autoCorrect={false}
+                        editable={!syncing}
                       />
                       <TouchableOpacity onPress={handleRefreshCaptcha} style={styles.captchaImgWrap}>
                         {captchaUri ? (
@@ -656,13 +706,35 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         ) : (
           <View style={styles.webViewWrap}>
             <View style={styles.webViewStatusBar}>
-              <Ionicons name="shield-outline" size={16} color={COLORS.oceanPrimary} />
-              <Text style={styles.webViewStatusText} numberOfLines={2}>
+              <Ionicons name="shield-checkmark" size={15} color={COLORS.emerald} />
+              <Text style={styles.webViewStatusText} numberOfLines={1}>
                 {webViewStatus}
               </Text>
+              <TouchableOpacity
+                onPress={() => webViewRef.current?.goBack()}
+                style={styles.webViewActionBtn}
+                hitSlop={6}
+              >
+                <Ionicons name="arrow-back" size={16} color={COLORS.textSecondary} />
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => {
+                  setErrorText(null);
+                  setWebViewKey((k) => k + 1);
+                }}
+                style={styles.webViewActionBtn}
+                hitSlop={6}
+              >
+                <Ionicons name="refresh" size={16} color={COLORS.oceanPrimary} />
+              </TouchableOpacity>
             </View>
+            {webViewProgress > 0 && webViewProgress < 1 && (
+              <View style={styles.progressTrack}>
+                <View style={[styles.progressFill, { width: `${Math.round(webViewProgress * 100)}%` }]} />
+              </View>
+            )}
             {errorText && (
-              <View style={[styles.errorBox, { marginHorizontal: 14, marginTop: 8 }]}>
+              <View style={[styles.errorBox, { marginHorizontal: 12, marginTop: 6, marginBottom: 4 }]}>
                 <Ionicons name="alert-circle" size={16} color={COLORS.danger} />
                 <Text style={styles.errorText}>{errorText}</Text>
               </View>
@@ -670,18 +742,28 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
             <WebView<object>
               key={webViewKey}
               ref={webViewRef}
-              source={{ uri: GDOU_ENTRY_URL }}
+              source={{
+                uri: session?.isWebVpn === false ? GDOU_ENTRY_URL : 'https://wfw.gdou.edu.cn/',
+              }}
               incognito={true}
               cacheEnabled={false}
               saveFormDataDisabled={true}
               sharedCookiesEnabled={false}
+              thirdPartyCookiesEnabled={true}
               javaScriptEnabled={true}
               domStorageEnabled={true}
+              scalesPageToFit={true}
+              setBuiltInZoomControls={false}
+              mixedContentMode="compatibility"
               injectedJavaScript={injectedWebViewJs}
+              onLoadProgress={({ nativeEvent }) => {
+                setWebViewProgress(nativeEvent.progress);
+              }}
               onNavigationStateChange={() => {
                 webViewRef.current?.injectJavaScript(injectedWebViewJs);
               }}
               onLoadEnd={() => {
+                setWebViewProgress(1);
                 webViewRef.current?.injectJavaScript(injectedWebViewJs);
               }}
               onMessage={handleWebViewMessage}
@@ -709,6 +791,10 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.surface,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
+  },
+  headerCompact: {
+    paddingTop: Platform.OS === 'ios' ? 12 : 10,
+    paddingBottom: 8,
   },
   headerTitle: {
     fontSize: 18,
@@ -1010,25 +1096,42 @@ const styles = StyleSheet.create({
   },
   webViewWrap: {
     flex: 1,
-    marginTop: 10,
+    marginTop: 8,
   },
   webViewStatusBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    backgroundColor: COLORS.oceanTint,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    gap: 6,
+    backgroundColor: COLORS.emeraldLight,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
     borderTopWidth: 1,
     borderBottomWidth: 1,
-    borderColor: COLORS.oceanLight,
+    borderColor: '#A7F3D0',
   },
   webViewStatusText: {
     flex: 1,
     fontSize: 12,
-    color: COLORS.oceanDeep,
+    color: '#065F46',
+    fontWeight: '600',
+  },
+  webViewActionBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.85)',
+  },
+  progressTrack: {
+    height: 2.5,
+    backgroundColor: COLORS.borderLight,
+    width: '100%',
+  },
+  progressFill: {
+    height: 2.5,
+    backgroundColor: COLORS.oceanPrimary,
   },
   webView: {
     flex: 1,
+    backgroundColor: COLORS.white,
   },
 });
