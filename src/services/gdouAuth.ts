@@ -14,6 +14,24 @@ import { parseZfScheduleResponse } from './scheduleParser';
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
+const GDOU_DEVICE_BFP = '8F14E45FCEEA167A5A36DEDD4BEA2543';
+
+/**
+ * Pure volatile RAM slot used ONLY during the brief window between Step 1 (password accepted,
+ * MFA code requested) and Step 2 (MFA code submitted) on off-campus WebVPN, where `wfw.gdou.edu.cn`
+ * requires authenticating `jw.gdou.edu.cn` inside its own server-side `WFWSESSID` jar.
+ * Never persisted to disk, never placed in React state, and unconditionally zeroed on completion/error/cancel.
+ */
+let pendingMfaSecret: { username: string; password: string } | null = null;
+
+export function clearPendingMfaSecret(): void {
+  if (pendingMfaSecret) {
+    pendingMfaSecret.username = '\0'.repeat(pendingMfaSecret.username.length);
+    pendingMfaSecret.password = '\0'.repeat(pendingMfaSecret.password.length);
+    pendingMfaSecret = null;
+  }
+}
+
 export interface PreparedAuthSession {
   entryFinalUrl: string;
   authOrigin: string; // "https://authserver.gdou.edu.cn"
@@ -115,7 +133,11 @@ export async function prepareGdouAuthSession(): Promise<PreparedAuthSession> {
     ? 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn'
     : 'https://jw.gdou.edu.cn';
 
-  const serviceUrl = extractServiceUrl(netHtml) || 'https://jw.gdou.edu.cn/sso/jziotlogin';
+  // CRITICAL (Off-campus WebVPN): wfw.gdou.edu.cn refuses to store backend jw.gdou.edu.cn JSESSIONID
+  // inside WFWSESSID until WFWSESSID itself is authenticated via CAS with service=https://wfw.gdou.edu.cn/.
+  const serviceUrl = isWebVpn
+    ? 'https://wfw.gdou.edu.cn/'
+    : extractServiceUrl(netHtml) || 'https://jw.gdou.edu.cn/sso/jziotlogin';
   const authOrigin = 'https://authserver.gdou.edu.cn';
   const authLoginUrl = `${authOrigin}/authserver/login?service=${encodeURIComponent(serviceUrl)}`;
 
@@ -125,6 +147,8 @@ export async function prepareGdouAuthSession(): Promise<PreparedAuthSession> {
     headers: {
       'User-Agent': DESKTOP_UA,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      // Wipe any unauthenticated WFWSESSID / stale JSESSIONID set during netcheck probe so Phase 1 starts 100% clean
+      'X-Gdou-Reset-Cookies-Before': '1',
     },
   });
 
@@ -387,6 +411,12 @@ async function fetchJwExamJson(
       'queryModel.showCount': '100',
       'queryModel.currentPage': '1',
     },
+    {
+      xnm: '',
+      xqm: '',
+      'queryModel.showCount': '100',
+      'queryModel.currentPage': '1',
+    },
   ];
 
   for (const endpoint of endpoints) {
@@ -476,19 +506,16 @@ export async function logoutEphemeralSession(
   authOrigin: string,
   isWebVpn: boolean
 ): Promise<boolean> {
-  const logoutUrls = [
-    `${jwBaseUrl}/logout`,
-    `${jwBaseUrl}/jwglxt/logout`,
-    `${authOrigin}/authserver/logout`,
-  ];
+  clearPendingMfaSecret();
+  const preLogoutUrls = [`${jwBaseUrl}/logout`, `${jwBaseUrl}/jwglxt/logout`];
   if (isWebVpn) {
-    logoutUrls.push('https://wfw.gdou.edu.cn/authserver/logout');
-    logoutUrls.push('https://wfw.gdou.edu.cn/logout');
+    preLogoutUrls.push('https://wfw.gdou.edu.cn/authserver/logout');
+    preLogoutUrls.push('https://wfw.gdou.edu.cn/logout');
   }
 
   let anySucceeded = false;
   await Promise.all(
-    logoutUrls.map(async (url) => {
+    preLogoutUrls.map(async (url) => {
       try {
         await fetch(url, {
           method: 'GET',
@@ -501,6 +528,22 @@ export async function logoutEphemeralSession(
       }
     })
   );
+
+  // Terminate CAS session and instruct native OkHttp interceptor to flush all cookies to 0 bytes immediately after
+  try {
+    await fetch(`${authOrigin}/authserver/logout`, {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        'User-Agent': DESKTOP_UA,
+        'X-Gdou-Clear-Cookies-After': '1',
+      },
+    });
+    anySucceeded = true;
+  } catch {
+    // Best-effort
+  }
+
   return anySucceeded;
 }
 
@@ -629,10 +672,20 @@ export async function submitGdouMfaAndCompleteSync(
     shouldLogoutSession = true;
     log('4. 多因子二次认证通过，正在激活教务系统票据...');
 
-    await completeCasToJwHandoff(mfa.session);
+    const secretSnapshot = pendingMfaSecret
+      ? { username: pendingMfaSecret.username, password: pendingMfaSecret.password }
+      : undefined;
+    clearPendingMfaSecret();
+
+    await completeCasToJwHandoff(mfa.session, mfa.session.isWebVpn, secretSnapshot);
+    if (secretSnapshot) {
+      secretSnapshot.username = '';
+      secretSnapshot.password = '';
+    }
     return await pullAllJwDataAndBuildResult(mfa.session, steps, log, termOverride);
   } finally {
     if (shouldLogoutSession) {
+      clearPendingMfaSecret();
       await logoutEphemeralSession(
         mfa.session.jwBaseUrl,
         mfa.session.authOrigin,
@@ -643,11 +696,87 @@ export async function submitGdouMfaAndCompleteSync(
   }
 }
 
-async function completeCasToJwHandoff(session: PreparedAuthSession): Promise<void> {
-  // Request CAS service ticket for jw.gdou.edu.cn/sso/jziotlogin.
-  // On Android, MainApplication.kt rewrites `Location: https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...`
-  // to `https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...`, authenticating JWXT in 1 hop.
-  // NEVER call `/sso/jziotlogin` a second time without `?ticket=...`, as that resets the JWXT session!
+async function completeCasToJwHandoff(
+  session: PreparedAuthSession,
+  needWfwActivation: boolean,
+  ephemeralForWfw?: { username: string; password: string }
+): Promise<void> {
+  if (session.isWebVpn) {
+    // Phase 1 (when coming from MFA where reAuthSubmit.do didn't redirect to wfw.gdou.edu.cn):
+    // Activate wfw.gdou.edu.cn's server-side session jar (WFWSESSID) via CAS service=https://wfw.gdou.edu.cn/.
+    if (needWfwActivation) {
+      const wfwTicketUrl = `${session.authOrigin}/authserver/login?service=${encodeURIComponent(
+        'https://wfw.gdou.edu.cn/'
+      )}`;
+      await fetch(wfwTicketUrl, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'User-Agent': DESKTOP_UA,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      }).catch(() => null);
+    }
+
+    // Phase 2 (Inside authenticated WFWSESSID):
+    // wfw.gdou.edu.cn maintains an isolated server-side cookie jar per WFWSESSID and strips external `?ticket=`.
+    // Requesting `https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn` lets wfw fetch the proxied CAS form;
+    // submitting it once inside WFWSESSID makes wfw follow `jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...`
+    // internally on campus intranet and store the authenticated JWXT JSESSIONID inside WFWSESSID.
+    const jwEntryResp = await fetch('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn', {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        'User-Agent': DESKTOP_UA,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    });
+    const jwEntryHtml = await jwEntryResp.text();
+    const salt2 = extractHiddenInput(jwEntryHtml, 'pwdEncryptSalt');
+    const exe2 = extractHiddenInput(jwEntryHtml, 'execution');
+    const lt2 = extractHiddenInput(jwEntryHtml, 'lt');
+
+    if (salt2 && exe2 && ephemeralForWfw?.username && ephemeralForWfw?.password) {
+      // Bind trusted device fingerprint inside WFWSESSID's proxied authserver session
+      await fetch(
+        `https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/bfp/info?bfp=${GDOU_DEVICE_BFP}`,
+        {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'User-Agent': DESKTOP_UA },
+        }
+      ).catch(() => null);
+
+      const encryptedPwd2 = encryptGdouPassword(ephemeralForWfw.password, salt2);
+      const wfwAuthPostUrl =
+        'https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/login?service=' +
+        encodeURIComponent('https://jw.gdou.edu.cn/sso/jziotlogin');
+
+      await fetch(wfwAuthPostUrl, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'User-Agent': DESKTOP_UA,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: 'https://wfw.gdou.edu.cn',
+          Referer: 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn',
+        },
+        body: encodeFormBody({
+          username: ephemeralForWfw.username,
+          password: encryptedPwd2,
+          captcha: '',
+          _eventId: 'submit',
+          cllt: 'userNameLogin',
+          dllt: 'generalLogin',
+          lt: lt2,
+          execution: exe2,
+        }),
+      });
+    }
+    return;
+  }
+
+  // Campus direct network: CAS redirects straight to https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...
   const jwSsoService = 'https://jw.gdou.edu.cn/sso/jziotlogin';
   const ticketReqUrl = `${session.authOrigin}/authserver/login?service=${encodeURIComponent(
     jwSsoService
@@ -662,20 +791,50 @@ async function completeCasToJwHandoff(session: PreparedAuthSession): Promise<voi
   }).catch(() => null);
 }
 
+function derivePreviousTerm(xnm: string, xqm: string): { xnm: string; xqm: string; label: string } | null {
+  const y = parseInt(xnm, 10);
+  if (!Number.isFinite(y)) return null;
+  if (xqm === '3') {
+    return { xnm: String(y - 1), xqm: '12', label: `${y - 1}-${y}学年 第2学期` };
+  }
+  return { xnm: String(y), xqm: '3', label: `${y}-${y + 1}学年 第1学期` };
+}
+
 async function pullAllJwDataAndBuildResult(
   session: PreparedAuthSession,
   steps: string[],
   log: (msg: string) => void,
   termOverride?: SyncTermOverride
 ): Promise<SyncResult> {
-  const { prefix, xnm, xqm, termLabel } = await detectJwPrefixAndTerm(
+  let { prefix, xnm, xqm, termLabel } = await detectJwPrefixAndTerm(
     session.jwBaseUrl,
     termOverride
   );
   log(`5. 已锁定目标学期：${termLabel} (xnm=${xnm}, xqm=${xqm})`);
 
-  const rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm);
-  const parsedSchedule = parseZfScheduleResponse(rawSchedule);
+  let rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm);
+  let parsedSchedule = parseZfScheduleResponse(rawSchedule);
+
+  // If current default term hasn't published courses yet and user didn't force a term, auto-fallback to previous term
+  if (parsedSchedule.courses.length === 0 && !termOverride?.xnm && !termOverride?.xqm) {
+    const prev = derivePreviousTerm(xnm, xqm);
+    if (prev) {
+      try {
+        const prevRaw = await fetchJwScheduleJson(session.jwBaseUrl, prefix, prev.xnm, prev.xqm);
+        const prevParsed = parseZfScheduleResponse(prevRaw);
+        if (prevParsed.courses.length > 0) {
+          xnm = prev.xnm;
+          xqm = prev.xqm;
+          termLabel = prevParsed.termLabel || prev.label;
+          rawSchedule = prevRaw;
+          parsedSchedule = prevParsed;
+          log(`5b. 当前默认学期暂无排课，已自动切换至上一学期：${termLabel}`);
+        }
+      } catch {
+        // Keep primary term result
+      }
+    }
+  }
   log(`6. 课表解析完成：共 ${parsedSchedule.courses.length} 项教学安排`);
 
   const rawExams = await fetchJwExamJson(session.jwBaseUrl, prefix, xnm, xqm);
@@ -735,7 +894,7 @@ export async function executeOneShotGdouSync(
     );
 
     const username = credentials.username.trim();
-    const rawPassword = credentials.password;
+    let rawPassword = credentials.password;
     const captcha = (credentials.captcha ?? '').trim();
 
     // Immediately wipe raw credentials from caller's object BEFORE network I/O
@@ -745,26 +904,14 @@ export async function executeOneShotGdouSync(
       session.serviceUrl
     )}`;
 
-    // Fetch fresh salt & execution immediately prior to POST so session & token are 100% synchronized
-    let preLoginResp = await fetch(loginAction, {
-      method: 'GET',
-      credentials: 'include',
-      headers: {
-        'User-Agent': DESKTOP_UA,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
-    let preLoginHtml = await preLoginResp.text();
-    if (
-      (preLoginResp.url || '').includes('reAuthLoginView.do') ||
-      preLoginHtml.includes('reAuthParams')
-    ) {
-      await fetch(`${session.authOrigin}/authserver/logout`, {
-        method: 'GET',
-        credentials: 'include',
-        headers: { 'User-Agent': DESKTOP_UA },
-      }).catch(() => null);
-      preLoginResp = await fetch(loginAction, {
+    // Reuse prepared salt/execution if captcha was entered (so JSESSIONID matches captcha);
+    // otherwise fetch fresh salt/execution immediately before POST.
+    let activeSalt = session.pwdEncryptSalt;
+    let activeExecution = session.execution;
+    let activeLt = session.lt;
+
+    if (!captcha || !activeSalt || !activeExecution) {
+      let preLoginResp = await fetch(loginAction, {
         method: 'GET',
         credentials: 'include',
         headers: {
@@ -772,22 +919,40 @@ export async function executeOneShotGdouSync(
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
       });
-      preLoginHtml = await preLoginResp.text();
+      let preLoginHtml = await preLoginResp.text();
+      if (
+        (preLoginResp.url || '').includes('reAuthLoginView.do') ||
+        preLoginHtml.includes('reAuthParams')
+      ) {
+        await fetch(`${session.authOrigin}/authserver/logout`, {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'User-Agent': DESKTOP_UA },
+        }).catch(() => null);
+        preLoginResp = await fetch(loginAction, {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            'User-Agent': DESKTOP_UA,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        });
+        preLoginHtml = await preLoginResp.text();
+      }
+      activeSalt = extractHiddenInput(preLoginHtml, 'pwdEncryptSalt') || activeSalt;
+      activeExecution = extractHiddenInput(preLoginHtml, 'execution') || activeExecution;
+      activeLt = extractHiddenInput(preLoginHtml, 'lt') || activeLt;
     }
 
     // Bind device fingerprint to active login session (matches common-header.js on /authserver/login)
-    await fetch(`${session.authOrigin}/authserver/bfp/info?bfp=8F14E45FCEEA167A5A36DEDD4BEA2543`, {
+    await fetch(`${session.authOrigin}/authserver/bfp/info?bfp=${GDOU_DEVICE_BFP}`, {
       method: 'GET',
       credentials: 'include',
       headers: { 'User-Agent': DESKTOP_UA },
     }).catch(() => null);
 
-    const activeSalt = extractHiddenInput(preLoginHtml, 'pwdEncryptSalt') || session.pwdEncryptSalt;
-    const activeExecution = extractHiddenInput(preLoginHtml, 'execution') || session.execution;
-    const activeLt = extractHiddenInput(preLoginHtml, 'lt') || session.lt;
-
     const encryptedPwd = encryptGdouPassword(rawPassword, activeSalt);
-    log('2. 密码已完成本地 AES-128-CBC 加密，明文密码已从内存清除');
+    log('2. 密码已完成本地 AES-128-CBC 加密，正在提交统一身份认证...');
 
     const loginResp = await fetch(loginAction, {
       method: 'POST',
@@ -820,8 +985,12 @@ export async function executeOneShotGdouSync(
       loginHtml.includes('多因子认证')
     ) {
       keepSessionForMfa = true;
+      if (session.isWebVpn) {
+        pendingMfaSecret = { username, password: rawPassword };
+      }
+      rawPassword = '';
       // Bind device fingerprint on reAuthLoginView.do (matches common-header.js on reAuthLoginView.do)
-      await fetch(`${session.authOrigin}/authserver/bfp/info?bfp=8F14E45FCEEA167A5A36DEDD4BEA2543`, {
+      await fetch(`${session.authOrigin}/authserver/bfp/info?bfp=${GDOU_DEVICE_BFP}`, {
         method: 'GET',
         credentials: 'include',
         headers: { 'User-Agent': DESKTOP_UA },
@@ -842,18 +1011,35 @@ export async function executeOneShotGdouSync(
       };
     }
 
-    if (loginHtml.includes('pwdEncryptSalt') && (loginHtml.includes('pwdFromId') || loginHtml.includes('loginFromId'))) {
+    if (
+      loginResp.status === 429 ||
+      loginHtml.includes('频繁') ||
+      loginHtml.includes('Too Many Requests')
+    ) {
+      rawPassword = '';
+      throw new Error('认证请求过于频繁，请等待 30 秒后再试');
+    }
+
+    if (
+      loginHtml.includes('pwdEncryptSalt') &&
+      (loginHtml.includes('pwdFromId') || loginHtml.includes('loginFromId'))
+    ) {
+      rawPassword = '';
       const errTip = extractAuthError(loginHtml);
       throw new Error(errTip || '学号、密码或验证码错误，请核对后重试');
     }
 
-    log('3. 广海统一身份认证通过，已建立一次性教务临时会话');
-    await completeCasToJwHandoff(session);
+    log('3. 广海统一身份认证通过，正在激活教务系统会话...');
+    const needWfwActivation = session.isWebVpn && !loginFinalUrl.includes('wfw.gdou.edu.cn');
+    await completeCasToJwHandoff(session, needWfwActivation, { username, password: rawPassword });
+    rawPassword = '';
+    log('4. 教务通道已打通，明文密码已从内存销毁');
     const result = await pullAllJwDataAndBuildResult(session, steps, log, termOverride);
     return { status: 'completed', result };
   } finally {
     purgeEphemeralCredentials(credentials);
     if (!keepSessionForMfa) {
+      clearPendingMfaSecret();
       await logoutEphemeralSession(session.jwBaseUrl, session.authOrigin, session.isWebVpn);
       log('8. 服务端会话已注销，本地未写入任何账号/密码/Cookie（用完即删完成）');
     }
@@ -874,6 +1060,29 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
       if (window.__GDOU_SYNC_RUNNING__) return;
       var href = String(window.location.href || '');
       var html = String(document.documentElement ? document.documentElement.innerHTML : '');
+
+      // Off-campus WebVPN WebView fix:
+      // 1) If netcheck landed on wfw.gdou.edu.cn/https://authserver... (unauthenticated WFWSESSID),
+      //    redirect to https://wfw.gdou.edu.cn/ so WFWSESSID gets authenticated first.
+      if (href.indexOf('wfw.gdou.edu.cn/https://authserver.gdou.edu.cn') !== -1) {
+        window.location.replace('https://wfw.gdou.edu.cn/');
+        return;
+      }
+      // 2) Once logged into https://wfw.gdou.edu.cn/ home portal, jump straight into jw.gdou.edu.cn
+      if (
+        href.indexOf('https://wfw.gdou.edu.cn/') === 0 &&
+        href.indexOf('jw.gdou.edu.cn') === -1 &&
+        href.indexOf('authserver') === -1 &&
+        html.indexOf('pwdEncryptSalt') === -1 &&
+        html.indexOf('reAuthParams') === -1
+      ) {
+        if (!window.__GDOU_JUMPED_TO_JW__) {
+          window.__GDOU_JUMPED_TO_JW__ = true;
+          window.location.href = 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn';
+        }
+        return;
+      }
+
       var isAuthPage =
         html.indexOf('pwdEncryptSalt') !== -1 ||
         html.indexOf('reAuthParams') !== -1 ||

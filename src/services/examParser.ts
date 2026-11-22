@@ -14,6 +14,7 @@ interface RawZfExam {
   jsz?: string;
   cdbh?: string;
   ksxzmc?: string;
+  ksfs?: string;
   ksmc?: string;
   xqmc?: string;
   cdxqmc?: string;
@@ -99,7 +100,9 @@ export function parseZfExamResponse(raw: unknown): ExamItem[] {
 
     const location = String(item.cdmc ?? item.jsmc ?? item.ksdd ?? '考场待公布').trim();
     const seatNumber = String(item.zwh ?? item.jsz ?? '').trim();
-    const examType = String(item.ksxzmc ?? item.ksmc ?? '期末考试').trim();
+    const examType =
+      [item.ksfs, item.ksxzmc].map((v) => String(v ?? '').trim()).filter(Boolean).join(' · ') ||
+      String(item.ksmc ?? '期末考试').trim();
     const courseCode = String(item.kch ?? item.kch_id ?? '').trim();
     const campus = String(item.cdxqmc ?? item.xqmc ?? '').trim();
     const invigilator = String(item.jklsmc ?? item.xm ?? '').trim();

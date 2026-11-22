@@ -21,6 +21,7 @@ import { parseZfExamResponse } from '../services/examParser';
 import {
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
+  clearPendingMfaSecret,
   executeOneShotGdouSync,
   fetchGdouCaptchaImage,
   logoutEphemeralSession,
@@ -100,6 +101,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         setWebViewKey((k) => k + 1);
       }
     } else {
+      clearPendingMfaSecret();
       if (mfaChallenge) {
         void logoutEphemeralSession(
           mfaChallenge.session.jwBaseUrl,
@@ -201,7 +203,15 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorText(msg);
-      void initDirectSession();
+      const refreshed = await prepareGdouAuthSession().catch(() => null);
+      if (refreshed) {
+        setSession(refreshed);
+        if (msg.includes('验证码') || msg.includes('动态码')) {
+          const uri = await fetchGdouCaptchaImage(refreshed).catch(() => undefined);
+          setNeedCaptcha(true);
+          setCaptchaUri(uri);
+        }
+      }
     } finally {
       purgeEphemeralCredentials(ephemeral);
       setSyncing(false);
