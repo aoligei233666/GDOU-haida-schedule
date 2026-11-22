@@ -729,20 +729,28 @@ async function completeCasToJwHandoff(
     // Requesting `https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn` lets wfw fetch the proxied CAS form;
     // submitting it once inside WFWSESSID makes wfw follow `jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...`
     // internally on campus intranet and store the authenticated JWXT JSESSIONID inside WFWSESSID.
-    const jwEntryResp = await fetch('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn', {
-      method: 'GET',
-      credentials: 'include',
-      headers: {
-        'User-Agent': DESKTOP_UA,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
-    const jwEntryHtml = await jwEntryResp.text();
-    const salt2 = extractHiddenInput(jwEntryHtml, 'pwdEncryptSalt');
-    const exe2 = extractHiddenInput(jwEntryHtml, 'execution');
-    const lt2 = extractHiddenInput(jwEntryHtml, 'lt');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const jwEntryResp = await fetch('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn', {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'User-Agent': DESKTOP_UA,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      });
+      const jwEntryHtml = await jwEntryResp.text();
+      const salt2 = extractHiddenInput(jwEntryHtml, 'pwdEncryptSalt');
+      const exe2 = extractHiddenInput(jwEntryHtml, 'execution');
+      const lt2 = extractHiddenInput(jwEntryHtml, 'lt');
 
-    if (salt2 && exe2 && ephemeralForWfw?.username && ephemeralForWfw?.password) {
+      if (!salt2 || !exe2) {
+        // Already inside JWXT portal (no proxied CAS login needed)
+        return;
+      }
+      if (!ephemeralForWfw?.username || !ephemeralForWfw?.password) {
+        return;
+      }
+
       // Bind trusted device fingerprint inside WFWSESSID's proxied authserver session
       await fetch(
         `https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/bfp/info?bfp=${GDOU_DEVICE_BFP}`,
@@ -781,13 +789,29 @@ async function completeCasToJwHandoff(
       if (wfwPostResp.status === 429) {
         throw new Error('认证请求过于频繁，请等待 30 秒后再试');
       }
+      const wfwPostUrl = wfwPostResp.url || '';
       const wfwPostHtml = await wfwPostResp.text();
+      if (
+        wfwPostUrl.includes('reAuthLoginView.do') ||
+        wfwPostHtml.includes('reAuthParams') ||
+        wfwPostHtml.includes('多因子认证')
+      ) {
+        throw new Error('校外教务通道触发了二次安全验证，请切换顶部「官网无痕网页」完成本次登录');
+      }
       if (wfwPostHtml.includes('pwdEncryptSalt')) {
         const tip = extractAuthError(wfwPostHtml);
-        if (tip) {
-          throw new Error(`校外教务通道二次握手提示：${tip}`);
+        // GDOU authserver cluster nodes keep per-node captcha counters; retry once in case Phase 2 hit a stale node
+        if (attempt === 0 && (tip.includes('动态码') || tip.includes('验证码') || !tip)) {
+          await new Promise((r) => setTimeout(r, 600));
+          continue;
         }
+        throw new Error(
+          tip
+            ? `校外教务通道二次握手提示：${tip}（建议直接切换顶部「官网无痕网页」同步）`
+            : '校外教务通道二次握手未通过，请重试或切换顶部「官网无痕网页」同步'
+        );
       }
+      return;
     }
     return;
   }
@@ -958,14 +982,14 @@ export async function executeOneShotGdouSync(
       activeSalt = extractHiddenInput(preLoginHtml, 'pwdEncryptSalt') || activeSalt;
       activeExecution = extractHiddenInput(preLoginHtml, 'execution') || activeExecution;
       activeLt = extractHiddenInput(preLoginHtml, 'lt') || activeLt;
-    }
 
-    // Bind device fingerprint to active login session (matches common-header.js on /authserver/login)
-    await fetch(`${session.authOrigin}/authserver/bfp/info?bfp=${GDOU_DEVICE_BFP}`, {
-      method: 'GET',
-      credentials: 'include',
-      headers: { 'User-Agent': DESKTOP_UA },
-    }).catch(() => null);
+      // Bind device fingerprint to freshly refreshed login session (skip redundant call when captcha session is already bound)
+      await fetch(`${session.authOrigin}/authserver/bfp/info?bfp=${GDOU_DEVICE_BFP}`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 'User-Agent': DESKTOP_UA },
+      }).catch(() => null);
+    }
 
     const encryptedPwd = encryptGdouPassword(rawPassword, activeSalt);
     log('2. 密码已完成本地 AES-128-CBC 加密，正在提交统一身份认证...');
@@ -1074,6 +1098,7 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
   return `
     (function() {
       var href = String(window.location.href || '');
+      var host = String(window.location.hostname || '');
       var html = String(document.documentElement ? document.documentElement.innerHTML : '');
 
       function post(payload) {
@@ -1082,28 +1107,36 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
         }
       }
 
-      // 1. Mobile UI adaptation for GDOU authserver & WebVPN pages (remove wasted top blank space, fit phone screens cleanly)
+      // 1. Mobile UI adaptation for GDOU authserver & WebVPN pages (clean spacing + bulletproof slider captcha modal)
       (function adaptMobileLayout() {
         try {
-          if (href.indexOf('authserver.gdou.edu.cn') !== -1 || html.indexOf('pwdEncryptSalt') !== -1 || html.indexOf('reAuthParams') !== -1) {
+          if (host === 'authserver.gdou.edu.cn' || html.indexOf('pwdEncryptSalt') !== -1 || html.indexOf('reAuthParams') !== -1) {
             var vp = document.querySelector('meta[name="viewport"]');
             if (!vp) {
               vp = document.createElement('meta');
               vp.name = 'viewport';
               document.head && document.head.appendChild(vp);
             }
-            vp.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
+            vp.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no';
 
             if (!document.getElementById('__gdou_mobile_fit__')) {
               var style = document.createElement('style');
               style.id = '__gdou_mobile_fit__';
               style.textContent = [
-                'html, body { max-width: 100vw !important; overflow-x: hidden !important; background: #ffffff !important; margin: 0 !important; padding: 0 !important; }',
-                '.login-header, .header, .top-logo, .logo-box, .banner, .footer, .copyright, .login-footer { display: none !important; height: 0 !important; margin: 0 !important; padding: 0 !important; }',
-                '.main, .login-main, .login-box, .auth_page_wrapper, .m-login, .content, .container, #app, .root-main > body { padding-top: 8px !important; margin-top: 0 !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; }',
-                'form, .form, .loginFromClass { width: 100% !important; max-width: 440px !important; margin: 0 auto !important; padding: 6px 18px 24px !important; box-sizing: border-box !important; }',
+                'html, body { max-width: 100vw !important; min-height: 100vh !important; overflow-x: hidden !important; overflow-y: auto !important; background: #ffffff !important; margin: 0 !important; padding: 0 !important; }',
+                '.login-header, .header, .school-logo, .top-logo, .logo-box, .banner, .footer, .copyright, .login-footer { display: none !important; height: 0 !important; margin: 0 !important; padding: 0 !important; }',
+                '.index_login { margin: 0 20px !important; padding-top: 8px !important; }',
+                '.main, .login-main, .login-box, .auth_page_wrapper, .m-login, .content, #app { padding-top: 6px !important; margin-top: 0 !important; width: 100% !important; max-width: 100% !important; box-sizing: border-box !important; }',
+                'form, .loginFromClass { width: 100% !important; max-width: 440px !important; margin: 0 auto !important; box-sizing: border-box !important; }',
                 'input[type="text"], input[type="password"], input[type="tel"], input[type="number"] { font-size: 16px !important; }',
-                '.login-btn, #login_submit, button[type="submit"] { border-radius: 12px !important; min-height: 46px !important; font-size: 16px !important; }'
+                '.btn_login, .login-btn, #login_submit, button[type="submit"] { border-radius: 12px !important; min-height: 46px !important; font-size: 16px !important; }',
+                /* Ensure Wisedu slider captcha modal stays dead-center, unclipped, and 1:1 draggable on all screens */
+                '.background_bj_gray { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; z-index: 9998 !important; }',
+                '.slidercaptcha-fluid { position: fixed !important; top: 50% !important; left: 50% !important; bottom: auto !important; right: auto !important; transform: translate(-50%, -50%) !important; -webkit-transform: translate(-50%, -50%) !important; width: 320px !important; max-width: 94vw !important; height: auto !important; z-index: 9999 !important; padding: 0 !important; margin: 0 !important; }',
+                '.slidercaptcha { left: 0 !important; top: 0 !important; width: 100% !important; max-width: 320px !important; margin: 0 auto !important; touch-action: none !important; }',
+                '.slidercaptcha .card-body { padding: 14px 10px 18px !important; }',
+                '#sliderDiv { width: 280px !important; margin: 0 auto !important; touch-action: none !important; }',
+                '.sliderContainer, .slider, .sliderMask, .sliderbg { touch-action: none !important; }'
               ].join('\\n');
               (document.head || document.documentElement).appendChild(style);
             }
@@ -1114,34 +1147,71 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
       if (window.__GDOU_SYNC_RUNNING__) return;
 
       // 2. Off-campus WebVPN WebView routing:
-      //    (a) Before WFWSESSID is authenticated, redirect wfw/https://authserver... to https://wfw.gdou.edu.cn/
       var wfwAuthed = false;
       try { wfwAuthed = sessionStorage.getItem('__gdou_wfw_authed__') === '1'; } catch (e) {}
 
+      // If unauthenticated wfw splash page ("正在跳转到统一认证..."), let it redirect to authserver.gdou.edu.cn naturally
+      var isWfwSplash =
+        host === 'wfw.gdou.edu.cn' &&
+        (html.indexOf('正在跳转到统一认证') !== -1 ||
+          html.indexOf('authserver.gdou.edu.cn/authserver/login') !== -1 ||
+          document.title.indexOf('正在跳转') !== -1);
+      if (isWfwSplash) {
+        post({ type: 'PROGRESS', message: '正在打开海大统一身份认证...' });
+        return;
+      }
+
       if (!wfwAuthed && href.indexOf('wfw.gdou.edu.cn/https://authserver.gdou.edu.cn') !== -1) {
-        post({ type: 'PROGRESS', message: '正在跳转海大校外认证通道，请完成登录...' });
-        window.location.replace('https://wfw.gdou.edu.cn/');
+        post({ type: 'PROGRESS', message: '正在跳转海大官方统一身份认证...' });
+        window.location.replace('https://authserver.gdou.edu.cn/authserver/login?service=' + encodeURIComponent('https://wfw.gdou.edu.cn/'));
         return;
       }
 
-      if (href.indexOf('authserver.gdou.edu.cn') !== -1 && href.indexOf('wfw.gdou.edu.cn') === -1) {
-        post({ type: 'PROGRESS', message: '第 1 步：请完成海大统一身份认证（支持密码 / 短信验证码）' });
+      // Step 1: Direct authserver.gdou.edu.cn (real CAS domain — slider captcha & MFA work 100% natively!)
+      if (host === 'authserver.gdou.edu.cn') {
+        if (href.indexOf('reAuthLoginView') !== -1 || html.indexOf('reAuthParams') !== -1) {
+          post({ type: 'PROGRESS', message: '第 1 步：请完成海大多因子安全验证（短信 / 企业微信）' });
+        } else {
+          post({ type: 'PROGRESS', message: '第 1 步：请完成海大统一身份认证（支持滑块验证 / 手机验证码登录）' });
+        }
         return;
       }
 
-      if (href.indexOf('wfw.gdou.edu.cn/https://authserver.gdou.edu.cn') !== -1 || (href.indexOf('wfw.gdou.edu.cn/https://jw.gdou.edu.cn') !== -1 && html.indexOf('pwdEncryptSalt') !== -1)) {
+      // Step 2: Proxied CAS inside authenticated WFWSESSID
+      if (
+        host === 'wfw.gdou.edu.cn' &&
+        (href.indexOf('/https://authserver.gdou.edu.cn') !== -1 ||
+          href.indexOf('/authserver/login') !== -1 ||
+          (href.indexOf('/https://jw.gdou.edu.cn') !== -1 && html.indexOf('pwdEncryptSalt') !== -1))
+      ) {
+        // Fix wfw's injected ajaxPrefilter which rewrites /authserver/* to /https://jw.gdou.edu.cn/authserver/*
+        // (breaking Path=/authserver JSESSIONID & route cookies needed by slider captcha!)
+        try {
+          if (window.jQuery && window.jQuery.ajaxPrefilter && !window.__gdou_auth_prefilter_fixed__) {
+            window.__gdou_auth_prefilter_fixed__ = true;
+            window.jQuery.ajaxPrefilter(function(opts) {
+              if (opts && typeof opts.url === 'string') {
+                var idx = opts.url.indexOf('/authserver/');
+                if (idx !== -1 && opts.url.indexOf('wfw.gdou.edu.cn/https://jw.gdou.edu.cn/authserver/') !== -1) {
+                  opts.url = opts.url.substring(idx);
+                }
+              }
+            });
+          }
+        } catch (e) {}
         post({ type: 'PROGRESS', message: '第 2 步：校外通道已激活，请再点一次登录进入教务系统即可自动同步' });
         return;
       }
 
-      //    (b) On https://wfw.gdou.edu.cn/ home portal (after Step 1 OR Step 2):
-      //        Mark wfwAuthed=1 and immediately probe if jw.gdou.edu.cn is already authenticated inside WFWSESSID!
+      // Authenticated https://wfw.gdou.edu.cn/ home portal (strictly exclude splash & auth pages!)
       var isWfwHome =
-        href.indexOf('https://wfw.gdou.edu.cn/') === 0 &&
+        host === 'wfw.gdou.edu.cn' &&
+        !isWfwSplash &&
         href.indexOf('jw.gdou.edu.cn') === -1 &&
         href.indexOf('authserver') === -1 &&
         html.indexOf('pwdEncryptSalt') === -1 &&
-        html.indexOf('reAuthParams') === -1;
+        html.indexOf('reAuthParams') === -1 &&
+        html.indexOf('统一身份认证') === -1;
 
       var isAuthPage =
         html.indexOf('pwdEncryptSalt') !== -1 ||
@@ -1240,6 +1310,34 @@ export function buildIncognitoWebViewSyncScript(override?: SyncTermOverride): st
             return;
           }
           var kbJson = JSON.parse(kbText);
+          // Auto-fallback to previous semester if default term has no courses yet and user did not override
+          if ((!kbJson.kbList || kbJson.kbList.length === 0) && !${overrideXnm} && !${overrideXqm}) {
+            var yNum = parseInt(xnm, 10);
+            if (!isNaN(yNum)) {
+              var prevXnm = xqm === '3' ? String(yNum - 1) : String(yNum);
+              var prevXqm = xqm === '3' ? '12' : '3';
+              try {
+                var prevResp = await fetch(root + prefix + '/kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151', {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest'
+                  },
+                  body: 'xnm=' + encodeURIComponent(prevXnm) + '&xqm=' + encodeURIComponent(prevXqm) + '&kzlx=ck&xsdm='
+                });
+                var prevText = (await prevResp.text()).trim();
+                if (prevText && prevText.charAt(0) === '{') {
+                  var prevJson = JSON.parse(prevText);
+                  if (prevJson.kbList && prevJson.kbList.length > 0) {
+                    kbJson = prevJson;
+                    xnm = prevXnm;
+                    xqm = prevXqm;
+                  }
+                }
+              } catch (e) {}
+            }
+          }
 
           post({ type: 'PROGRESS', message: '正在拉取考试安排与考场座位...' });
           var examJson = { items: [] };

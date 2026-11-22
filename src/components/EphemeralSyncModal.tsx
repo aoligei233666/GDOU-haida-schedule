@@ -55,6 +55,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const [session, setSession] = useState<PreparedAuthSession | null>(null);
   const [preparing, setPreparing] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [checkingCaptcha, setCheckingCaptcha] = useState(false);
   const [needCaptcha, setNeedCaptcha] = useState(false);
   const [captchaUri, setCaptchaUri] = useState<string | undefined>(undefined);
   const [statusLog, setStatusLog] = useState<string[]>([]);
@@ -76,10 +77,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const [webViewKey, setWebViewKey] = useState(0);
   const [webViewProgress, setWebViewProgress] = useState(0);
   const [webViewStatus, setWebViewStatus] = useState(
-    '请完成海大官方登录（用完即删，自动提取课表/考试/绩点）'
+    '第 1 步：请完成海大统一身份认证（用完即删，自动同步）'
   );
   const webViewRef = useRef<WebView<object> | null>(null);
-  // Tracks which (session + username) pair has already fetched its captcha so onBlur never overwrites it
+  const scrollViewRef = useRef<React.ComponentRef<typeof ScrollView> | null>(null);
+  // Tracks which (session + username) pair has already checked captcha so onBlur never overwrites it
   const captchaSessionKeyRef = useRef<string>('');
 
   const wipeFormInputs = (keepUsername = false) => {
@@ -122,11 +124,17 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, mode]);
 
-  const initDirectSession = async (autoCheckUsername?: string) => {
+  const initDirectSession = async (
+    autoCheckUsername?: string,
+    preserveError = false,
+    forceFetchCaptcha = false
+  ) => {
     setPreparing(true);
-    setErrorText(null);
+    if (!preserveError) {
+      setErrorText(null);
+      setNeedCaptcha(false);
+    }
     // CRITICAL: Reset any stale captcha image whenever a brand-new JSESSIONID is initialized
-    setNeedCaptcha(false);
     setCaptchaUri(undefined);
     setCaptcha('');
     captchaSessionKeyRef.current = '';
@@ -135,11 +143,25 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setSession(prepared);
       const targetUser = (autoCheckUsername ?? '').trim();
       if (targetUser) {
-        const res = await checkGdouCaptcha(prepared, targetUser);
-        if (res.isNeed) {
-          setNeedCaptcha(true);
-          setCaptchaUri(res.imageDataUri);
+        setCheckingCaptcha(true);
+        try {
+          const res = await checkGdouCaptcha(prepared, targetUser);
+          if (res.isNeed && res.imageDataUri) {
+            setNeedCaptcha(true);
+            setCaptchaUri(res.imageDataUri);
+          } else if (forceFetchCaptcha) {
+            const uri = await fetchGdouCaptchaImage(prepared).catch(() => undefined);
+            if (uri) {
+              setNeedCaptcha(true);
+              setCaptchaUri(uri);
+            }
+          } else {
+            setNeedCaptcha(res.isNeed);
+            setCaptchaUri(res.imageDataUri);
+          }
           captchaSessionKeyRef.current = `${prepared.pwdEncryptSalt}|${prepared.execution}|${targetUser}`;
+        } finally {
+          setCheckingCaptcha(false);
         }
       }
       return prepared;
@@ -155,32 +177,65 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     }
   };
 
+  // If user finished typing username while session was still preparing, check captcha once session is ready
+  useEffect(() => {
+    if (!visible || mode !== 'direct' || !session || preparing || syncing) return;
+    const trimmed = username.trim();
+    if (!trimmed) return;
+    const key = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
+    if (captchaSessionKeyRef.current === key) return;
+    let cancelled = false;
+    setCheckingCaptcha(true);
+    void checkGdouCaptcha(session, trimmed)
+      .then((res) => {
+        if (cancelled) return;
+        setNeedCaptcha(res.isNeed);
+        setCaptchaUri(res.imageDataUri);
+        captchaSessionKeyRef.current = key;
+      })
+      .finally(() => {
+        if (!cancelled) setCheckingCaptcha(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
+
   const handleUsernameBlur = async () => {
     const trimmed = username.trim();
     if (!session || !trimmed || preparing || syncing) return;
     const key = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
     // Never silently re-fetch & overwrite an already displayed captcha for this exact JSESSIONID
-    if (captchaSessionKeyRef.current === key && needCaptcha && captchaUri) {
+    if (captchaSessionKeyRef.current === key && (!needCaptcha || captchaUri)) {
       return;
     }
-    const res = await checkGdouCaptcha(session, trimmed);
-    setNeedCaptcha(res.isNeed);
-    setCaptchaUri(res.imageDataUri);
-    if (res.isNeed && res.imageDataUri) {
+    setCheckingCaptcha(true);
+    try {
+      const res = await checkGdouCaptcha(session, trimmed);
+      setNeedCaptcha(res.isNeed);
+      setCaptchaUri(res.imageDataUri);
       captchaSessionKeyRef.current = key;
+    } finally {
+      setCheckingCaptcha(false);
     }
   };
 
   const handleRefreshCaptcha = async () => {
     if (!session || preparing || syncing) return;
     setCaptcha('');
-    const uri = await fetchGdouCaptchaImage(session);
-    if (uri) {
-      setCaptchaUri(uri);
-      const trimmed = username.trim();
-      if (trimmed) {
-        captchaSessionKeyRef.current = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
+    setCheckingCaptcha(true);
+    try {
+      const uri = await fetchGdouCaptchaImage(session);
+      if (uri) {
+        setCaptchaUri(uri);
+        const trimmed = username.trim();
+        if (trimmed) {
+          captchaSessionKeyRef.current = `${session.pwdEncryptSalt}|${session.execution}|${trimmed}`;
+        }
       }
+    } finally {
+      setCheckingCaptcha(false);
     }
   };
 
@@ -190,15 +245,34 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setErrorText('请输入学号和密码（仅用于本次即时拉取，用完立即销毁）');
       return;
     }
-    if (needCaptcha && !captcha.trim()) {
-      setErrorText('请输入图形验证码');
-      return;
-    }
 
     let activeSession = session;
     if (!activeSession) {
-      activeSession = await initDirectSession();
+      activeSession = await initDirectSession(trimmedUser, false);
       if (!activeSession) return;
+    }
+
+    // If captcha requirement wasn't checked yet for this (session, username), check BEFORE submitting
+    const expectedKey = `${activeSession.pwdEncryptSalt}|${activeSession.execution}|${trimmedUser}`;
+    if (captchaSessionKeyRef.current !== expectedKey) {
+      setCheckingCaptcha(true);
+      try {
+        const res = await checkGdouCaptcha(activeSession, trimmedUser);
+        setNeedCaptcha(res.isNeed);
+        setCaptchaUri(res.imageDataUri);
+        captchaSessionKeyRef.current = expectedKey;
+        if (res.isNeed && !captcha.trim()) {
+          setErrorText('海大认证要求输入图形验证码，请输入上方 4 位验证码后再次点击拉取');
+          return;
+        }
+      } finally {
+        setCheckingCaptcha(false);
+      }
+    }
+
+    if (needCaptcha && !captcha.trim()) {
+      setErrorText('请输入图形验证码');
+      return;
     }
 
     const ephemeral: EphemeralCredentials = {
@@ -239,16 +313,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorText(msg);
-      // Re-initialize a brand-new JSESSIONID and fetch its exact matching captcha image atomically
-      const refreshed = await initDirectSession(trimmedUser);
-      if (refreshed && (msg.includes('验证码') || msg.includes('动态码')) && !captchaSessionKeyRef.current) {
-        const uri = await fetchGdouCaptchaImage(refreshed).catch(() => undefined);
-        if (uri) {
-          setNeedCaptcha(true);
-          setCaptchaUri(uri);
-          captchaSessionKeyRef.current = `${refreshed.pwdEncryptSalt}|${refreshed.execution}|${trimmedUser}`;
-        }
-      }
+      // Re-initialize a brand-new JSESSIONID and fetch its exact matching captcha image WITHOUT erasing errorText!
+      const needForceCaptcha = msg.includes('验证码') || msg.includes('动态码');
+      await initDirectSession(trimmedUser, true, needForceCaptcha);
+      setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 120);
     } finally {
       purgeEphemeralCredentials(ephemeral);
       setSyncing(false);
@@ -404,14 +472,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           </TouchableOpacity>
         </View>
 
-        {/* Zero-Retention Privacy Guarantee Banner (full on direct tab; compact status strip on WebView tab) */}
+        {/* Zero-Retention Privacy Guarantee Banner (compact so form + captcha + error + submit fit cleanly) */}
         {mode === 'direct' && (
           <View style={styles.privacyBanner}>
-            <Ionicons name="shield-checkmark" size={20} color={COLORS.emerald} />
+            <Ionicons name="shield-checkmark" size={18} color={COLORS.emerald} />
             <View style={styles.privacyTextWrap}>
               <Text style={styles.privacyTitle}>凭据用完即删 · 零留存保护已开启</Text>
               <Text style={styles.privacyDesc}>
-                账号和密码仅在点击拉取的瞬间用于海大官方认证，拉取完成后立即注销服务端会话并清除内存，绝不保存任何账号、密码或 Cookie。
+                账号密码仅用于本次拉取，完成后立即注销会话并销毁内存，绝不落盘。
               </Text>
             </View>
           </View>
@@ -454,7 +522,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         </View>
 
         {mode === 'direct' ? (
-          <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+          <ScrollView
+            ref={scrollViewRef}
+            contentContainerStyle={styles.formContent}
+            keyboardShouldPersistTaps="handled"
+          >
             {/* Connection Route Pill */}
             <View style={styles.routeCard}>
               {preparing ? (
@@ -600,24 +672,41 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                   <View style={styles.captchaBox}>
                     <Text style={styles.fieldLabel}>图形验证码（点击图片可刷新）</Text>
                     <View style={styles.captchaRow}>
-                      <TextInput
-                        style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}
-                        placeholder="输入右侧 4 位验证码"
-                        placeholderTextColor={COLORS.textMuted}
-                        value={captcha}
-                        onChangeText={setCaptcha}
-                        autoCapitalize="none"
-                        autoCorrect={false}
-                        editable={!syncing}
-                      />
-                      <TouchableOpacity onPress={handleRefreshCaptcha} style={styles.captchaImgWrap}>
-                        {captchaUri ? (
+                      <View style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}>
+                        <Ionicons name="shield-outline" size={18} color={COLORS.textMuted} />
+                        <TextInput
+                          style={styles.input}
+                          placeholder="输入右侧 4 位验证码"
+                          placeholderTextColor={COLORS.textMuted}
+                          value={captcha}
+                          onChangeText={setCaptcha}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          maxLength={8}
+                          editable={!syncing}
+                        />
+                      </View>
+                      <TouchableOpacity
+                        onPress={handleRefreshCaptcha}
+                        style={styles.captchaImgWrap}
+                        disabled={checkingCaptcha || syncing}
+                      >
+                        {checkingCaptcha ? (
+                          <ActivityIndicator size="small" color={COLORS.oceanPrimary} />
+                        ) : captchaUri ? (
                           <Image source={{ uri: captchaUri }} style={styles.captchaImg} resizeMode="contain" />
                         ) : (
                           <Text style={styles.captchaReload}>刷新</Text>
                         )}
                       </TouchableOpacity>
                     </View>
+                  </View>
+                )}
+
+                {errorText && (
+                  <View style={styles.errorBox}>
+                    <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
+                    <Text style={styles.errorText}>{errorText}</Text>
                   </View>
                 )}
 
@@ -663,11 +752,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                 )}
 
                 <TouchableOpacity
-                  style={[styles.primaryBtn, (syncing || preparing) && styles.primaryBtnDisabled]}
-                  disabled={syncing || preparing}
+                  style={[
+                    styles.primaryBtn,
+                    (syncing || preparing || checkingCaptcha) && styles.primaryBtnDisabled,
+                  ]}
+                  disabled={syncing || preparing || checkingCaptcha}
                   onPress={handleDirectSync}
                 >
-                  {syncing ? (
+                  {syncing || checkingCaptcha ? (
                     <ActivityIndicator color={COLORS.white} />
                   ) : (
                     <>
@@ -679,7 +771,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               </>
             )}
 
-            {errorText && (
+            {mfaChallenge && errorText && (
               <View style={styles.errorBox}>
                 <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
                 <Text style={styles.errorText}>{errorText}</Text>
@@ -743,7 +835,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               key={webViewKey}
               ref={webViewRef}
               source={{
-                uri: session?.isWebVpn === false ? GDOU_ENTRY_URL : 'https://wfw.gdou.edu.cn/',
+                uri:
+                  session?.isWebVpn === false
+                    ? GDOU_ENTRY_URL
+                    : 'https://authserver.gdou.edu.cn/authserver/login?service=' +
+                      encodeURIComponent('https://wfw.gdou.edu.cn/'),
               }}
               incognito={true}
               cacheEnabled={false}
@@ -752,15 +848,12 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               thirdPartyCookiesEnabled={true}
               javaScriptEnabled={true}
               domStorageEnabled={true}
-              scalesPageToFit={true}
+              scalesPageToFit={false}
               setBuiltInZoomControls={false}
               mixedContentMode="compatibility"
               injectedJavaScript={injectedWebViewJs}
               onLoadProgress={({ nativeEvent }) => {
                 setWebViewProgress(nativeEvent.progress);
-              }}
-              onNavigationStateChange={() => {
-                webViewRef.current?.injectJavaScript(injectedWebViewJs);
               }}
               onLoadEnd={() => {
                 setWebViewProgress(1);
@@ -811,32 +904,33 @@ const styles = StyleSheet.create({
   },
   privacyBanner: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     backgroundColor: COLORS.emeraldLight,
     marginHorizontal: 14,
-    marginTop: 12,
-    padding: 12,
-    borderRadius: 12,
-    gap: 10,
+    marginTop: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 10,
+    gap: 8,
   },
   privacyTextWrap: {
     flex: 1,
   },
   privacyTitle: {
-    fontSize: 13,
+    fontSize: 12.5,
     fontWeight: '700',
     color: '#065F46',
   },
   privacyDesc: {
-    fontSize: 12,
+    fontSize: 11.5,
     color: '#047857',
-    marginTop: 3,
-    lineHeight: 17,
+    marginTop: 2,
+    lineHeight: 15,
   },
   modeTabs: {
     flexDirection: 'row',
     marginHorizontal: 14,
-    marginTop: 12,
+    marginTop: 8,
     backgroundColor: COLORS.borderLight,
     borderRadius: 10,
     padding: 4,
@@ -863,14 +957,16 @@ const styles = StyleSheet.create({
     color: COLORS.white,
   },
   formContent: {
-    padding: 16,
-    paddingBottom: 40,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 36,
   },
   routeCard: {
     backgroundColor: COLORS.surface,
     borderRadius: 10,
-    padding: 12,
-    marginBottom: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    marginBottom: 8,
     borderWidth: 1,
     borderColor: COLORS.border,
   },
