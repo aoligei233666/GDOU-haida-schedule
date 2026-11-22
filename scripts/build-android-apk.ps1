@@ -14,13 +14,15 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location "$projectRoot\android"
 try {
-    & .\gradlew.bat assembleRelease "-PreactNativeArchitectures=arm64-v8a" --console=plain --no-daemon
+    & .\gradlew.bat assembleRelease "-PreactNativeArchitectures=arm64-v8a,x86_64" --console=plain --no-daemon
     $apkSource = "$projectRoot\android\app\build\outputs\apk\release\app-release.apk"
     $distDir = "$projectRoot\dist"
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-    $apkOut = "$distDir\gdou-schedule-v1.0.0-android.apk"
-    Copy-Item $apkSource $apkOut -Force
-    Write-Host "`nAPK built successfully: $apkOut" -ForegroundColor Green
+    $apkOut1 = "$distDir\gdou-schedule-v1.0.0-android.apk"
+    $apkOut2 = "$distDir\haida-schedule-v1.1.0-android.apk"
+    Copy-Item $apkSource $apkOut1 -Force
+    Copy-Item $apkSource $apkOut2 -Force
+    Write-Host "`nAPK built successfully: $apkOut2" -ForegroundColor Green
 } finally {
     Pop-Location
 }
