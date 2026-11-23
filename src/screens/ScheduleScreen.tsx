@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Dimensions,
@@ -28,9 +28,9 @@ import { COLORS, COURSE_PALETTE } from '../theme/colors';
 import { AlarmRule, AppSettings, CourseItem } from '../types/models';
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
-const TIME_COL_WIDTH = 44;
+const TIME_COL_WIDTH = 46;
 const ROW_HEIGHT = 60;
-const VISIBLE_SECTIONS = 12;
+const MIN_VISIBLE_SECTIONS = 12;
 
 interface Props {
   courses: CourseItem[];
@@ -59,7 +59,16 @@ export const ScheduleScreen: React.FC<Props> = ({
   const [activeCourse, setActiveCourse] = useState<CourseItem | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
+  useEffect(() => {
+    setSelectedWeek(currentWeek);
+  }, [currentWeek]);
+
   const periods = useMemo(() => getActivePeriods(settings), [settings]);
+  const visibleSections = useMemo(() => {
+    const maxCourseSec = courses.reduce((acc, c) => Math.max(acc, c.endSection || 0), 0);
+    const maxPeriodSec = periods.reduce((acc, p) => Math.max(acc, p.section || 0), 0);
+    return Math.max(MIN_VISIBLE_SECTIONS, maxCourseSec, maxPeriodSec);
+  }, [courses, periods]);
   const todayDow = getTodayDayOfWeek();
   const colWidth = Math.floor((SCREEN_WIDTH - TIME_COL_WIDTH - 12) / 7);
 
@@ -330,22 +339,23 @@ export const ScheduleScreen: React.FC<Props> = ({
             <View style={styles.gridBody}>
               {/* Left Period Column */}
               <View style={{ width: TIME_COL_WIDTH }}>
-                {Array.from({ length: VISIBLE_SECTIONS }, (_, i) => {
+                {Array.from({ length: visibleSections }, (_, i) => {
                   const sec = i + 1;
                   const p = periods.find((item) => item.section === sec);
                   return (
                     <View key={sec} style={styles.timeCell}>
                       <Text style={styles.sectionNum}>{sec}</Text>
                       <Text style={styles.sectionTime}>{p?.start ?? ''}</Text>
+                      {p?.end ? <Text style={styles.sectionEndTime}>{p.end}</Text> : null}
                     </View>
                   );
                 })}
               </View>
 
               {/* 7-Day Columns */}
-              <View style={styles.columnsWrap}>
+              <View style={[styles.columnsWrap, { height: visibleSections * ROW_HEIGHT }]}>
                 {/* Background Grid Lines */}
-                {Array.from({ length: VISIBLE_SECTIONS }, (_, i) => (
+                {Array.from({ length: visibleSections }, (_, i) => (
                   <View
                     key={`line-${i}`}
                     style={[
@@ -656,14 +666,19 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
   },
   sectionTime: {
-    fontSize: 9,
+    fontSize: 8.5,
+    color: COLORS.textSecondary,
+    marginTop: 1,
+    fontWeight: '600',
+  },
+  sectionEndTime: {
+    fontSize: 8,
     color: COLORS.textMuted,
-    marginTop: 2,
+    marginTop: 0.5,
   },
   columnsWrap: {
     flex: 1,
     position: 'relative',
-    height: VISIBLE_SECTIONS * ROW_HEIGHT,
   },
   gridRowLine: {
     position: 'absolute',

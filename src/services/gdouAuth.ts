@@ -18,6 +18,7 @@ import {
   ExamItem,
   GradeItem,
   LogoutVerificationDetails,
+  PeriodTime,
   SyncReceipt,
 } from '../types/models';
 import {
@@ -28,7 +29,7 @@ import {
 } from './cryptoAes';
 import { parseZfExamResponse } from './examParser';
 import { parseZfGradesResponse } from './gradeParser';
-import { parseZfScheduleResponse } from './scheduleParser';
+import { parseZfPeriodTimesResponse, parseZfScheduleResponse } from './scheduleParser';
 import { sanitizeEndpointUrl } from './zeroRetentionSanitizer';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
@@ -133,10 +134,28 @@ export interface MfaChallengeState {
   previousSteps: string[];
 }
 
+/**
+ * Off-campus WebVPN (`wfw.gdou.edu.cn`) sub-session auth handoff state after MFA passes.
+ * Contains ZERO plaintext password (strict P0-5 zero-retention compliance).
+ */
+export interface WfwSubAuthState {
+  required: true;
+  username: string;
+  salt2: string;
+  execution2: string;
+  lt2: string;
+  needCaptcha: boolean;
+  captchaImageUri?: string;
+  session: PreparedAuthSession;
+  previousSteps: string[];
+}
+
 export interface SyncResult {
   courses: CourseItem[];
   exams: ExamItem[];
   grades: GradeItem[];
+  syncedPeriods?: PeriodTime[];
+  detectedCampus?: string;
   termLabel: string;
   academicYear: string;
   semesterCode: string;
@@ -146,6 +165,10 @@ export interface SyncResult {
 export type OneShotSyncOutcome =
   | { status: 'completed'; result: SyncResult }
   | { status: 'mfa_required'; mfa: MfaChallengeState };
+
+export type MfaCompletionOutcome =
+  | { status: 'completed'; result: SyncResult }
+  | { status: 'wfw_subauth_required'; subAuth: WfwSubAuthState };
 
 export interface SyncTermOverride {
   xnm?: string;
@@ -717,6 +740,52 @@ async function fetchJwExamJson(
   };
 }
 
+async function fetchJwPeriodTimesJson(
+  jwBaseUrl: string,
+  prefix: string,
+  xnm: string,
+  xqm: string,
+  campusId?: string,
+  options: AuthRequestOptions = {}
+): Promise<PeriodTime[]> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const endpoint = `${jwBaseUrl}${prefix}${GDOU_JW_PATHS.periodTimes}`;
+  const paramVariants: Record<string, string>[] = [
+    { xnm, xqm, xqh_id: campusId || '1' },
+    { xnm, xqm },
+  ];
+
+  for (const params of paramVariants) {
+    try {
+      const resp = await fetchWithTimeout(
+        endpoint,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'User-Agent': ua,
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            Accept: 'application/json, text/javascript, */*; q=0.01',
+          },
+          body: encodeFormBody(params),
+        },
+        { ...options, timeoutMs: Math.min(options.timeoutMs ?? 12_000, 12_000) }
+      );
+      if (!resp.ok) continue;
+      const text = (await resp.text()).trim();
+      if (!text.startsWith('{') && !text.startsWith('[')) continue;
+      const parsed = parseZfPeriodTimesResponse(JSON.parse(text));
+      if (parsed.length >= 8) {
+        return parsed;
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+    }
+  }
+  return [];
+}
+
 async function fetchJwGradesJson(
   jwBaseUrl: string,
   prefix: string,
@@ -956,8 +1025,76 @@ export async function requestGdouMfaDynamicCode(
 }
 
 /**
+ * Fetch a fresh graphic captcha image inside an active off-campus `wfw` proxy session.
+ */
+export async function fetchWfwSubAuthCaptchaImage(
+  session: PreparedAuthSession,
+  options: AuthRequestOptions = {}
+): Promise<string | undefined> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const imgUrl = `${GDOU_WFW_ORIGIN}/${session.authOrigin}${GDOU_AUTH_PATHS.getCaptcha}?${Date.now()}`;
+  const resp = await fetchWithTimeout(
+    imgUrl,
+    {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        'User-Agent': ua,
+        Accept: 'image/webp,image/apng,image/*,*/*;q=0.8',
+        Referer: GDOU_JW_WFW_BASE,
+      },
+    },
+    { ...options, timeoutMs: options.timeoutMs ?? 12_000 }
+  );
+  if (!resp.ok) return undefined;
+  const buf = await resp.arrayBuffer();
+  if (!buf || buf.byteLength < 64) return undefined;
+  const base64 = arrayBufferToBase64(buf);
+  const rawType = resp.headers.get('content-type') || 'image/jpeg';
+  const mimeType = rawType.split(';')[0].trim() || 'image/jpeg';
+  return `data:${mimeType};base64,${base64}`;
+}
+
+async function checkWfwSubAuthCaptcha(
+  session: PreparedAuthSession,
+  username: string,
+  options: AuthRequestOptions = {}
+): Promise<{ isNeed: boolean; imageDataUri?: string }> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const trimmed = username.trim();
+  if (!trimmed) return { isNeed: false };
+  try {
+    const checkUrl = `${GDOU_WFW_ORIGIN}/${session.authOrigin}${GDOU_AUTH_PATHS.checkNeedCaptcha}?username=${encodeURIComponent(
+      trimmed
+    )}&_=${Date.now()}`;
+    const resp = await fetchWithTimeout(
+      checkUrl,
+      {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 'User-Agent': ua },
+      },
+      { ...options, timeoutMs: 10_000 }
+    );
+    if (!resp.ok) return { isNeed: false };
+    const text = (await resp.text()).trim();
+    if (!text.startsWith('{')) return { isNeed: false };
+    const data = JSON.parse(text) as { isNeed?: boolean };
+    if (!data?.isNeed) return { isNeed: false };
+    const imageDataUri = await fetchWfwSubAuthCaptchaImage(session, options).catch(() => undefined);
+    return { isNeed: true, imageDataUri };
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+    return { isNeed: false };
+  }
+}
+
+/**
  * Submit MFA dynamic code and complete the one-shot JWXT pull.
  * Zero plaintext password is ever retained across the MFA pause.
+ * When off-campus `wfw` requires a separate proxied JWXT login after MFA succeeds,
+ * keeps `WFWSESSID` alive and returns `{ status: 'wfw_subauth_required', subAuth }`
+ * so the user can finish Step 2 seamlessly without ever caching plaintext passwords.
  */
 export async function submitGdouMfaAndCompleteSync(
   mfa: MfaChallengeState,
@@ -966,7 +1103,7 @@ export async function submitGdouMfaAndCompleteSync(
   termOverride?: SyncTermOverride,
   onProgress?: (step: string) => void,
   options: AuthRequestOptions = {}
-): Promise<SyncResult> {
+): Promise<MfaCompletionOutcome> {
   const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
   const { controller, cleanup } = createBoundedSyncController(options.signal);
   const reqOpts: AuthRequestOptions = { ...options, signal: controller.signal, userAgent: ua };
@@ -978,6 +1115,7 @@ export async function submitGdouMfaAndCompleteSync(
   };
 
   let shouldLogoutSession = false;
+  let keepSessionForSubAuth = false;
   let detectedPrefix = '';
 
   try {
@@ -1043,7 +1181,26 @@ export async function submitGdouMfaAndCompleteSync(
     log('4. 多因子二次认证通过，正在激活教务系统票据...');
 
     // Ticket-only handoff (zero plaintext password retained across MFA!)
-    await completeCasToJwHandoff(mfa.session, mfa.session.isWebVpn, undefined, reqOpts);
+    const handoff = await completeCasToJwHandoff(mfa.session, mfa.session.isWebVpn, undefined, reqOpts);
+    if (handoff.status === 'wfw_subauth_needed') {
+      keepSessionForSubAuth = true;
+      const cap = await checkWfwSubAuthCaptcha(mfa.session, mfa.reAuthUserId, reqOpts);
+      log('5. 校外微门户 (wfw) 已就绪，需确认教务子会话（内存未留存密码，请重新输入一次密码）');
+      return {
+        status: 'wfw_subauth_required',
+        subAuth: {
+          required: true,
+          username: mfa.reAuthUserId,
+          salt2: handoff.salt2,
+          execution2: handoff.execution2,
+          lt2: handoff.lt2,
+          needCaptcha: cap.isNeed,
+          captchaImageUri: cap.imageDataUri,
+          session: mfa.session,
+          previousSteps: steps,
+        },
+      };
+    }
 
     const pulled = await pullAllJwData(mfa.session, steps, log, termOverride, reqOpts);
     detectedPrefix = pulled.prefix;
@@ -1077,16 +1234,204 @@ export async function submitGdouMfaAndCompleteSync(
     }
 
     return {
+      status: 'completed',
+      result: {
+        courses: pulled.courses,
+        exams: pulled.exams,
+        grades: pulled.grades,
+        syncedPeriods: pulled.syncedPeriods,
+        detectedCampus: pulled.detectedCampus,
+        termLabel: pulled.termLabel,
+        academicYear: pulled.academicYear,
+        semesterCode: pulled.semesterCode,
+        receipt: {
+          syncedAtIso: new Date().toISOString(),
+          mode: 'direct',
+          networkRoute: mfa.session.isWebVpn ? 'wfw-webvpn' : 'campus-direct',
+          termLabel: pulled.termLabel,
+          coursesCount: pulled.courses.length,
+          examsCount: pulled.exams.length,
+          gradesCount: pulled.grades.length,
+          credentialsPurged,
+          sessionLoggedOut,
+          storageCleaned,
+          cookiesFlushed,
+          logoutDetails,
+          warnings: warnings.length > 0 ? warnings : undefined,
+          steps,
+        },
+      },
+    };
+  } finally {
+    cleanup();
+    if (shouldLogoutSession && !keepSessionForSubAuth) {
+      await logoutEphemeralSession(
+        mfa.session.jwBaseUrl,
+        mfa.session.authOrigin,
+        mfa.session.isWebVpn,
+        detectedPrefix,
+        { userAgent: ua, timeoutMs: 5_000 }
+      );
+    }
+  }
+}
+
+/**
+ * Step 2 for off-campus `wfw` after MFA: uses fresh user-supplied ephemeral password
+ * (encrypted immediately with `salt2` and purged BEFORE network I/O) to authenticate
+ * the proxied `jw.gdou.edu.cn` sub-session inside the already-authenticated `WFWSESSID`,
+ * pulls all JWXT data, and logs out all 3 sessions with HTTP verification.
+ */
+export async function completeWfwSubAuthAndSync(
+  subAuth: WfwSubAuthState,
+  credentials: EphemeralCredentials,
+  termOverride?: SyncTermOverride,
+  onProgress?: (step: string) => void,
+  options: AuthRequestOptions = {}
+): Promise<SyncResult> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const { controller, cleanup } = createBoundedSyncController(options.signal);
+  const reqOpts: AuthRequestOptions = { ...options, signal: controller.signal, userAgent: ua };
+
+  const steps = [...subAuth.previousSteps];
+  const log = (msg: string) => {
+    steps.push(msg);
+    onProgress?.(msg);
+  };
+
+  let logoutCompleted = false;
+  let detectedPrefix = '';
+  let rawPassword = credentials.password;
+  const username = (credentials.username || subAuth.username).trim();
+  const captcha = (credentials.captcha ?? '').trim();
+
+  try {
+    // Purge caller credential object immediately BEFORE network I/O
+    purgeEphemeralCredentials(credentials);
+
+    // Bind already MFA-trusted ephemeralBfp inside wfw proxy so Step 2 does not re-trigger MFA
+    try {
+      await fetchWithTimeout(
+        `${GDOU_WFW_ORIGIN}/${subAuth.session.authOrigin}${GDOU_AUTH_PATHS.bfpInfo}?bfp=${subAuth.session.ephemeralBfp}`,
+        {
+          method: 'GET',
+          credentials: 'include',
+          headers: { 'User-Agent': ua },
+        },
+        { ...reqOpts, timeoutMs: 10_000 }
+      );
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+    }
+
+    const encryptedPwd2 = encryptGdouPassword(rawPassword, subAuth.salt2);
+    rawPassword = '';
+    log('5b. 教务子会话密码已本地加密并释放内存引用，正在激活校外教务通道...');
+
+    const wfwAuthPostUrl =
+      `${GDOU_WFW_ORIGIN}/${subAuth.session.authOrigin}${GDOU_AUTH_PATHS.login}?service=` +
+      encodeURIComponent(GDOU_JW_SSO_SERVICE);
+
+    const wfwPostResp = await fetchWithTimeout(
+      wfwAuthPostUrl,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'User-Agent': ua,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: GDOU_WFW_ORIGIN,
+          Referer: GDOU_JW_WFW_BASE,
+        },
+        body: encodeFormBody({
+          username,
+          password: encryptedPwd2,
+          captcha,
+          _eventId: 'submit',
+          cllt: 'userNameLogin',
+          dllt: 'generalLogin',
+          lt: subAuth.lt2,
+          execution: subAuth.execution2,
+        }),
+      },
+      reqOpts
+    );
+
+    if (wfwPostResp.status === 429) {
+      throw new Error('认证请求过于频繁，请等待 30 秒后再试');
+    }
+    const wfwPostUrl = wfwPostResp.url || '';
+    const wfwPostHtml = await wfwPostResp.text();
+    if (isAccountLockedMessage(wfwPostHtml)) {
+      throw new Error(
+        '检测到海大账号已触发临时锁定/冻结保护，已立即熔断停止所有请求。请等待 15–30 分钟自动解冻或前往官方找回密码页面自助解冻。'
+      );
+    }
+    if (
+      wfwPostUrl.includes('reAuthLoginView.do') ||
+      wfwPostHtml.includes('reAuthParams') ||
+      wfwPostHtml.includes('多因子认证')
+    ) {
+      throw new Error('校外教务子通道再次触发二次安全验证，请切换顶部「官网无痕网页」完成本次同步');
+    }
+    if (wfwPostHtml.includes('pwdEncryptSalt')) {
+      const tip = extractAuthError(wfwPostHtml);
+      if (isAccountLockedMessage(tip)) {
+        throw new Error(
+          `海大认证提示：${tip}。已立即熔断禁止自动重试，请等待冷却后使用「官网无痕网页」手机验证码登录。`
+        );
+      }
+      throw new Error(
+        tip
+          ? `校外教务子会话验证未通过：${tip}（可切换「官网无痕网页」登录）`
+          : '校外教务子会话验证未通过，请核对密码/验证码或切换顶部「官网无痕网页」同步'
+      );
+    }
+
+    const pulled = await pullAllJwData(subAuth.session, steps, log, termOverride, reqOpts);
+    detectedPrefix = pulled.prefix;
+
+    const logoutDetails = await logoutEphemeralSession(
+      subAuth.session.jwBaseUrl,
+      subAuth.session.authOrigin,
+      subAuth.session.isWebVpn,
+      detectedPrefix,
+      { userAgent: ua, signal: options.signal }
+    );
+    logoutCompleted = true;
+
+    const credentialsPurged = areCredentialsPurged(credentials) && rawPassword === '';
+    const cookiesFlushed = logoutDetails.casLoggedOut;
+    const storageCleaned = cookiesFlushed;
+    const sessionLoggedOut =
+      logoutDetails.casLoggedOut && logoutDetails.failedEndpoints.length === 0;
+    const warnings = [...pulled.warnings];
+    if (!sessionLoggedOut) {
+      warnings.push(
+        `部分远端注销请求未确认成功 (${logoutDetails.succeeded}/${logoutDetails.attempted})，请留意官网登录状态`
+      );
+      log(
+        `8. 本地无痕清理已尝试，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议手动核对官网退出）`
+      );
+    } else {
+      log(
+        `8. 服务端会话已确认注销（${logoutDetails.succeeded}/${logoutDetails.attempted} 项 HTTP 确认），本地零凭据落盘`
+      );
+    }
+
+    return {
       courses: pulled.courses,
       exams: pulled.exams,
       grades: pulled.grades,
+      syncedPeriods: pulled.syncedPeriods,
+      detectedCampus: pulled.detectedCampus,
       termLabel: pulled.termLabel,
       academicYear: pulled.academicYear,
       semesterCode: pulled.semesterCode,
       receipt: {
         syncedAtIso: new Date().toISOString(),
         mode: 'direct',
-        networkRoute: mfa.session.isWebVpn ? 'wfw-webvpn' : 'campus-direct',
+        networkRoute: 'wfw-webvpn',
         termLabel: pulled.termLabel,
         coursesCount: pulled.courses.length,
         examsCount: pulled.exams.length,
@@ -1101,12 +1446,14 @@ export async function submitGdouMfaAndCompleteSync(
       },
     };
   } finally {
+    rawPassword = '';
+    purgeEphemeralCredentials(credentials);
     cleanup();
-    if (shouldLogoutSession) {
+    if (!logoutCompleted) {
       await logoutEphemeralSession(
-        mfa.session.jwBaseUrl,
-        mfa.session.authOrigin,
-        mfa.session.isWebVpn,
+        subAuth.session.jwBaseUrl,
+        subAuth.session.authOrigin,
+        subAuth.session.isWebVpn,
         detectedPrefix,
         { userAgent: ua, timeoutMs: 5_000 }
       );
@@ -1114,12 +1461,16 @@ export async function submitGdouMfaAndCompleteSync(
   }
 }
 
+type CasHandoffOutcome =
+  | { status: 'ready' }
+  | { status: 'wfw_subauth_needed'; salt2: string; execution2: string; lt2: string };
+
 async function completeCasToJwHandoff(
   session: PreparedAuthSession,
   needWfwActivation: boolean,
   ephemeralForWfw?: { username: string; password: string },
   options: AuthRequestOptions = {}
-): Promise<void> {
+): Promise<CasHandoffOutcome> {
   const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
 
   if (session.isWebVpn) {
@@ -1165,13 +1516,16 @@ async function completeCasToJwHandoff(
 
     if (!salt2 || !exe2) {
       // Already inside JWXT portal without needing a second proxied login
-      return;
+      return { status: 'ready' };
     }
 
     if (!ephemeralForWfw?.username || !ephemeralForWfw?.password) {
-      throw new Error(
-        '多因子认证已通过，但校外微门户 (wfw) 要求教务子会话独立鉴权。为确保密码绝不驻留内存，请切换顶部「官网无痕网页」完成同步'
-      );
+      return {
+        status: 'wfw_subauth_needed',
+        salt2,
+        execution2: exe2,
+        lt2,
+      };
     }
 
     try {
@@ -1247,7 +1601,7 @@ async function completeCasToJwHandoff(
           : '校外教务通道二次握手未通过，建议切换顶部「官网无痕网页」同步'
       );
     }
-    return;
+    return { status: 'ready' };
   }
 
   // Campus direct network: CAS redirects straight to https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...
@@ -1266,6 +1620,7 @@ async function completeCasToJwHandoff(
     },
     options
   );
+  return { status: 'ready' };
 }
 
 function derivePreviousTerm(
@@ -1291,6 +1646,8 @@ async function pullAllJwData(
   courses: CourseItem[];
   exams: ExamItem[];
   grades: GradeItem[];
+  syncedPeriods?: PeriodTime[];
+  detectedCampus?: string;
   termLabel: string;
   academicYear: string;
   semesterCode: string;
@@ -1336,7 +1693,20 @@ async function pullAllJwData(
   if (parsedSchedule.warnings.length > 0) {
     warnings.push(...parsedSchedule.warnings);
   }
-  log(`6. 课表解析完成：共 ${parsedSchedule.courses.length} 项教学安排`);
+
+  const syncedPeriods = await fetchJwPeriodTimesJson(
+    session.jwBaseUrl,
+    prefix,
+    xnm,
+    xqm,
+    parsedSchedule.campusId,
+    options
+  );
+  log(
+    syncedPeriods.length >= 8
+      ? `6. 课表解析完成：共 ${parsedSchedule.courses.length} 项教学安排（已同步教务官方 ${syncedPeriods.length} 节作息时间）`
+      : `6. 课表解析完成：共 ${parsedSchedule.courses.length} 项教学安排`
+  );
 
   const examRes = await fetchJwExamJson(session.jwBaseUrl, prefix, xnm, xqm, options);
   if (examRes.queryWarning) warnings.push(examRes.queryWarning);
@@ -1352,6 +1722,8 @@ async function pullAllJwData(
     courses: parsedSchedule.courses,
     exams,
     grades,
+    syncedPeriods: syncedPeriods.length >= 8 ? syncedPeriods : undefined,
+    detectedCampus: parsedSchedule.campusName,
     termLabel: parsedSchedule.termLabel || termLabel,
     academicYear: xnm,
     semesterCode: xqm,
@@ -1627,6 +1999,8 @@ export async function executeOneShotGdouSync(
         courses: pulled.courses,
         exams: pulled.exams,
         grades: pulled.grades,
+        syncedPeriods: pulled.syncedPeriods,
+        detectedCampus: pulled.detectedCampus,
         termLabel: pulled.termLabel,
         academicYear: pulled.academicYear,
         semesterCode: pulled.semesterCode,
@@ -1739,9 +2113,26 @@ export function buildIncognitoWebViewSyncScript(
         }).join('&');
       }
 
-      // 1. Mobile UI adaptation for GDOU authserver & WebVPN pages
+      // 1. Mobile UI adaptation + automatic HTTPS upgrade for GDOU authserver & WebVPN pages
       (function adaptMobileLayout() {
         try {
+          // Ensure in-page cleartext http://*.gdou.edu.cn forms/XHR/resources auto-upgrade to HTTPS
+          if (host === 'gdou.edu.cn' || host.slice(-12) === '.gdou.edu.cn') {
+            if (!document.getElementById('__gdou_upgrade_https__') && document.head) {
+              var csp = document.createElement('meta');
+              csp.id = '__gdou_upgrade_https__';
+              csp.httpEquiv = 'Content-Security-Policy';
+              csp.content = 'upgrade-insecure-requests';
+              document.head.appendChild(csp);
+            }
+            var forms = document.querySelectorAll('form[action^="http://"]');
+            for (var fi = 0; fi < forms.length; fi++) {
+              var act = forms[fi].getAttribute('action') || '';
+              if (act.indexOf('gdou.edu.cn') !== -1) {
+                forms[fi].setAttribute('action', act.replace(/^http:\\/\\//i, 'https://'));
+              }
+            }
+          }
           if (host === 'authserver.gdou.edu.cn' || html.indexOf('pwdEncryptSalt') !== -1 || html.indexOf('reAuthParams') !== -1) {
             var vp = document.querySelector('meta[name="viewport"]');
             if (!vp) {
@@ -1959,6 +2350,37 @@ export function buildIncognitoWebViewSyncScript(
             }
           }
 
+          var periodTimesJson = null;
+          try {
+            var xqhId = (kbJson.kbList && kbJson.kbList[0] && kbJson.kbList[0].xqh_id) ? String(kbJson.kbList[0].xqh_id) : '1';
+            var rjcBodies = [
+              encodeForm({ xnm: xnm, xqm: xqm, xqh_id: xqhId }),
+              encodeForm({ xnm: xnm, xqm: xqm })
+            ];
+            for (var ri = 0; ri < rjcBodies.length && !periodTimesJson; ri++) {
+              try {
+                var rjcResp = await timedFetch(root + prefix + JW_PATHS.periodTimes, {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest'
+                  },
+                  body: rjcBodies[ri]
+                }, 10000);
+                if (!rjcResp.ok) continue;
+                var rjcText = (await rjcResp.text()).trim();
+                if (rjcText.charAt(0) === '{' || rjcText.charAt(0) === '[') {
+                  var rjcParsed = JSON.parse(rjcText);
+                  var arr = Array.isArray(rjcParsed) ? rjcParsed : (rjcParsed.items || rjcParsed.rows || rjcParsed.rjcList || rjcParsed.sjdList || []);
+                  if (Array.isArray(arr) && arr.length >= 8) {
+                    periodTimesJson = rjcParsed;
+                  }
+                }
+              } catch (e) {}
+            }
+          } catch (e) {}
+
           post({ type: 'PROGRESS', message: '正在拉取考试安排与考场座位...' });
           var examJson = { items: [] };
           var examVariants = [
@@ -2075,6 +2497,7 @@ export function buildIncognitoWebViewSyncScript(
             xqm: xqm,
             isWebVpn: isWebVpn,
             scheduleRaw: kbJson,
+            periodTimesRaw: periodTimesJson,
             examRaw: examJson,
             gradeRaw: gradeJson,
             storageCleaned: storageCleaned,

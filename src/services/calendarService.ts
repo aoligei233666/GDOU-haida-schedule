@@ -1,10 +1,10 @@
-import * as Calendar from 'expo-calendar';
+import * as Calendar from 'expo-calendar/legacy';
 import { Platform } from 'react-native';
 import { getActivePeriods } from '../constants/gdouTimetable';
 import { AppSettings, CourseItem, ExamItem } from '../types/models';
 import { parseExamIsoLocal } from './examParser';
 import {
-  getCourseOccurrences,
+  getCourseWallClockOccurrences,
   isCourseSchedulable,
   parseLocalDateStrict,
 } from './scheduleParser';
@@ -572,6 +572,17 @@ async function upsertTaggedEvents(params: {
   };
 }
 
+function shanghaiWallClockToDate(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number
+): Date {
+  // China Standard Time is fixed UTC+08:00 with no DST
+  return new Date(Date.UTC(year, month - 1, day, hour - 8, minute, 0, 0));
+}
+
 function buildReminderAlarms(offsetsMinutes: number[]): Calendar.Alarm[] {
   return offsetsMinutes.map((relativeOffset) =>
     Platform.OS === 'android'
@@ -610,9 +621,23 @@ export async function syncAllCoursesToCalendar(
       skippedUnparsed++;
       continue;
     }
-    const occurrences = getCourseOccurrences(course, settings.termStartDate, periods);
+    const occurrences = getCourseWallClockOccurrences(course, settings.termStartDate, periods);
     for (const occ of occurrences) {
-      if (skipPastEvents && occ.end.getTime() < nowMs) {
+      const startDate = shanghaiWallClockToDate(
+        occ.year,
+        occ.month,
+        occ.day,
+        occ.startHour,
+        occ.startMinute
+      );
+      const endDate = shanghaiWallClockToDate(
+        occ.year,
+        occ.month,
+        occ.day,
+        occ.endHour,
+        occ.endMinute
+      );
+      if (skipPastEvents && endDate.getTime() < nowMs) {
         skippedPast++;
         continue;
       }
@@ -625,8 +650,8 @@ export async function syncAllCoursesToCalendar(
           notes: `授课教师：${course.teacher}\n节次：第 ${course.startSection}-${course.endSection} 节\n周次：第 ${occ.week} 周（${course.weekText}）${
             course.credit ? `\n学分：${course.credit}` : ''
           }\n${tag}`,
-          startDate: occ.start,
-          endDate: occ.end,
+          startDate,
+          endDate,
           timeZone: 'Asia/Shanghai',
           alarms,
         },
@@ -687,18 +712,32 @@ export async function addSingleCourseToCalendar(
   const periods = getActivePeriods(settings);
   const reminderOffset = -Math.abs(settings.defaultCalendarReminderMinutes || 15);
   const alarms = buildReminderAlarms([reminderOffset]);
-  const occurrences = getCourseOccurrences(course, settings.termStartDate, periods);
+  const occurrences = getCourseWallClockOccurrences(course, settings.termStartDate, periods);
 
   const desired: DesiredCalendarEvent[] = occurrences.map((occ) => {
     const tag = `${COURSE_TAG_PREFIX}${course.id}:w${occ.week}]`;
+    const startDate = shanghaiWallClockToDate(
+      occ.year,
+      occ.month,
+      occ.day,
+      occ.startHour,
+      occ.startMinute
+    );
+    const endDate = shanghaiWallClockToDate(
+      occ.year,
+      occ.month,
+      occ.day,
+      occ.endHour,
+      occ.endMinute
+    );
     return {
       tag,
       details: {
         title: course.name,
         location: [course.campus, course.location].filter(Boolean).join(' · '),
         notes: `授课教师：${course.teacher}\n节次：第 ${course.startSection}-${course.endSection} 节\n周次：第 ${occ.week} 周（${course.weekText}）\n${tag}`,
-        startDate: occ.start,
-        endDate: occ.end,
+        startDate,
+        endDate,
         timeZone: 'Asia/Shanghai',
         alarms,
       },

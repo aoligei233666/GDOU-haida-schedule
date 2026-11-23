@@ -11,7 +11,11 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { EphemeralSyncModal } from './src/components/EphemeralSyncModal';
-import { buildSampleGdouData } from './src/constants/gdouTimetable';
+import {
+  buildSampleGdouData,
+  getDefaultTermStartDateForTerm,
+  matchCampusPresetByName,
+} from './src/constants/gdouTimetable';
 import { AlarmsScreen } from './src/screens/AlarmsScreen';
 import { ExamsScreen } from './src/screens/ExamsScreen';
 import { GradesScreen } from './src/screens/GradesScreen';
@@ -174,6 +178,36 @@ function MainApp() {
   const handleSyncSuccess = (result: SyncResult) => {
     mutateAppData((prev) => {
       const manualExams = prev.exams.filter((e) => e.isManual);
+      const nextSettings: AppSettings = { ...prev.settings };
+
+      // 1. Apply authoritative section bell schedule fetched from 正方 /kbcx/xskbcx_cxRjc.html when available
+      if (result.syncedPeriods && result.syncedPeriods.length >= 8) {
+        nextSettings.customPeriods = result.syncedPeriods;
+        nextSettings.campusPreset = 'custom';
+      } else if (prev.settings.campusPreset !== 'custom') {
+        const matchedPreset = matchCampusPresetByName(
+          result.detectedCampus || result.courses.find((c) => c.campus)?.campus
+        );
+        if (matchedPreset) {
+          nextSettings.campusPreset = matchedPreset;
+        }
+      }
+
+      // 2. Align termStartDate automatically whenever the synced term changes (or first sync)
+      const termChanged =
+        prev.academicYear !== result.academicYear ||
+        prev.semesterCode !== result.semesterCode ||
+        prev.courses.length === 0;
+      if (termChanged) {
+        const alignedMonday = getDefaultTermStartDateForTerm(
+          result.academicYear,
+          result.semesterCode
+        );
+        if (alignedMonday) {
+          nextSettings.termStartDate = alignedMonday;
+        }
+      }
+
       return {
         ...prev,
         courses: result.courses,
@@ -184,6 +218,7 @@ function MainApp() {
         semesterCode: result.semesterCode,
         lastSyncedAt: result.receipt.syncedAtIso,
         lastSyncReceipt: result.receipt,
+        settings: nextSettings,
       };
     });
 

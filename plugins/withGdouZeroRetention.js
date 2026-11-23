@@ -44,6 +44,7 @@ import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -198,8 +199,11 @@ class MainApplication : Application(), ReactApplication {
         .addNetworkInterceptor { chain ->
           val req = chain.request()
           val reqUrl = req.url.toString()
-          val effectiveReq = if (reqUrl.startsWith("http://authserver.gdou.edu.cn/")) {
-            req.newBuilder().url(reqUrl.replaceFirst("http://", "https://")).build()
+          val isGdouHttpReq = req.url.scheme.equals("http", ignoreCase = true) &&
+            (req.url.host.equals("gdou.edu.cn", ignoreCase = true) ||
+              req.url.host.endsWith(".gdou.edu.cn", ignoreCase = true))
+          val effectiveReq = if (isGdouHttpReq) {
+            req.newBuilder().url(req.url.newBuilder().scheme("https").port(443).build()).build()
           } else {
             req
           }
@@ -227,13 +231,18 @@ class MainApplication : Application(), ReactApplication {
             }
           }
 
-          // Upgrade cleartext http://authserver redirects to https:// and fix relative wfw/jw redirects
+          // Upgrade cleartext http://*.gdou.edu.cn redirects to https:// and fix relative wfw/jw redirects
           val loc = resp.header("Location")
           var rewrittenLoc: String? = null
           if (loc != null) {
+            val parsedLoc = loc.toHttpUrlOrNull()
+            val isGdouHttpLoc = parsedLoc != null &&
+              parsedLoc.scheme.equals("http", ignoreCase = true) &&
+              (parsedLoc.host.equals("gdou.edu.cn", ignoreCase = true) ||
+                parsedLoc.host.endsWith(".gdou.edu.cn", ignoreCase = true))
             rewrittenLoc = when {
-              loc.startsWith("http://authserver.gdou.edu.cn/") ->
-                loc.replaceFirst("http://", "https://")
+              isGdouHttpLoc && parsedLoc != null ->
+                parsedLoc.newBuilder().scheme("https").port(443).build().toString()
               loc.startsWith("/") &&
                 !loc.startsWith("/https://") &&
                 !loc.startsWith("/http://") &&
@@ -462,11 +471,17 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     mutable.setValue(nil, forHTTPHeaderField: Self.resetHeader)
     mutable.setValue(nil, forHTTPHeaderField: Self.clearHeader)
 
-    // Upgrade cleartext http://authserver.gdou.edu.cn/ to https://
-    if let urlStr = mutable.url?.absoluteString,
-       urlStr.hasPrefix("http://authserver.gdou.edu.cn/"),
-       let upgraded = URL(string: "https://" + urlStr.dropFirst("http://".count)) {
-      mutable.url = upgraded
+    // Upgrade cleartext http://*.gdou.edu.cn/ to https://
+    if let curUrl = mutable.url,
+       curUrl.scheme?.lowercased() == "http",
+       let host = curUrl.host?.lowercased(),
+       (host == "gdou.edu.cn" || host.hasSuffix(".gdou.edu.cn")),
+       var comps = URLComponents(url: curUrl, resolvingAgainstBaseURL: false) {
+      comps.scheme = "https"
+      if comps.port == 80 { comps.port = nil }
+      if let upgraded = comps.url {
+        mutable.url = upgraded
+      }
     }
 
     // Attach cookies strictly from our volatile RAM store (never HTTPCookieStorage.shared)
@@ -522,13 +537,20 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     let nextMutable = ((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest) ?? NSMutableURLRequest(url: nextUrl)
     URLProtocol.removeProperty(forKey: Self.handledKey, in: nextMutable)
 
-    // Match Android OkHttp redirect fixes (http://authserver -> https:// and relative wfw/jw paths)
+    // Match Android OkHttp redirect fixes (http://*.gdou.edu.cn -> https:// and relative wfw/jw paths)
     let rawLoc = response.value(forHTTPHeaderField: "Location")
     let origUrlStr = task.originalRequest?.url?.absoluteString ?? ""
     if let loc = rawLoc {
-      if loc.hasPrefix("http://authserver.gdou.edu.cn/"),
-         let upgraded = URL(string: "https://" + loc.dropFirst("http://".count)) {
-        nextMutable.url = upgraded
+      if let locUrl = URL(string: loc),
+         locUrl.scheme?.lowercased() == "http",
+         let locHost = locUrl.host?.lowercased(),
+         (locHost == "gdou.edu.cn" || locHost.hasSuffix(".gdou.edu.cn")),
+         var comps = URLComponents(url: locUrl, resolvingAgainstBaseURL: false) {
+        comps.scheme = "https"
+        if comps.port == 80 { comps.port = nil }
+        if let upgraded = comps.url {
+          nextMutable.url = upgraded
+        }
       } else if loc.hasPrefix("/"),
                 !loc.hasPrefix("/https://"),
                 !loc.hasPrefix("/http://"),
@@ -729,8 +751,8 @@ function withGdouGradleProperties(config) {
 function withGdouAppBuildGradle(config) {
   return withAppBuildGradle(config, (mod) => {
     let contents = mod.modResults.contents;
-    const versionName = config.version || '1.3.0';
-    const versionCode = Number(config.android?.versionCode) || 3;
+    const versionName = config.version || '1.3.1';
+    const versionCode = Number(config.android?.versionCode) || 4;
 
     // 1. Sync versionCode & versionName from app.json (single source of truth)
     contents = contents.replace(/versionCode\s+\d+/, `versionCode ${versionCode}`);
@@ -804,8 +826,8 @@ function withGdouProguardRules(config) {
 
 function withGdouIosInfoPlist(config) {
   return withInfoPlist(config, (mod) => {
-    mod.modResults.CFBundleShortVersionString = config.version || '1.3.0';
-    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '3');
+    mod.modResults.CFBundleShortVersionString = config.version || '1.3.1';
+    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '4');
     mod.modResults.NSAppTransportSecurity = {
       NSAllowsArbitraryLoads: false,
       NSAllowsLocalNetworking: true,

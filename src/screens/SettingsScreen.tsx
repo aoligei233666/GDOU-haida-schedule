@@ -1,7 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
+  Linking,
   Platform,
   ScrollView,
   StyleSheet,
@@ -11,12 +13,24 @@ import {
   View,
 } from 'react-native';
 import appConfig from '../../app.json';
-import { CAMPUS_PRESETS, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
+import {
+  CAMPUS_PRESETS,
+  GDOU_ENTRY_URL,
+  getActivePeriods,
+  isValidHHMM,
+} from '../constants/gdouTimetable';
 import { openAndroidExactAlarmSettings } from '../services/alarmService';
 import { parseLocalDateStrict } from '../services/scheduleParser';
 import { auditLocalStorageZeroCredentials } from '../services/storageService';
+import {
+  checkForAppUpdate,
+  formatBytesCompact,
+  GITHUB_RELEASES_PAGE_URL,
+  isTrustedGithubReleaseUrl,
+  UpdateCheckResult,
+} from '../services/updateService';
 import { COLORS } from '../theme/colors';
-import { AppSettings, CampusPresetKey, SyncReceipt } from '../types/models';
+import { AppSettings, CampusPresetKey, PeriodTime, SyncReceipt } from '../types/models';
 
 const APP_VERSION = appConfig.expo.version;
 
@@ -42,9 +56,27 @@ export const SettingsScreen: React.FC<Props> = ({
     credentialKeysFound: string[];
   } | null>(null);
 
+  // Bell schedule custom editor state
+  const activePeriods = useMemo(() => getActivePeriods(settings), [settings]);
+  const [editingPeriods, setEditingPeriods] = useState(false);
+  const [draftPeriods, setDraftPeriods] = useState<PeriodTime[]>(() =>
+    activePeriods.map((p) => ({ ...p }))
+  );
+
+  // GitHub Releases update checker state
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
   useEffect(() => {
     setTermDateInput(settings.termStartDate);
   }, [settings.termStartDate]);
+
+  useEffect(() => {
+    if (!editingPeriods) {
+      setDraftPeriods(activePeriods.map((p) => ({ ...p })));
+    }
+  }, [activePeriods, editingPeriods]);
 
   useEffect(() => {
     void runPrivacyAudit();
@@ -56,10 +88,76 @@ export const SettingsScreen: React.FC<Props> = ({
   };
 
   const handleSelectCampus = (key: Exclude<CampusPresetKey, 'custom'>) => {
+    setEditingPeriods(false);
     onUpdateSettings({
       ...settings,
       campusPreset: key,
     });
+  };
+
+  const handleUpdateDraftPeriod = (
+    section: number,
+    field: 'start' | 'end',
+    value: string
+  ) => {
+    setDraftPeriods((prev) =>
+      prev.map((p) => (p.section === section ? { ...p, [field]: value } : p))
+    );
+  };
+
+  const handleSaveCustomPeriods = () => {
+    const normalized: PeriodTime[] = [];
+    for (const p of draftPeriods) {
+      const start = p.start.trim();
+      const end = p.end.trim();
+      if (!isValidHHMM(start) || !isValidHHMM(end)) {
+        Alert.alert(
+          '时间格式错误',
+          `第 ${p.section} 节的时间格式须为 HH:mm（例如 08:10），请检查后重试。`
+        );
+        return;
+      }
+      if (start >= end) {
+        Alert.alert(
+          '时间范围无效',
+          `第 ${p.section} 节的开始时间（${start}）必须早于结束时间（${end}）。`
+        );
+        return;
+      }
+      normalized.push({ section: p.section, start, end });
+    }
+    onUpdateSettings({
+      ...settings,
+      campusPreset: 'custom',
+      customPeriods: normalized,
+    });
+    setEditingPeriods(false);
+    Alert.alert('作息时间已更新', '已应用自定义节次时间，课表、日历与闹钟均将按新时间计算。');
+  };
+
+  const handleOpenTrustedUrl = async (url: string) => {
+    const target = isTrustedGithubReleaseUrl(url) ? url : GITHUB_RELEASES_PAGE_URL;
+    try {
+      await Linking.openURL(target);
+    } catch (err) {
+      Alert.alert(
+        '无法打开浏览器',
+        `请手动访问：\n${target}\n\n（${err instanceof Error ? err.message : String(err)}）`
+      );
+    }
+  };
+
+  const handleCheckUpdate = async () => {
+    setCheckingUpdate(true);
+    setUpdateError(null);
+    try {
+      const res = await checkForAppUpdate(APP_VERSION, Platform.OS);
+      setUpdateResult(res);
+    } catch (err) {
+      setUpdateError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckingUpdate(false);
+    }
   };
 
   const handleSaveTermDate = () => {
@@ -111,6 +209,94 @@ export const SettingsScreen: React.FC<Props> = ({
             </Text>
           </View>
         </View>
+        {/* Version & GitHub Releases Update Card */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Ionicons name="cloud-download-outline" size={20} color={COLORS.oceanPrimary} />
+            <Text style={styles.cardTitle}>检查更新与下载（GitHub Releases）</Text>
+          </View>
+          <Text style={styles.cardDesc}>
+            当前版本：v{APP_VERSION} · 官方发布地址：{GITHUB_RELEASES_PAGE_URL}
+          </Text>
+
+          <View style={styles.updateBtnRow}>
+            <TouchableOpacity
+              style={[styles.updatePrimaryBtn, checkingUpdate && { opacity: 0.65 }]}
+              onPress={handleCheckUpdate}
+              disabled={checkingUpdate}
+            >
+              {checkingUpdate ? (
+                <ActivityIndicator size="small" color={COLORS.white} />
+              ) : (
+                <Ionicons name="refresh-outline" size={16} color={COLORS.white} />
+              )}
+              <Text style={styles.updatePrimaryBtnText}>
+                {checkingUpdate ? '正在检查...' : '检查新版本'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.updateSecondaryBtn}
+              onPress={() => void handleOpenTrustedUrl(GITHUB_RELEASES_PAGE_URL)}
+            >
+              <Ionicons name="open-outline" size={15} color={COLORS.oceanPrimary} />
+              <Text style={styles.updateSecondaryBtnText}>前往 Releases 下载</Text>
+            </TouchableOpacity>
+          </View>
+
+          {updateError && (
+            <View style={styles.updateErrorBox}>
+              <Ionicons name="alert-circle-outline" size={16} color={COLORS.danger} />
+              <Text style={styles.updateErrorText}>{updateError}</Text>
+            </View>
+          )}
+
+          {updateResult && (
+            <View
+              style={[
+                styles.updateResultBox,
+                updateResult.hasUpdate ? styles.updateResultHighlight : styles.updateResultUpToDate,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.updateResultTitle,
+                  { color: updateResult.hasUpdate ? '#9A3412' : '#065F46' },
+                ]}
+              >
+                {updateResult.hasUpdate
+                  ? `🎉 发现新版本 v${updateResult.latestVersion}（当前 v${updateResult.currentVersion}）`
+                  : updateResult.statusNote ||
+                    `✅ 当前 v${updateResult.currentVersion} 已是最新版本（远端 v${updateResult.latestVersion}）`}
+              </Text>
+
+              {updateResult.releaseNotes ? (
+                <Text style={styles.updateNotes} numberOfLines={5}>
+                  {updateResult.releaseNotes}
+                </Text>
+              ) : null}
+
+              {updateResult.hasUpdate && (
+                <TouchableOpacity
+                  style={styles.downloadReleaseBtn}
+                  onPress={() => void handleOpenTrustedUrl(updateResult.downloadUrl)}
+                >
+                  <Ionicons name="download-outline" size={16} color={COLORS.white} />
+                  <Text style={styles.downloadReleaseBtnText}>
+                    {updateResult.assetName
+                      ? `直接下载 ${updateResult.assetName}${
+                          updateResult.assetSizeBytes
+                            ? ` (${formatBytesCompact(updateResult.assetSizeBytes)})`
+                            : ''
+                        }`
+                      : `前往下载 v${updateResult.latestVersion}`}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+        </View>
+
         {/* Privacy Zero-Retention Audit Card */}
         <View style={[styles.card, styles.auditCard]}>
           <View style={styles.cardHeader}>
@@ -235,12 +421,16 @@ export const SettingsScreen: React.FC<Props> = ({
           </View>
         </View>
 
-        {/* Campus Bell Schedule Presets */}
+        {/* Campus Bell Schedule Presets + Custom Period Time Editor */}
         <View style={styles.card}>
           <View style={styles.cardHeader}>
             <Ionicons name="time-outline" size={20} color={COLORS.oceanPrimary} />
             <Text style={styles.cardTitle}>校区作息时间表</Text>
           </View>
+          <Text style={styles.cardDesc}>
+            同步课表时会自动尝试拉取教务官方节次时间；若需按所在校区或冬/夏令时微调，可在下方选择预设或直接修改每节起止时间。
+          </Text>
+
           {(Object.keys(CAMPUS_PRESETS) as Exclude<CampusPresetKey, 'custom'>[]).map((key) => {
             const preset = CAMPUS_PRESETS[key];
             const selected = settings.campusPreset === key;
@@ -264,6 +454,92 @@ export const SettingsScreen: React.FC<Props> = ({
               </TouchableOpacity>
             );
           })}
+
+          {settings.campusPreset === 'custom' && (
+            <View style={[styles.presetRow, styles.presetRowActive]}>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.presetTitle, { color: COLORS.oceanPrimary }]}>
+                  当前：教务同步 / 自定义作息时间（{activePeriods.length} 节）
+                </Text>
+                <Text style={styles.presetDesc}>
+                  第1节 {activePeriods[0]?.start}-{activePeriods[0]?.end} · 第5节{' '}
+                  {activePeriods[4]?.start}-{activePeriods[4]?.end} · 第9节{' '}
+                  {activePeriods[8]?.start}-{activePeriods[8]?.end}
+                </Text>
+              </View>
+              <Ionicons name="radio-button-on" size={20} color={COLORS.oceanPrimary} />
+            </View>
+          )}
+
+          {/* Compact Read-Only Preview of Active Section Times */}
+          {!editingPeriods ? (
+            <>
+              <View style={styles.periodPreviewGrid}>
+                {activePeriods.slice(0, 12).map((p) => (
+                  <View key={p.section} style={styles.periodPreviewCell}>
+                    <Text style={styles.periodPreviewSec}>第{p.section}节</Text>
+                    <Text style={styles.periodPreviewTime}>
+                      {p.start}-{p.end}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+              <TouchableOpacity
+                style={[styles.auditBtn, { marginTop: 10, borderColor: COLORS.oceanLight }]}
+                onPress={() => {
+                  setDraftPeriods(activePeriods.map((p) => ({ ...p })));
+                  setEditingPeriods(true);
+                }}
+              >
+                <Ionicons name="create-outline" size={15} color={COLORS.oceanPrimary} />
+                <Text style={[styles.auditBtnText, { color: COLORS.oceanPrimary }]}>
+                  自定义微调每节课起止时间
+                </Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <View style={styles.periodEditorWrap}>
+              <Text style={styles.periodEditorHint}>
+                请输入 24 小时制 HH:mm（例如 08:10），修改后点击保存即可生效：
+              </Text>
+              {draftPeriods.map((p) => (
+                <View key={p.section} style={styles.periodEditRow}>
+                  <Text style={styles.periodEditLabel}>第 {p.section} 节</Text>
+                  <TextInput
+                    style={styles.periodEditInput}
+                    value={p.start}
+                    onChangeText={(v) => handleUpdateDraftPeriod(p.section, 'start', v)}
+                    placeholder="08:10"
+                    placeholderTextColor={COLORS.textMuted}
+                    maxLength={5}
+                  />
+                  <Text style={styles.periodEditDash}>—</Text>
+                  <TextInput
+                    style={styles.periodEditInput}
+                    value={p.end}
+                    onChangeText={(v) => handleUpdateDraftPeriod(p.section, 'end', v)}
+                    placeholder="08:55"
+                    placeholderTextColor={COLORS.textMuted}
+                    maxLength={5}
+                  />
+                </View>
+              ))}
+              <View style={styles.periodEditActions}>
+                <TouchableOpacity
+                  style={styles.periodCancelBtn}
+                  onPress={() => {
+                    setDraftPeriods(activePeriods.map((p) => ({ ...p })));
+                    setEditingPeriods(false);
+                  }}
+                >
+                  <Text style={styles.periodCancelBtnText}>取消</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.periodSaveBtn} onPress={handleSaveCustomPeriods}>
+                  <Text style={styles.periodSaveBtnText}>保存自定义作息</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
         </View>
 
         {/* Default Reminder Offsets */}
@@ -615,5 +891,198 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '700',
     color: COLORS.danger,
+  },
+  updateBtnRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  updatePrimaryBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.oceanPrimary,
+    borderRadius: 10,
+    paddingVertical: 10,
+    gap: 6,
+  },
+  updatePrimaryBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
+  updateSecondaryBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.oceanTint,
+    borderRadius: 10,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: COLORS.oceanLight,
+    gap: 5,
+  },
+  updateSecondaryBtnText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.oceanPrimary,
+  },
+  updateErrorBox: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: COLORS.dangerLight,
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 10,
+    gap: 6,
+  },
+  updateErrorText: {
+    flex: 1,
+    fontSize: 12,
+    color: COLORS.danger,
+    lineHeight: 17,
+  },
+  updateResultBox: {
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 10,
+    borderWidth: 1,
+  },
+  updateResultHighlight: {
+    backgroundColor: '#FFF7ED',
+    borderColor: '#FDBA74',
+  },
+  updateResultUpToDate: {
+    backgroundColor: '#F0FDF4',
+    borderColor: '#BBF7D0',
+  },
+  updateResultTitle: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    lineHeight: 18,
+  },
+  updateNotes: {
+    fontSize: 11.5,
+    color: COLORS.textSecondary,
+    lineHeight: 17,
+    marginTop: 6,
+  },
+  downloadReleaseBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.coral,
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginTop: 10,
+    gap: 6,
+  },
+  downloadReleaseBtnText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
+  periodPreviewGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 10,
+  },
+  periodPreviewCell: {
+    width: '31%',
+    backgroundColor: COLORS.bg,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.borderLight,
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+    alignItems: 'center',
+  },
+  periodPreviewSec: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+  },
+  periodPreviewTime: {
+    fontSize: 10.5,
+    color: COLORS.textSecondary,
+    marginTop: 2,
+  },
+  periodEditorWrap: {
+    marginTop: 10,
+    backgroundColor: COLORS.bg,
+    borderRadius: 12,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    gap: 6,
+  },
+  periodEditorHint: {
+    fontSize: 11.5,
+    color: COLORS.textSecondary,
+    marginBottom: 4,
+  },
+  periodEditRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  periodEditLabel: {
+    width: 54,
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+  },
+  periodEditInput: {
+    flex: 1,
+    height: 36,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    fontSize: 13,
+    color: COLORS.textPrimary,
+    textAlign: 'center',
+  },
+  periodEditDash: {
+    fontSize: 13,
+    color: COLORS.textMuted,
+    fontWeight: '700',
+  },
+  periodEditActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  periodCancelBtn: {
+    flex: 1,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  periodCancelBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+  },
+  periodSaveBtn: {
+    flex: 2,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: COLORS.oceanPrimary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  periodSaveBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.white,
   },
 });

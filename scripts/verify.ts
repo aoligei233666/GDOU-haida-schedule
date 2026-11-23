@@ -5,8 +5,14 @@ import pkgJson from '../package.json';
 import {
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
+  upgradeGdouHttpToHttps,
 } from '../src/constants/gdouEndpoints';
-import { buildSampleGdouData, createDefaultSettings } from '../src/constants/gdouTimetable';
+import {
+  buildSampleGdouData,
+  CAMPUS_PRESETS,
+  createDefaultSettings,
+  getDefaultTermStartDateForTerm,
+} from '../src/constants/gdouTimetable';
 import {
   buildClassAlarmDedupeKey,
   buildExamAlarmDedupeKey,
@@ -23,12 +29,15 @@ import { getExamCountdown, parseExamDateTime, parseZfExamResponse } from '../src
 import {
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
+  completeWfwSubAuthAndSync,
   fetchWithTimeout,
   isAccountLockedMessage,
   isNativeMobileRuntime,
   logoutEphemeralSession,
+  MfaChallengeState,
   PreparedAuthSession,
   prepareGdouAuthSession,
+  submitGdouMfaAndCompleteSync,
 } from '../src/services/gdouAuth';
 import {
   computeGpaSummary,
@@ -43,8 +52,16 @@ import {
   parseLocalDateStrict,
   parseSectionRange,
   parseWeekExpression,
+  parseZfPeriodTimesResponse,
   parseZfScheduleResponse,
 } from '../src/services/scheduleParser';
+import {
+  checkForAppUpdate,
+  compareSemver,
+  GITHUB_RELEASES_PAGE_URL,
+  isTrustedGithubReleaseUrl,
+  selectPlatformReleaseAsset,
+} from '../src/services/updateService';
 import {
   containsSensitiveCredentialValue,
   findForbiddenCredentialKeys,
@@ -239,32 +256,153 @@ async function run() {
     assert.equal(captchaErr.checkFailed, true);
     assert.ok(Boolean(captchaErr.errorMessage), 'checkGdouCaptcha must surface HTTP error');
 
-    // 3d. Lockout detector & WebView origin allowlists + bridge token + storage cleanup verification
+    // 3d. Lockout detector & WebView origin allowlists + HTTP->HTTPS auto-upgrade + bridge token + storage cleanup verification
     assert.equal(isAccountLockedMessage('您的账号已被冻结，请稍后再试'), true);
     assert.equal(isAccountLockedMessage('密码错误'), false);
     assert.equal(isAllowedWebViewNavigationUrl('https://authserver.gdou.edu.cn/authserver/login'), true);
     assert.equal(isAllowedWebViewNavigationUrl('http://authserver.gdou.edu.cn/authserver/login'), false);
     assert.equal(isAllowedWebViewNavigationUrl('https://evil.example.com/phish'), false);
+    assert.equal(
+      upgradeGdouHttpToHttps(
+        'http://authserver.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?isMultifactor=true'
+      ),
+      'https://authserver.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?isMultifactor=true'
+    );
+    assert.equal(upgradeGdouHttpToHttps('https://authserver.gdou.edu.cn/authserver/login'), null);
+    assert.equal(upgradeGdouHttpToHttps('http://evil.example.com/phish'), null);
+    assert.equal(upgradeGdouHttpToHttps('http://gdou.edu.cn.evil.com/phish'), null);
+    assert.equal(upgradeGdouHttpToHttps('javascript:alert(1)'), null);
     assert.equal(isTrustedWebViewMessageUrl('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn'), true);
     assert.equal(isTrustedWebViewMessageUrl('https://evil.example.com'), false);
     const token = generateSecureHex(16);
     const injected = buildIncognitoWebViewSyncScript(undefined, token);
     assert.ok(injected.includes(token), 'WebView script must embed bridgeToken');
+    assert.ok(injected.includes('upgrade-insecure-requests'), 'WebView script must inject HTTPS upgrade CSP');
+    assert.ok(injected.includes('xskbcx_cxRjc.html'), 'WebView script must query official section period times');
     assert.ok(injected.includes('sessionStorage.clear()'), 'WebView script must clear sessionStorage');
     assert.ok(injected.includes('storageCleaned: storageCleaned'), 'WebView script must report verified storageCleaned');
     assert.ok(injected.includes('Promise.race'), 'WebView timedFetch must have Promise.race timeout fallback');
     assert.ok(injected.includes("xnm: '', xqm: ''"), 'WebView script must include 3rd exam query variant');
+
+    // 3e. Off-campus wfw MFA -> Step 2 sub-session auth keeps WFWSESSID alive with ZERO retained password
+    let logoutCalledDuringMfaHandoff = false;
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('/logout')) {
+        logoutCalledDuringMfaHandoff = true;
+        return makeMockResponse(200, 'ok', url);
+      }
+      if (url.includes('reAuthSubmit.do')) {
+        return makeMockResponse(200, JSON.stringify({ code: 'reAuth_success', msg: '认证成功' }), url);
+      }
+      if (url === 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn') {
+        return makeMockResponse(
+          200,
+          '<input id="pwdEncryptSalt" value="WFW2Salt12345678"/><input name="execution" value="e2s1"/>',
+          url
+        );
+      }
+      if (url.includes('checkNeedCaptcha.htl')) {
+        return makeMockResponse(200, JSON.stringify({ isNeed: false }), url);
+      }
+      if (url.includes('xskbcx_cxXskbcxIndex.html')) {
+        return makeMockResponse(
+          200,
+          '<select id="xnm"><option value="2026" selected>2026</option></select><select id="xqm"><option value="3" selected>1</option></select>',
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxXsgrkb.html')) {
+        return makeMockResponse(
+          200,
+          JSON.stringify({
+            kbList: [{ kcmc: '测试课', xqj: '1', jcs: '1-2', zcd: '1-16周', xqh_id: '1', xqmc: '湖光校区' }],
+          }),
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxRjc.html')) {
+        return makeMockResponse(
+          200,
+          JSON.stringify([
+            { jcdm: '1', qssj: '08:10', jssj: '08:55' },
+            { jcdm: '2', qssj: '09:00', jssj: '09:45' },
+            { jcdm: '3', qssj: '10:15', jssj: '11:00' },
+            { jcdm: '4', qssj: '11:05', jssj: '11:50' },
+            { jcdm: '5', qssj: '14:30', jssj: '15:15' },
+            { jcdm: '6', qssj: '15:20', jssj: '16:05' },
+            { jcdm: '7', qssj: '16:30', jssj: '17:15' },
+            { jcdm: '8', qssj: '17:20', jssj: '18:05' },
+          ]),
+          url
+        );
+      }
+      if (url.includes('kscx_cxXsksxx') || url.includes('cjcx_cx')) {
+        return makeMockResponse(200, JSON.stringify({ items: [] }), url);
+      }
+      return makeMockResponse(200, 'ok', url);
+    }) as typeof fetch;
+
+    const mockWfwMfa: MfaChallengeState = {
+      required: true,
+      reAuthUserId: 'TEST_STUDENT_001',
+      serviceUrl: 'https://wfw.gdou.edu.cn/',
+      defaultReAuthType: '3',
+      credentialsPurged: areCredentialsPurged(creds),
+      session: {
+        ...mockSession,
+        jwBaseUrl: 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn',
+        isWebVpn: true,
+        serviceUrl: 'https://wfw.gdou.edu.cn/',
+      },
+      previousSteps: ['1. init', '2. enc', '3. mfa'],
+    };
+    const mfaOutcome = await submitGdouMfaAndCompleteSync(mockWfwMfa, '123456', '3');
+    assert.equal(mfaOutcome.status, 'wfw_subauth_required');
+    assert.equal(logoutCalledDuringMfaHandoff, false, 'Must NOT log out WFWSESSID while awaiting Step 2');
+    if (mfaOutcome.status === 'wfw_subauth_required') {
+      assert.equal(mfaOutcome.subAuth.salt2, 'WFW2Salt12345678');
+      assert.equal('password' in mfaOutcome.subAuth, false, 'WfwSubAuthState must never carry password');
+      const step2Creds: EphemeralCredentials = { username: 'TEST_STUDENT_001', password: 'TempPassword123' };
+      const finalSync = await completeWfwSubAuthAndSync(mfaOutcome.subAuth, step2Creds);
+      assert.equal(areCredentialsPurged(step2Creds), true, 'Step 2 credentials must be purged');
+      assert.equal(finalSync.courses.length, 1);
+      assert.equal(finalSync.syncedPeriods?.length, 8);
+      assert.equal(finalSync.syncedPeriods?.[1].start, '09:00');
+      assert.equal(finalSync.receipt.sessionLoggedOut, true);
+      assert.equal(logoutCalledDuringMfaHandoff, true, 'Must log out after Step 2 completes');
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
   console.log('   OK: Timeout, X-Gdou guard, verified logout, fail-closed captcha & WebView guards verified.');
 
-  console.log('4) Testing 正方 week/section/schedule parser & explicit unparsed warnings...');
+  console.log('4) Testing 正方 week/section/schedule/period-time parser & GDOU bell schedule...');
   assert.deepEqual(parseWeekExpression('1-4周(单),6-8周(双),11周'), [1, 3, 6, 8, 11]);
   assert.deepEqual(parseSectionRange('3-4节'), { startSection: 3, endSection: 4 });
+  assert.deepEqual(parseSectionRange('1,2,3节'), { startSection: 1, endSection: 3 });
+  assert.deepEqual(parseSectionRange(undefined, undefined, undefined, '3'), { startSection: 1, endSection: 2 });
   assert.equal(parseSectionRange('未知节次'), null);
   assert.equal(parseLocalDateStrict('2026-02-31'), null);
   assert.ok(parseLocalDateStrict('2026-09-07') !== null);
+  assert.equal(getDefaultTermStartDateForTerm('2026', '3'), '2026-08-31');
+  assert.equal(getDefaultTermStartDateForTerm('2025', '3'), '2025-09-01');
+  assert.equal(getDefaultTermStartDateForTerm('2025', '12'), '2026-03-02');
+  assert.equal(CAMPUS_PRESETS.huguang_0810.periods[1].start, '09:00');
+  assert.equal(CAMPUS_PRESETS.huguang_0810.periods[1].end, '09:45');
+  assert.equal(CAMPUS_PRESETS.huguang_0810.periods[2].start, '10:15');
+  assert.equal(CAMPUS_PRESETS.huguang_0810.periods[5].start, '15:20');
+  assert.equal(CAMPUS_PRESETS.huguang_0810.periods[6].start, '16:30');
+  const parsedRjc = parseZfPeriodTimesResponse({
+    items: [
+      { jcdm: '01', qssj: '8:10:00', jssj: '8:55:00' },
+      { jcdm: '02', sj: '09:00-09:45' },
+    ],
+  });
+  assert.deepEqual(parsedRjc, [
+    { section: 1, start: '08:10', end: '08:55' },
+    { section: 2, start: '09:00', end: '09:45' },
+  ]);
 
   const parsedKb = parseZfScheduleResponse({
     xsxx: { XH: 'TEST_STUDENT_001', XM: '测试同学', XNMC: '2026-2027', XQMMC: '1' },
@@ -448,7 +586,70 @@ async function run() {
   assert.ok(longFolded.includes('\r\n '), '86-octet description must be folded');
   console.log('   OK: RFC 5545 ICS (all', physicalLines.length, 'lines <= 75 octets) verified.');
 
-  console.log('8) Testing version consistency (app.json, package.json, package-lock.json) & config plugin...');
+  console.log('8) Testing Expo SDK 58 expo-calendar/legacy guard, GitHub Releases updater & version consistency...');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const nodeFs = require('fs') as { readFileSync: (p: string, enc: string) => string };
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const nodePath = require('path') as { join: (...parts: string[]) => string };
+  const calSvcSource = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'src', 'services', 'calendarService.ts'),
+    'utf8'
+  );
+  assert.ok(
+    calSvcSource.includes("from 'expo-calendar/legacy'"),
+    'calendarService.ts must import from expo-calendar/legacy (bare expo-calendar throws in SDK 58)'
+  );
+  assert.ok(
+    !calSvcSource.includes("from 'expo-calendar';"),
+    'calendarService.ts must NOT import deprecated *Async stubs from bare expo-calendar'
+  );
+
+  // GitHub Releases update checker (offline mocked)
+  assert.equal(compareSemver('1.3.1', '1.3.0'), 1);
+  assert.equal(compareSemver('v1.10.0', '1.2.9'), 1);
+  assert.equal(compareSemver('1.3.1', 'v1.3.1'), 0);
+  assert.equal(compareSemver('1.4.0-beta.1', '1.4.0'), -1);
+  assert.equal(isTrustedGithubReleaseUrl(GITHUB_RELEASES_PAGE_URL), true);
+  assert.equal(isTrustedGithubReleaseUrl('https://evil.example.com/app.apk'), false);
+  const pickedApk = selectPlatformReleaseAsset(
+    [
+      { name: 'haida-schedule-v1.4.0-android-unsigned.apk', browser_download_url: 'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-android-unsigned.apk', size: 25000000 },
+      { name: 'haida-schedule-v1.4.0-android.apk', browser_download_url: 'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-android.apk', size: 26000000 },
+      { name: 'haida-schedule-v1.4.0-ios.ipa', browser_download_url: 'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-ios.ipa', size: 20000000 },
+    ],
+    'android'
+  );
+  assert.equal(pickedApk?.name, 'haida-schedule-v1.4.0-android.apk', 'Android updater must prefer signed APK');
+
+  const origFetchForUpdate = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () =>
+      makeMockResponse(
+        200,
+        JSON.stringify({
+          tag_name: 'v1.4.0',
+          name: '海大课表 v1.4.0',
+          body: '修复若干问题',
+          html_url: 'https://github.com/aoligei233666/GDOU-haida-schedule/releases/tag/v1.4.0',
+          published_at: '2026-11-24T00:00:00Z',
+          assets: [
+            {
+              name: 'haida-schedule-v1.4.0-android.apk',
+              browser_download_url:
+                'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-android.apk',
+              size: 26214400,
+            },
+          ],
+        })
+      )) as typeof fetch;
+    const upd = await checkForAppUpdate('1.3.1', 'android');
+    assert.equal(upd.hasUpdate, true);
+    assert.equal(upd.latestVersion, '1.4.0');
+    assert.equal(upd.assetName, 'haida-schedule-v1.4.0-android.apk');
+  } finally {
+    globalThis.fetch = origFetchForUpdate;
+  }
+
   assert.equal(pkgJson.version, appJson.expo.version, 'package.json and app.json versions must match');
   assert.equal(pkgLockJson.version, appJson.expo.version, 'package-lock.json root version must match app.json');
   assert.equal(
@@ -463,7 +664,7 @@ async function run() {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pluginFn = require('../plugins/withGdouZeroRetention.js') as unknown;
   assert.equal(typeof pluginFn, 'function', 'Config plugin must export a function');
-  console.log(`   OK: Single-source version v${appJson.expo.version} & config plugin verified.`);
+  console.log(`   OK: Calendar legacy guard, updater, single-source version v${appJson.expo.version} & config plugin verified.`);
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

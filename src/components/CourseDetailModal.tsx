@@ -128,7 +128,15 @@ export const CourseDetailModal: React.FC<Props> = ({
           </View>
 
           <View style={styles.metaList}>
-            <MetaRow icon="time-outline" label="上课时间" value={`${dayLabel} 第 ${course.startSection}-${course.endSection} 节（${startText} - ${endText}）`} />
+            <MetaRow
+              icon="time-outline"
+              label="上课时间"
+              value={`${dayLabel} ${
+                course.startSection === course.endSection
+                  ? `第 ${course.startSection} 节`
+                  : `第 ${course.startSection}-${course.endSection} 节`
+              }（${startText} - ${endText}）`}
+            />
             <MetaRow icon="location-outline" label="上课地点" value={[course.campus, course.location].filter(Boolean).join(' · ')} />
             <MetaRow icon="person-outline" label="授课教师" value={course.teacher} />
             <MetaRow icon="calendar-outline" label="教学周次" value={`${course.weekText}（共 ${course.weeks.length} 周）`} />

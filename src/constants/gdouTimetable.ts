@@ -10,16 +10,16 @@ export const CAMPUS_PRESETS: Record<
   { label: string; description: string; periods: PeriodTime[] }
 > = {
   huguang_0810: {
-    label: '湖光校区（08:10 标准版）',
-    description: '上午 08:10 起 · 下午 14:30 起 · 晚上 19:30 起',
+    label: '湖光 / 海滨校区（08:10 官方标准版）',
+    description: '上午 08:10-11:50（小课间5分）· 下午 14:30-18:05 · 晚上 19:30 起',
     periods: [
       { section: 1, start: '08:10', end: '08:55' },
-      { section: 2, start: '09:05', end: '09:50' },
-      { section: 3, start: '10:10', end: '10:55' },
+      { section: 2, start: '09:00', end: '09:45' },
+      { section: 3, start: '10:15', end: '11:00' },
       { section: 4, start: '11:05', end: '11:50' },
       { section: 5, start: '14:30', end: '15:15' },
-      { section: 6, start: '15:25', end: '16:10' },
-      { section: 7, start: '16:25', end: '17:10' },
+      { section: 6, start: '15:20', end: '16:05' },
+      { section: 7, start: '16:30', end: '17:15' },
       { section: 8, start: '17:20', end: '18:05' },
       { section: 9, start: '19:30', end: '20:15' },
       { section: 10, start: '20:25', end: '21:10' },
@@ -29,7 +29,7 @@ export const CAMPUS_PRESETS: Record<
   },
   huguang_0800: {
     label: '湖光校区（08:00 常规版）',
-    description: '上午 08:00 起 · 下午 14:30 起 · 晚上 19:30 起',
+    description: '上午 08:00-11:40 · 下午 14:30-18:00 · 晚上 19:30 起',
     periods: [
       { section: 1, start: '08:00', end: '08:45' },
       { section: 2, start: '08:55', end: '09:40' },
@@ -46,8 +46,8 @@ export const CAMPUS_PRESETS: Record<
     ],
   },
   yangjiang: {
-    label: '阳江 / 海滨校区（08:20 版）',
-    description: '上午 08:20 起 · 下午 14:30 起 · 晚上 19:30 起',
+    label: '阳江校区（08:20 版）',
+    description: '上午 08:20-12:00 · 下午 14:30-18:05 · 晚上 19:30 起',
     periods: [
       { section: 1, start: '08:20', end: '09:05' },
       { section: 2, start: '09:15', end: '10:00' },
@@ -65,37 +65,77 @@ export const CAMPUS_PRESETS: Record<
   },
 };
 
+export function isValidHHMM(value: string): boolean {
+  const m = String(value ?? '').trim().match(/^(\d{2}):(\d{2})$/);
+  if (!m) return false;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  return h >= 0 && h <= 23 && min >= 0 && min <= 59;
+}
+
+export function matchCampusPresetByName(
+  campusName?: string
+): Exclude<CampusPresetKey, 'custom'> | null {
+  const s = String(campusName ?? '').trim();
+  if (!s) return null;
+  if (s.includes('阳江')) return 'yangjiang';
+  if (s.includes('湖光') || s.includes('海滨') || s.includes('霞山')) return 'huguang_0810';
+  return null;
+}
+
 export function getActivePeriods(settings: AppSettings): PeriodTime[] {
-  if (settings.campusPreset === 'custom' && settings.customPeriods.length >= 10) {
+  if (settings.campusPreset === 'custom' && settings.customPeriods.length >= 8) {
     return settings.customPeriods;
   }
   const key = settings.campusPreset === 'custom' ? 'huguang_0810' : settings.campusPreset;
   return CAMPUS_PRESETS[key].periods;
 }
 
+function snapAnchorToTermMonday(anchor: Date): string {
+  const d = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate());
+  const dow = d.getDay(); // 0 Sun .. 6 Sat
+  const diff = dow === 0 ? 1 : dow === 6 ? 2 : 1 - dow;
+  d.setDate(d.getDate() + diff);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * Derive GDOU Week 1 Monday for a specific Zhengfang term `(xnm, xqm)`:
+ * - `xqm='3'` (Fall term): Monday of the week of Sep 1 of `xnm` (e.g. 2025-3 -> 2025-09-01, 2026-3 -> 2026-08-31)
+ * - `xqm='12'` (Spring term): first Monday of Mar of `xnm + 1` (e.g. 2025-12 -> 2026-03-02)
+ */
+export function getDefaultTermStartDateForTerm(xnm: string, xqm: string): string | null {
+  const startYear = parseInt(String(xnm ?? '').trim(), 10);
+  if (!Number.isFinite(startYear) || startYear < 2000 || startYear > 2100) return null;
+  const sem = String(xqm ?? '').trim();
+  if (sem === '3' || sem === '1') {
+    return snapAnchorToTermMonday(new Date(startYear, 8, 1));
+  }
+  if (sem === '12' || sem === '2') {
+    return snapAnchorToTermMonday(new Date(startYear + 1, 2, 1));
+  }
+  if (sem === '16') {
+    return snapAnchorToTermMonday(new Date(startYear + 1, 6, 1));
+  }
+  return null;
+}
+
 /**
  * Derive a reasonable default Monday for the current academic term.
- * Fall semester usually starts on the first Monday of September;
- * Spring semester usually starts around late February / first Monday of March.
+ * Fall semester usually starts on the Monday of Sep 1 week;
+ * Spring semester usually starts on the first Monday of March.
  */
 export function getDefaultTermStartDate(now: Date = new Date()): string {
   const year = now.getFullYear();
   const month = now.getMonth() + 1; // 1..12
-  let anchor: Date;
   if (month >= 8 || month === 1) {
     const fallYear = month === 1 ? year - 1 : year;
-    anchor = new Date(fallYear, 8, 1); // Sep 1
-  } else {
-    anchor = new Date(year, 2, 1); // Mar 1
+    return snapAnchorToTermMonday(new Date(fallYear, 8, 1));
   }
-  // Snap to Monday of that week (or next Monday if Sat/Sun)
-  const dow = anchor.getDay(); // 0 Sun .. 6 Sat
-  const diff = dow === 0 ? 1 : dow === 6 ? 2 : 1 - dow;
-  anchor.setDate(anchor.getDate() + diff);
-  const y = anchor.getFullYear();
-  const m = String(anchor.getMonth() + 1).padStart(2, '0');
-  const d = String(anchor.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+  return snapAnchorToTermMonday(new Date(year, 2, 1));
 }
 
 export function deriveCurrentTermParams(now: Date = new Date()): {

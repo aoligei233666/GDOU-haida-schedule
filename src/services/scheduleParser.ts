@@ -25,7 +25,7 @@ export function parseWeekExpression(zcd: string): number[] {
   for (const seg of segments) {
     const isOdd = seg.includes('单');
     const isEven = seg.includes('双');
-    const cleaned = seg.replace(/周|\(单\)|\(双\)|单|双/g, '').trim();
+    const cleaned = seg.replace(/周|\(\s*[单双]\s*\)|[单双]/g, '').trim();
 
     const rangeMatch = cleaned.match(/^(\d+)\s*[-~至]\s*(\d+)$/);
     if (rangeMatch) {
@@ -52,13 +52,15 @@ export function parseWeekExpression(zcd: string): number[] {
 }
 
 /**
- * Parse 正方教务 section fields (`jcs`, `jc`, `jcor`) into { startSection, endSection }.
+ * Parse 正方教务 section fields (`jcs`, `jc`, `jcor`, plus optional bitmask `oldjc`)
+ * into { startSection, endSection }.
  * Returns null if unparseable (never silently fabricates 1-2节).
  */
 export function parseSectionRange(
   jc?: string,
   jcs?: string,
-  jcor?: string
+  jcor?: string,
+  oldjc?: string | number
 ): { startSection: number; endSection: number } | null {
   const candidates = [jcs, jc, jcor].filter((v): v is string => Boolean(v && String(v).trim()));
   for (const raw of candidates) {
@@ -71,6 +73,15 @@ export function parseSectionRange(
         return { startSection: s, endSection: e };
       }
     }
+    if (cleaned.includes(',')) {
+      const nums = cleaned
+        .split(',')
+        .map((n) => parseInt(n.trim(), 10))
+        .filter((n) => Number.isFinite(n) && n >= 1 && n <= 16);
+      if (nums.length > 0) {
+        return { startSection: Math.min(...nums), endSection: Math.max(...nums) };
+      }
+    }
     const singleMatch = cleaned.match(/^(\d+)$/);
     if (singleMatch) {
       const s = parseInt(singleMatch[1], 10);
@@ -79,7 +90,97 @@ export function parseSectionRange(
       }
     }
   }
+
+  // Fallback: Zhengfang `oldjc` bitmask (bit i-1 set => section i active, e.g. 3 => 0b11 => 1-2)
+  const mask = parseInt(String(oldjc ?? '').trim(), 10);
+  if (Number.isFinite(mask) && mask > 0 && mask < 1 << 16) {
+    let first = 0;
+    let last = 0;
+    for (let sec = 1; sec <= 16; sec++) {
+      if ((mask & (1 << (sec - 1))) !== 0) {
+        if (!first) first = sec;
+        last = sec;
+      }
+    }
+    if (first >= 1 && last >= first) {
+      return { startSection: first, endSection: last };
+    }
+  }
+
   return null;
+}
+
+function normalizeTimeToken(raw: unknown): string | null {
+  const s = String(raw ?? '').trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (!Number.isFinite(h) || !Number.isFinite(min) || h < 0 || h > 23 || min < 0 || min > 59) {
+    return null;
+  }
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+interface RawZfPeriodTime {
+  jcdm?: string | number;
+  jcbh?: string | number;
+  jc?: string | number;
+  jcmc?: string;
+  xh?: string | number;
+  qssj?: string;
+  kssj?: string;
+  jssj?: string;
+  xksj?: string;
+  sj?: string;
+  qzsj?: string;
+  sksj?: string;
+}
+
+/**
+ * Parse 正方V9 `/kbcx/xskbcx_cxRjc.html` official section-time response into sorted PeriodTime[].
+ * Handles array or `{ items | rows | rjcList | sjdList | data }` wrapper shapes cleanly.
+ */
+export function parseZfPeriodTimesResponse(raw: unknown): PeriodTime[] {
+  let rows: RawZfPeriodTime[] = [];
+  if (Array.isArray(raw)) {
+    rows = raw as RawZfPeriodTime[];
+  } else if (raw && typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    const candidate =
+      obj.items ?? obj.rows ?? obj.rjcList ?? obj.sjdList ?? obj.data ?? obj.list;
+    if (Array.isArray(candidate)) {
+      rows = candidate as RawZfPeriodTime[];
+    }
+  }
+  if (rows.length === 0) return [];
+
+  const bySection = new Map<number, PeriodTime>();
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const secRaw = row.jcdm ?? row.jcbh ?? row.jc ?? row.jcmc ?? row.xh;
+    const secMatch = String(secRaw ?? '').match(/(\d+)/);
+    if (!secMatch) continue;
+    const section = parseInt(secMatch[1], 10);
+    if (!Number.isFinite(section) || section < 1 || section > 16) continue;
+
+    let start = normalizeTimeToken(row.qssj ?? row.kssj);
+    let end = normalizeTimeToken(row.jssj ?? row.xksj);
+
+    if (!start || !end) {
+      const combined = String(row.sj ?? row.qzsj ?? row.sksj ?? '').trim();
+      const rangeMatch = combined.match(/(\d{1,2}:\d{2})(?::\d{2})?\s*[-~至—–]\s*(\d{1,2}:\d{2})(?::\d{2})?/);
+      if (rangeMatch) {
+        start = normalizeTimeToken(rangeMatch[1]);
+        end = normalizeTimeToken(rangeMatch[2]);
+      }
+    }
+
+    if (!start || !end || start >= end) continue;
+    bySection.set(section, { section, start, end });
+  }
+
+  return Array.from(bySection.values()).sort((a, b) => a.section - b.section);
 }
 
 function stableColorIndex(courseName: string): number {
@@ -119,11 +220,13 @@ interface RawZfCourse {
   cdmc?: string;
   jgmc?: string;
   xqmc?: string;
+  xqh_id?: string;
   xqj?: string | number;
   xqjmc?: string;
   jc?: string;
   jcs?: string;
   jcor?: string;
+  oldjc?: string | number;
   zcd?: string;
   xf?: string;
   jxbmc?: string;
@@ -141,6 +244,8 @@ interface RawZfCourse {
 export function parseZfScheduleResponse(raw: unknown): {
   courses: CourseItem[];
   termLabel?: string;
+  campusId?: string;
+  campusName?: string;
   warnings: string[];
 } {
   if (!raw || typeof raw !== 'object') {
@@ -152,14 +257,23 @@ export function parseZfScheduleResponse(raw: unknown): {
   const seen = new Set<string>();
   const courses: CourseItem[] = [];
   const warnings: string[] = [];
+  let campusId: string | undefined;
+  let campusName: string | undefined;
 
   for (let idx = 0; idx < kbList.length; idx++) {
     const item = kbList[idx];
     const name = String(item.kcmc ?? '').trim();
     if (!name) continue;
 
+    if (!campusId && item.xqh_id) {
+      campusId = String(item.xqh_id).trim() || undefined;
+    }
+    if (!campusName && item.xqmc) {
+      campusName = String(item.xqmc).trim() || undefined;
+    }
+
     const dayOfWeek = parseDayOfWeek(item.xqj ?? item.xqjmc);
-    const sectionRange = parseSectionRange(item.jc, item.jcs, item.jcor);
+    const sectionRange = parseSectionRange(item.jc, item.jcs, item.jcor, item.oldjc);
     const weekText = String(item.zcd ?? '').trim();
     const weeks = parseWeekExpression(weekText);
     const location = String(item.cdmc ?? item.jgmc ?? '待定教室').trim();
@@ -216,7 +330,7 @@ export function parseZfScheduleResponse(raw: unknown): {
   }
 
   courses.sort((a, b) => a.dayOfWeek - b.dayOfWeek || a.startSection - b.startSection);
-  return { courses, termLabel, warnings };
+  return { courses, termLabel, campusId, campusName, warnings };
 }
 
 /**

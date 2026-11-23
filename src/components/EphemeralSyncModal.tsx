@@ -21,6 +21,7 @@ import {
   GDOU_WFW_ORIGIN,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
+  upgradeGdouHttpToHttps,
 } from '../constants/gdouEndpoints';
 import { deriveCurrentTermParams, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
 import { generateSecureHex, purgeEphemeralCredentials } from '../services/cryptoAes';
@@ -29,8 +30,10 @@ import {
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
   clearPendingMfaSecret,
+  completeWfwSubAuthAndSync,
   executeOneShotGdouSync,
   fetchGdouCaptchaImage,
+  fetchWfwSubAuthCaptchaImage,
   flushNativeEphemeralCookies,
   isAccountLockedMessage,
   logoutEphemeralSession,
@@ -41,9 +44,10 @@ import {
   requestGdouMfaDynamicCode,
   submitGdouMfaAndCompleteSync,
   SyncResult,
+  WfwSubAuthState,
 } from '../services/gdouAuth';
 import { parseZfGradesResponse } from '../services/gradeParser';
-import { parseZfScheduleResponse } from '../services/scheduleParser';
+import { parseZfPeriodTimesResponse, parseZfScheduleResponse } from '../services/scheduleParser';
 import { COLORS } from '../theme/colors';
 import { EphemeralCredentials, LogoutVerificationDetails } from '../types/models';
 
@@ -79,13 +83,21 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const [mfaHint, setMfaHint] = useState<string | null>(null);
   const [sendingMfaCode, setSendingMfaCode] = useState(false);
 
+  // Off-campus WebVPN (`wfw`) Step 2 sub-session auth after MFA passes (zero password retention)
+  const [wfwSubAuth, setWfwSubAuth] = useState<WfwSubAuthState | null>(null);
+  const [subAuthPassword, setSubAuthPassword] = useState('');
+  const [subAuthCaptcha, setSubAuthCaptcha] = useState('');
+  const [showSubAuthPassword, setShowSubAuthPassword] = useState(false);
+  const [refreshingSubCaptcha, setRefreshingSubCaptcha] = useState(false);
+
   // Optional semester override
   const [customTermOpen, setCustomTermOpen] = useState(false);
   const [xnmOverride, setXnmOverride] = useState('');
   const [xqmOverride, setXqmOverride] = useState('');
 
-  // WebView ephemeral state + route detection
+  // WebView ephemeral state + route detection + seamless HTTPS upgrade
   const [webViewKey, setWebViewKey] = useState(0);
+  const [activeWebViewUri, setActiveWebViewUri] = useState<string | null>(null);
   const [webViewProgress, setWebViewProgress] = useState(0);
   const [webViewRoutePref, setWebViewRoutePref] = useState<WebViewRoutePref>('auto');
   const [probedWebViewIsVpn, setProbedWebViewIsVpn] = useState<boolean | null>(null);
@@ -102,6 +114,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const bridgeTokenRef = useRef<string>(bridgeToken);
   const autoReinitCountRef = useRef<number>(0);
   const webViewCompletingRef = useRef<boolean>(false);
+  const lastHttpUpgradeRef = useRef<{ url: string; ts: number }>({ url: '', ts: 0 });
   bridgeTokenRef.current = bridgeToken;
 
   const MAX_AUTO_REINIT = 2;
@@ -129,6 +142,9 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     setCaptchaUri(undefined);
     setMfaCode('');
     setMfaHint(null);
+    setSubAuthPassword('');
+    setSubAuthCaptcha('');
+    setShowSubAuthPassword(false);
     captchaSessionKeyRef.current = '';
   };
 
@@ -167,6 +183,9 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setErrorText(null);
       setStatusLog([]);
       setMfaChallenge(null);
+      setWfwSubAuth(null);
+      setActiveWebViewUri(null);
+      lastHttpUpgradeRef.current = { url: '', ts: 0 };
       if (mode === 'direct') {
         void initDirectSession();
       } else {
@@ -180,11 +199,12 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     } else {
       abortActiveRequests();
       clearPendingMfaSecret();
-      if (mfaChallenge) {
+      const pendingSession = mfaChallenge?.session ?? wfwSubAuth?.session;
+      if (pendingSession) {
         void logoutEphemeralSession(
-          mfaChallenge.session.jwBaseUrl,
-          mfaChallenge.session.authOrigin,
-          mfaChallenge.session.isWebVpn
+          pendingSession.jwBaseUrl,
+          pendingSession.authOrigin,
+          pendingSession.isWebVpn
         );
       }
       if (mode === 'webview' && !webViewCompletingRef.current) {
@@ -193,6 +213,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       wipeFormInputs(false);
       setSyncing(false);
       setMfaChallenge(null);
+      setWfwSubAuth(null);
+      setActiveWebViewUri(null);
       setSession(null);
       autoReinitCountRef.current = 0;
     }
@@ -503,9 +525,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     const ac = createFreshAbortController();
     setSyncing(true);
     setErrorText(null);
+    // Reset statusLog to pre-MFA steps so retrying never duplicates step 4 lines
+    setStatusLog([...mfaChallenge.previousSteps]);
 
     try {
-      const result = await submitGdouMfaAndCompleteSync(
+      const outcome = await submitGdouMfaAndCompleteSync(
         mfaChallenge,
         codeSnapshot,
         mfaType,
@@ -515,12 +539,102 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         (step) => setStatusLog((prev) => [...prev, step]),
         { signal: ac.signal }
       );
+      if (outcome.status === 'wfw_subauth_required') {
+        setMfaChallenge(null);
+        setWfwSubAuth(outcome.subAuth);
+        setSubAuthPassword('');
+        setSubAuthCaptcha('');
+        setShowSubAuthPassword(false);
+        setErrorText(null);
+        setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 80);
+        return;
+      }
       setMfaChallenge(null);
+      onSyncSuccess(outcome.result);
+      onClose();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorText(msg);
+      const isRetryableCodeErr =
+        msg.includes('验证码') || msg.includes('动态码') || msg.includes('已过期');
+      if (!isRetryableCodeErr) {
+        // Session was already logged out in finally; clear stale MFA challenge cleanly
+        setMfaChallenge(null);
+        setSession(null);
+      }
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleRefreshSubAuthCaptcha = async () => {
+    if (!wfwSubAuth || syncing || refreshingSubCaptcha) return;
+    setSubAuthCaptcha('');
+    const ac = createFreshAbortController();
+    setRefreshingSubCaptcha(true);
+    try {
+      const uri = await fetchWfwSubAuthCaptchaImage(wfwSubAuth.session, { signal: ac.signal });
+      if (uri) {
+        setWfwSubAuth((prev) => (prev ? { ...prev, captchaImageUri: uri } : prev));
+      } else {
+        setErrorText('刷新教务通道图形验证码失败，请重试');
+      }
+    } catch (err) {
+      if (!(err instanceof Error && err.name === 'AbortError')) {
+        setErrorText(`刷新验证码失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+    } finally {
+      setRefreshingSubCaptcha(false);
+    }
+  };
+
+  const handleSubmitWfwSubAuth = async () => {
+    if (!wfwSubAuth) return;
+    if (!subAuthPassword) {
+      setErrorText('请重新输入统一身份认证密码以激活校外教务子会话（仅本次使用，用完即删）');
+      return;
+    }
+    if (wfwSubAuth.needCaptcha && !subAuthCaptcha.trim()) {
+      setErrorText('请输入上方图形验证码');
+      return;
+    }
+
+    const ephemeral: EphemeralCredentials = {
+      username: wfwSubAuth.username,
+      password: subAuthPassword,
+      captcha: subAuthCaptcha.trim(),
+    };
+    setSubAuthPassword('');
+    setSubAuthCaptcha('');
+    setShowSubAuthPassword(false);
+
+    const ac = createFreshAbortController();
+    setSyncing(true);
+    setErrorText(null);
+    setStatusLog([...wfwSubAuth.previousSteps]);
+
+    try {
+      const result = await completeWfwSubAuthAndSync(
+        wfwSubAuth,
+        ephemeral,
+        xnmOverride || xqmOverride
+          ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
+          : undefined,
+        (step) => setStatusLog((prev) => [...prev, step]),
+        { signal: ac.signal }
+      );
+      setWfwSubAuth(null);
+      wipeFormInputs(false);
       onSyncSuccess(result);
       onClose();
     } catch (err) {
-      setErrorText(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorText(msg);
+      // Session was already logged out in finally; exit stale sub-auth panel cleanly
+      setWfwSubAuth(null);
+      setSession(null);
     } finally {
+      purgeEphemeralCredentials(ephemeral);
       setSyncing(false);
     }
   };
@@ -540,6 +654,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         xqm?: string;
         isWebVpn?: boolean;
         scheduleRaw?: unknown;
+        periodTimesRaw?: unknown;
         examRaw?: unknown;
         gradeRaw?: unknown;
         storageCleaned?: boolean;
@@ -569,6 +684,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         void (async () => {
           try {
             const parsedSchedule = parseZfScheduleResponse(data.scheduleRaw);
+            const parsedPeriods = parseZfPeriodTimesResponse(data.periodTimesRaw);
             const parsedExams = parseZfExamResponse(data.examRaw);
             const parsedGrades = parseZfGradesResponse(data.gradeRaw);
             const derived = deriveCurrentTermParams();
@@ -618,6 +734,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               courses: parsedSchedule.courses,
               exams: parsedExams,
               grades: parsedGrades,
+              syncedPeriods: parsedPeriods.length >= 8 ? parsedPeriods : undefined,
+              detectedCampus: parsedSchedule.campusName,
               termLabel: parsedSchedule.termLabel || fallbackLabel,
               academicYear: xnm,
               semesterCode: xqm,
@@ -671,9 +789,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     abortActiveRequests();
     clearPendingMfaSecret();
     const shouldCleanWebView = mode === 'webview' && !webViewCompletingRef.current;
-    const shouldFlushDirect = mode === 'direct' && (syncing || Boolean(mfaChallenge));
+    const pendingSession = mfaChallenge?.session ?? wfwSubAuth?.session;
+    const shouldFlushDirect = mode === 'direct' && (syncing || Boolean(pendingSession));
     setSyncing(false);
     setMfaChallenge(null);
+    setWfwSubAuth(null);
     wipeFormInputs(false);
     if (shouldCleanWebView) {
       webViewCompletingRef.current = true;
@@ -682,7 +802,13 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       });
       return;
     }
-    if (shouldFlushDirect) {
+    if (pendingSession) {
+      void logoutEphemeralSession(
+        pendingSession.jwBaseUrl,
+        pendingSession.authOrigin,
+        pendingSession.isWebVpn
+      );
+    } else if (shouldFlushDirect) {
       void flushNativeEphemeralCookies();
     }
     onClose();
@@ -702,6 +828,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     )}`;
   }, [webViewRoutePref, probedWebViewIsVpn]);
 
+  useEffect(() => {
+    setActiveWebViewUri(null);
+  }, [effectiveWebViewUrl]);
+
   const injectedWebViewJs = useMemo(
     () =>
       buildIncognitoWebViewSyncScript(
@@ -716,6 +846,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const reloadWebView = (nextPref?: WebViewRoutePref) => {
     if (nextPref) setWebViewRoutePref(nextPref);
     setErrorText(null);
+    setActiveWebViewUri(null);
+    lastHttpUpgradeRef.current = { url: '', ts: 0 };
     setBridgeToken(generateSecureHex(16));
     setWebViewProgress(0.15);
     setWebViewKey((k) => k + 1);
@@ -829,7 +961,97 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               )}
             </View>
 
-            {mfaChallenge ? (
+            {wfwSubAuth ? (
+              <View style={styles.mfaBox}>
+                <Text style={styles.mfaTitle}>
+                  ✅ 多因子认证已通过 · 激活校外教务子通道
+                </Text>
+                <Text style={styles.mfaSub}>
+                  账号 {wfwSubAuth.username} 的校外微门户 (wfw) 已就绪。为确保密码绝不驻留内存，请重新输入一次密码完成最终教务拉取（用完即删，不再重复短信验证）：
+                </Text>
+
+                <View style={styles.inputRow}>
+                  <Ionicons name="lock-closed-outline" size={18} color={COLORS.textMuted} />
+                  <TextInput
+                    style={styles.input}
+                    placeholder="重新输入统一身份认证密码"
+                    placeholderTextColor={COLORS.textMuted}
+                    value={subAuthPassword}
+                    onChangeText={setSubAuthPassword}
+                    secureTextEntry={!showSubAuthPassword}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoComplete="off"
+                    textContentType="none"
+                    editable={!syncing}
+                  />
+                  <TouchableOpacity
+                    onPress={() => setShowSubAuthPassword((v) => !v)}
+                    hitSlop={8}
+                  >
+                    <Ionicons
+                      name={showSubAuthPassword ? 'eye-off-outline' : 'eye-outline'}
+                      size={20}
+                      color={COLORS.textSecondary}
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                {wfwSubAuth.needCaptcha && (
+                  <View style={styles.captchaBox}>
+                    <Text style={styles.fieldLabel}>教务通道图形验证码（点击图片可刷新）</Text>
+                    <View style={styles.captchaRow}>
+                      <View style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}>
+                        <Ionicons name="shield-outline" size={18} color={COLORS.textMuted} />
+                        <TextInput
+                          style={styles.input}
+                          placeholder="输入右侧 4 位验证码"
+                          placeholderTextColor={COLORS.textMuted}
+                          value={subAuthCaptcha}
+                          onChangeText={setSubAuthCaptcha}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          maxLength={8}
+                          editable={!syncing}
+                        />
+                      </View>
+                      <TouchableOpacity
+                        onPress={handleRefreshSubAuthCaptcha}
+                        style={styles.captchaImgWrap}
+                        disabled={refreshingSubCaptcha || syncing}
+                      >
+                        {refreshingSubCaptcha ? (
+                          <ActivityIndicator size="small" color={COLORS.oceanPrimary} />
+                        ) : wfwSubAuth.captchaImageUri ? (
+                          <Image
+                            source={{ uri: wfwSubAuth.captchaImageUri }}
+                            style={styles.captchaImg}
+                            resizeMode="contain"
+                          />
+                        ) : (
+                          <Text style={styles.captchaReload}>刷新</Text>
+                        )}
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={[styles.primaryBtn, syncing && styles.primaryBtnDisabled]}
+                  disabled={syncing}
+                  onPress={handleSubmitWfwSubAuth}
+                >
+                  {syncing ? (
+                    <ActivityIndicator color={COLORS.white} />
+                  ) : (
+                    <>
+                      <Ionicons name="cloud-download-outline" size={20} color={COLORS.white} />
+                      <Text style={styles.primaryBtnText}>确认并拉取课表 / 考试 / 绩点学分</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            ) : mfaChallenge ? (
               <View style={styles.mfaBox}>
                 <Text style={styles.mfaTitle}>🔐 海大多因子二次认证（账号：{mfaChallenge.reAuthUserId}）</Text>
                 <Text style={styles.mfaSub}>
@@ -1053,7 +1275,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               </TouchableOpacity>
             )}
 
-            {mfaChallenge && errorText && (
+            {(mfaChallenge || wfwSubAuth) && errorText && (
               <View style={styles.errorBox}>
                 <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
                 <Text style={styles.errorText}>{errorText}</Text>
@@ -1137,7 +1359,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
             <WebView<object>
               key={`${webViewKey}-${effectiveWebViewUrl}`}
               ref={webViewRef}
-              source={{ uri: effectiveWebViewUrl }}
+              source={{ uri: activeWebViewUri ?? effectiveWebViewUrl }}
               incognito={true}
               cacheEnabled={false}
               saveFormDataDisabled={true}
@@ -1150,10 +1372,30 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
               mixedContentMode="never"
               injectedJavaScript={injectedWebViewJs}
               onShouldStartLoadWithRequest={(req) => {
+                // Seamlessly upgrade GDOU server cleartext redirects (e.g. http://authserver.gdou.edu.cn/authserver/reAuthCheck/...) to HTTPS
+                const upgradedHttps = upgradeGdouHttpToHttps(req.url);
+                if (upgradedHttps) {
+                  const nowTs = Date.now();
+                  if (
+                    lastHttpUpgradeRef.current.url !== upgradedHttps ||
+                    nowTs - lastHttpUpgradeRef.current.ts > 1200
+                  ) {
+                    lastHttpUpgradeRef.current = { url: upgradedHttps, ts: nowTs };
+                    setErrorText(null);
+                    if (upgradedHttps.includes('reAuthLoginView')) {
+                      setWebViewStatus('第 1 步：请完成海大多因子安全验证（短信 / 企业微信）');
+                    }
+                    setActiveWebViewUri(upgradedHttps);
+                  }
+                  return false;
+                }
                 if (!isAllowedWebViewNavigationUrl(req.url)) {
                   setErrorText(`已拦截非海大官方 HTTPS 链接：${req.url.slice(0, 60)}`);
                   return false;
                 }
+                setErrorText((prev) =>
+                  prev && prev.startsWith('已拦截非海大官方') ? null : prev
+                );
                 return true;
               }}
               onLoadProgress={({ nativeEvent }) => {

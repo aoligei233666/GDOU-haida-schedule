@@ -20,8 +20,8 @@
 ### 1. 教务无痕同步（校内 / 校外自适应 · 双端零留存）
 - **官方入口自动路由**：接入 `https://netcheck.gdou.edu.cn/go.php?code=jw`，自动识别 **校园网直连**（`jw.gdou.edu.cn`）与 **校外微门户反代**（`wfw.gdou.edu.cn`）；无痕网页模式同样支持自动探测与手动切换通道。
 - **双通道登录同步**：
-  - **极速直连登录**：使用 `expo-crypto` / WebCrypto CSPRNG 生成随机前缀与 IV 执行 `AES-128-CBC-PKCS7` 加密（缺失加密盐值时强制终止，绝不降级明文），全量请求带超时与一键取消，支持图形验证码、企业微信/短信 MFA 及账号锁定熔断保护。
-  - **官网无痕网页**：内置 `incognito` 无痕沙箱 WebView，启用 `https://*.gdou.edu.cn` 导航白名单、每会话随机 `bridgeToken` 消息校验与严格 HTTPS（禁止混合内容与第三方 Cookie），支持滑块验证与手机验证码免密登录，同步完毕自动清空 `sessionStorage`/`localStorage`、缓存与原生 Cookie。
+  - **极速直连登录**：使用 `expo-crypto` / WebCrypto CSPRNG 生成随机前缀与 IV 执行 `AES-128-CBC-PKCS7` 加密（缺失加密盐值时强制终止，绝不降级明文），全量请求带超时与一键取消，支持图形验证码、企业微信/短信 MFA、校外微门户 (`wfw`) MFA 后的零留存第二步教务子会话鉴权及账号锁定熔断保护。
+  - **官网无痕网页**：内置 `incognito` 无痕沙箱 WebView，启用 `https://*.gdou.edu.cn` 导航白名单、对海大官方 `http://*.gdou.edu.cn` 跳转（如 `reAuthCheck`）自动原地无损升级为 `https://`、每会话随机 `bridgeToken` 消息校验与严格 HTTPS（禁止混合内容与第三方 Cookie），支持滑块验证与手机验证码免密登录，同步完毕自动清空 `sessionStorage`/`localStorage`、缓存与原生 Cookie。
 - **双端原生零留存架构（Expo CNG Config Plugin 持久化）**：
   - 通过 `plugins/withGdouZeroRetention.js` 统一管理 Android 与 iOS 原生安全改造，即使 `expo prebuild --clean` 也能 100% 确定性重建；
   - **Android 原生层**：纯内存无盘 HTTP 缓存的 `GdouEphemeralCookieJar`、OkHttp 无条件 `X-Gdou-*` 控制头剥离、WebView `CookieManager`/`WebStorage` 清理、`allowBackup=false`、`usesCleartextTraffic=false`、精简权限、R8 混淆与私有签名；
@@ -31,7 +31,7 @@
 ### 2. 课表查询
 - **周课表网格视图**（周一至周日，第 1–12 节）与 **今日课表速览**，切 Tab 自动保留滚动与周次状态；
 - 完整解析正方教务单双周与不连续周次表达式（如 `1-16周(单)`、`1-4周,6-12周(双),15周`）；对缺少星期/节次/周次的异常条目显式告警而非静默猜测；
-- 内置 **广东海洋大学各校区作息时间表**（湖光校区 08:10 标准版 / 08:00 常规版、阳江 / 海滨校区 08:20 版）与严格校验的开学首周日期设置。
+- 内置 **广东海洋大学各校区官方作息时间表**（湖光校区 08:10 官方标准版 / 08:00 常规版、阳江 / 海滨校区 08:20 版），同步课表时自动尝试从正方教务 `/kbcx/xskbcx_cxRjc.html` 拉取实时节次时间并对齐对应学期开学首周，同时支持在设置页直接查看与自定义编辑第 1–12 节起止时间。
 
 ### 3. 考试安排查询
 - 自动拉取教务考试信息：考试日期、起止时间、剩余天数倒计时、考场地点、座位号高亮、考核方式；
@@ -51,6 +51,9 @@
 - 基于确定性 `dedupeKey` 实现闹钟幂等更新：重复点击生成本周起床闹钟、单节课前提醒或考前双闹钟时，自动取消旧系统通知并覆盖更新，彻底避免重复响铃；
 - **Android** 支持通过 `android.intent.action.SET_ALARM` 直接写入系统原生时钟，并提供 Android 12+ 精确闹钟权限快捷检查入口。
 
+### 7. 应用内检查更新（GitHub Releases）
+- 在「关于设置」页内置 **检查更新与下载** 入口，直连 `https://github.com/aoligei233666/GDOU-haida-schedule/releases/`（GitHub Releases API）比对版本号，自动匹配 Android `.apk` / iOS `.ipa` 安装包并提供直达下载链接。
+
 ---
 
 ## 项目目录结构
@@ -58,7 +61,7 @@
 ```text
 GDOU-haida-schedule/
 ├── App.tsx                             # 应用主入口、ErrorBoundary 与状态保留 5 Tab 导航
-├── app.json                            # 单一版本号来源 (1.3.0) 与 Expo 插件配置
+├── app.json                            # 单一版本号来源 (1.3.1) 与 Expo 插件配置
 ├── plugins/
 │   └── withGdouZeroRetention.js        # Android + iOS 双端零留存原生配置插件 (CNG)
 ├── src/
@@ -70,16 +73,17 @@ GDOU-haida-schedule/
 │   │   ├── ExamsScreen.tsx             # 考试倒计时与考场座位
 │   │   ├── GradesScreen.tsx            # 绩点 GPA、估算标注与学分统计
 │   │   ├── AlarmsScreen.tsx            # 起床闹钟 / 课前考前提醒 / 日历与 ICS
-│   │   └── SettingsScreen.tsx          # 校区作息、校历周次、零留存审计与关于页
+│   │   └── SettingsScreen.tsx          # 校区与自定义作息、校历周次、检查更新与零留存审计
 │   ├── services/
 │   │   ├── gdouAuth.ts                 # 统一超时/取消网络封装、认证、熔断、真实注销校验
 │   │   ├── cryptoAes.ts                # CSPRNG AES-128-CBC-PKCS7（无 salt 强制失败）
 │   │   ├── zeroRetentionSanitizer.ts   # 递归凭据字段剔除与扫描（单测直接引用）
-│   │   ├── scheduleParser.ts           # 正方课表解析（显式告警，拒绝静默猜测）
+│   │   ├── scheduleParser.ts           # 正方课表与节次时间解析（显式告警，拒绝静默猜测）
 │   │   ├── examParser.ts / gradeParser.ts
-│   │   ├── calendarService.ts          # 分类标签幂等日历同步（课表/考试互不误删）
+│   │   ├── calendarService.ts          # 分类标签幂等日历同步（expo-calendar/legacy + Asia/Shanghai）
 │   │   ├── icsBuilder.ts / icsExporter.ts  # RFC 5545 严格合规 .ics 构建与导出
 │   │   ├── alarmService.ts             # 批量事务化闹钟调度与 Android SET_ALARM
+│   │   ├── updateService.ts            # GitHub Releases 版本检查与安装包链接安全校验
 │   │   └── storageService.ts           # 零凭据本地存储
 │   ├── constants/
 │   │   ├── gdouEndpoints.ts            # 直连与 WebView 共享的唯一端点与白名单定义
@@ -113,10 +117,10 @@ npm start              # 启动 Expo 开发服务
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-android-apk.ps1 -CleanPrebuild
 ```
-产物输出至 `dist/haida-schedule-v1.3.0-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
+产物输出至 `dist/haida-schedule-v1.3.1-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
 
 ### 3. 构建 iOS IPA
-- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码至 GitHub 后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`typecheck` + `verify`），再在 `macos-15` 执行 `npx expo prebuild --platform ios --clean`、`pod install` 与 `xcodebuild`，产出含完整 iOS 原生 `GdouEphemeralURLProtocol` 的未签名 `haida-schedule-v1.3.0-ios-unsigned.ipa`，下载后通过 **AltStore / Sideloadly / TrollStore** 安装。
+- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码至 GitHub 后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`typecheck` + `verify`），再在 `macos-15` 执行 `npx expo prebuild --platform ios --clean`、`pod install` 与 `xcodebuild`，产出含完整 iOS 原生 `GdouEphemeralURLProtocol` 的未签名 `haida-schedule-v1.3.1-ios-unsigned.ipa`，下载后通过 **AltStore / Sideloadly / TrollStore** 安装。
 - **macOS 本机 Xcode 构建**：
   ```bash
   npx expo prebuild --platform ios --clean

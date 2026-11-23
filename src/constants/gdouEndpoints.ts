@@ -18,6 +18,7 @@ export const GDOU_JW_PREFIXES = ['', '/jwglxt'] as const;
 export const GDOU_JW_PATHS = {
   scheduleIndex: '/kbcx/xskbcx_cxXskbcxIndex.html?gnmkdm=N2151&layout=default',
   scheduleQuery: '/kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151',
+  periodTimes: '/kbcx/xskbcx_cxRjc.html?gnmkdm=N2151',
   examQueries: [
     '/kwgl/kscx_cxXsksxxIndex.html?doType=query&gnmkdm=N358105',
     '/kwgl/kscx_cxXsksxxIndex.html?doType=query&gnmkdm=N358110',
@@ -106,6 +107,34 @@ export const ALLOWED_WEBVIEW_TRUSTED_HOSTS = [
   'jw.gdou.edu.cn',
 ] as const;
 
+function isOfficialGdouHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === 'gdou.edu.cn' || host.endsWith('.gdou.edu.cn');
+}
+
+/**
+ * If GDOU's reverse proxy emits a cleartext `http://*.gdou.edu.cn/...` redirect
+ * (e.g. `http://authserver.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?...`),
+ * return the equivalent strict HTTPS URL so WebView can upgrade seamlessly without
+ * ever permitting cleartext traffic. Returns `null` for non-HTTP or non-GDOU URLs.
+ */
+export function upgradeGdouHttpToHttps(rawUrl: string): string | null {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:') return null;
+    if (!isOfficialGdouHost(parsed.hostname)) return null;
+    parsed.protocol = 'https:';
+    if (parsed.port === '80') {
+      parsed.port = '';
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Strictly validate WebView navigation URLs:
  * only allow `about:blank` or HTTPS URLs under `*.gdou.edu.cn`.
@@ -116,8 +145,7 @@ export function isAllowedWebViewNavigationUrl(rawUrl: string): boolean {
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol !== 'https:') return false;
-    const host = parsed.hostname.toLowerCase();
-    return host === 'gdou.edu.cn' || host.endsWith('.gdou.edu.cn');
+    return isOfficialGdouHost(parsed.hostname);
   } catch {
     return false;
   }
