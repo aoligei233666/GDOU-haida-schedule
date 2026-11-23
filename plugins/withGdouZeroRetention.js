@@ -305,7 +305,7 @@ class MainApplication : Application(), ReactApplication {
 }
 `;
 
-const IOS_EPHEMERAL_NETWORKING_SWIFT = `import Expo
+const IOS_EPHEMERAL_NETWORKING_SWIFT = `internal import Expo
 import Foundation
 import React
 import WebKit
