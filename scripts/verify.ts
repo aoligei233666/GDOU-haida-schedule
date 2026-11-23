@@ -686,6 +686,44 @@ async function run() {
   assert.equal(isTrustedGithubReleaseUrl(iosAppEntry.versions[0]?.downloadURL), true);
   assert.ok((iosAppEntry.versions[0]?.size ?? 0) > 1000000, 'altstore-source.json size must be realistic');
 
+  // Verify dynamic app.config.js switches cleanly between sideload and TestFlight/AppStore compliance modes
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const dynamicConfigFn = require('../app.config.js') as () => {
+    expo: {
+      ios: {
+        bundleIdentifier: string;
+        infoPlist: Record<string, unknown>;
+      };
+    };
+  };
+  const prevDist = process.env.EXPO_PUBLIC_APP_DISTRIBUTION;
+  try {
+    process.env.EXPO_PUBLIC_APP_DISTRIBUTION = 'sideload';
+    const sideloadCfg = dynamicConfigFn();
+    assert.equal(sideloadCfg.expo.ios.bundleIdentifier, 'cn.edu.gdou.schedule');
+    assert.equal(sideloadCfg.expo.ios.infoPlist.ITSAppUsesNonExemptEncryption, false);
+    assert.equal(sideloadCfg.expo.ios.infoPlist.NSUserTrackingUsageDescription, undefined);
+    assert.ok(Array.isArray(sideloadCfg.expo.ios.infoPlist.LSApplicationQueriesSchemes));
+
+    process.env.EXPO_PUBLIC_APP_DISTRIBUTION = 'testflight';
+    const tfCfg = dynamicConfigFn();
+    assert.equal(tfCfg.expo.ios.bundleIdentifier, 'com.aoligei233666.haidaschedule');
+    assert.equal(tfCfg.expo.ios.infoPlist.LSApplicationQueriesSchemes, undefined);
+    assert.equal(tfCfg.expo.ios.infoPlist.NSUserTrackingUsageDescription, undefined);
+    assert.equal(tfCfg.expo.ios.infoPlist.ITSAppUsesNonExemptEncryption, false);
+  } finally {
+    if (prevDist === undefined) {
+      delete process.env.EXPO_PUBLIC_APP_DISTRIBUTION;
+    } else {
+      process.env.EXPO_PUBLIC_APP_DISTRIBUTION = prevDist;
+    }
+  }
+  const privacyHtml = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'docs', 'privacy.html'),
+    'utf8'
+  );
+  assert.ok(privacyHtml.includes('Data Not Collected'), 'docs/privacy.html must exist for TestFlight review');
+
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pluginFn = require('../plugins/withGdouZeroRetention.js') as unknown;
   assert.equal(typeof pluginFn, 'function', 'Config plugin must export a function');

@@ -1,0 +1,157 @@
+name: Upload iOS Build to TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Apple Developer Bundle ID (must match your App Store Connect App ID)'
+        required: true
+        default: 'com.aoligei233666.haidaschedule'
+
+jobs:
+  build-and-upload-testflight:
+    name: Archive & Upload Signed IPA to Apple TestFlight
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode 26+ toolchain (Swift >= 6.2)
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$LATEST_XCODE" ]; then
+            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies & run offline quality gate
+        run: |
+          npm ci
+          npm run typecheck
+          npm run verify
+
+      - name: Validate required Apple Developer Secrets
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for v in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD IOS_PROVISION_PROFILE_BASE64 ASC_API_KEY_ID ASC_API_ISSUER_ID ASC_API_KEY_P8_BASE64 APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then
+              echo "ERROR: Missing required GitHub Secret: $v"
+              exit 1
+            fi
+          done
+
+      - name: Prebuild iOS native project for TestFlight (no sideload UI/schemes)
+        env:
+          EXPO_PUBLIC_APP_DISTRIBUTION: testflight
+          EXPO_IOS_BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods
+        working-directory: ios
+        run: pod install
+
+      - name: Import Apple Distribution Certificate & Provisioning Profile
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$IOS_DIST_CERT_P12_BASE64" | base64 -d > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$IOS_DIST_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_PATH="$RUNNER_TEMP/appstore.mobileprovision"
+          echo "$IOS_PROVISION_PROFILE_BASE64" | base64 -d > "$PROFILE_PATH"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< $(security cms -D -i "$PROFILE_PATH"))
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin <<< $(security cms -D -i "$PROFILE_PATH"))
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
+
+      - name: Archive & Export App Store IPA
+        working-directory: ios
+        env:
+          EXPO_PUBLIC_APP_DISTRIBUTION: testflight
+          EXPO_IOS_BUNDLE_ID: ${{ inputs.bundle_id }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
+          SCHEME_FILE=$(find *.xcodeproj/xcshareddata/xcschemes -maxdepth 1 -name "*.xcscheme" 2>/dev/null | head -n 1)
+          SCHEME=$([ -n "$SCHEME_FILE" ] && basename "$SCHEME_FILE" .xcscheme || basename "$WORKSPACE" .xcworkspace)
+
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            archive
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${EXPO_IOS_BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Upload signed IPA to Apple TestFlight
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+        run: |
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          echo "$ASC_API_KEY_P8_BASE64" | base64 -d > "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_API_KEY_ID}.p8"
+          IPA_FILE=$(find "$RUNNER_TEMP/export" -name "*.ipa" | head -n 1)
+          xcrun altool --upload-app \
+            -f "$IPA_FILE" \
+            -t ios \
+            --apiKey "$ASC_API_KEY_ID" \
+            --apiIssuer "$ASC_API_ISSUER_ID"

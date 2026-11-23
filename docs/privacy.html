@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>海大课表（GDOU Schedule）隐私政策 / Privacy Policy</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+      max-width: 780px;
+      margin: 0 auto;
+      padding: 28px 20px 64px;
+      line-height: 1.7;
+      color: #0f172a;
+      background: #f8fafc;
+    }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
+    }
+    h1 { font-size: 24px; margin: 0 0 8px; color: #003b90; }
+    h2 { font-size: 17px; margin: 24px 0 8px; color: #0b3954; }
+    .meta { color: #64748b; font-size: 13px; margin-bottom: 20px; }
+    ul { padding-left: 20px; }
+    li { margin: 6px 0; }
+    code { background: #f1f5f9; padding: 2px 6px; border-radius: 6px; font-size: 13px; }
+    a { color: #0284c7; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>海大课表（GDOU Schedule）隐私政策</h1>
+    <div class="meta">生效日期：2026-11-23 · 开发者：种果仁（aoligei233666） · 开源协议：GPL-3.0</div>
+
+    <h2>1. 核心原则：不收集任何用户数据（Data Not Collected）</h2>
+    <p>「海大课表」是一款纯本地客户端工具，<strong>不部署任何开发者服务器，不收集、不上传、不共享、不出售任何用户的个人身份信息、教务账号密码、课表、成绩或设备标识符</strong>。</p>
+
+    <h2>2. 教务同步与「凭据用完即删」机制</h2>
+    <ul>
+      <li>当您主动发起同步时，应用仅在本地设备直连广东海洋大学官方域名（<code>*.gdou.edu.cn</code>）。</li>
+      <li>您的学号、密码与临时会话 Cookie 仅在同步瞬间驻留于纯内存临时容器（iOS <code>URLSessionConfiguration.ephemeral</code> / Android 纯内存 CookieJar），绝不写入磁盘、钥匙串或任何外部服务器。</li>
+      <li>同步结束或取消后，应用立即向官方服务端发起注销并清空内存 Cookie、WebView 缓存与临时凭据引用。</li>
+    </ul>
+
+    <h2>3. 本地存储与系统权限</h2>
+    <ul>
+      <li><strong>本地课表/考试/成绩缓存</strong>：仅保存在您的手机本地应用沙箱中，随时可在「关于设置」一键彻底清空。</li>
+      <li><strong>系统日历权限（可选）</strong>：仅在您手动点击「同步至系统日历」时使用，用于将课程与考试日程写入您的本地系统日历。</li>
+      <li><strong>本地通知权限（可选）</strong>：仅用于按您设定的提前时间发送本地起床闹钟、课前提醒与考前提醒，不使用远程推送或广告追踪。</li>
+    </ul>
+
+    <h2>4. 非官方声明</h2>
+    <p>本应用为独立开源学习辅助工具，与广东海洋大学官方无隶属关系。应用同时支持离线示例体验与手动添加日程，无需登录也可使用基础课表、考试与提醒功能。</p>
+
+    <h2>5. 联系方式与技术支持（Support）</h2>
+    <p>如有隐私疑问或功能反馈，请通过 GitHub Issues 联系：<a href="https://github.com/aoligei233666/GDOU-haida-schedule/issues">https://github.com/aoligei233666/GDOU-haida-schedule/issues</a></p>
+
+    <hr style="border:none;border-top:1px solid #e2e8f0;margin:28px 0;" />
+
+    <h2>Privacy Policy (English Summary)</h2>
+    <p><strong>GDOU Schedule</strong> is a local-only student timetable and study assistant. The developer operates no backend servers and collects <strong>no user data</strong>. Optional campus portal sync connects directly from the user's device to official <code>*.gdou.edu.cn</code> HTTPS endpoints using ephemeral in-memory sessions; credentials and cookies are never stored persistently and are cleared immediately after sync. Optional Calendar and Local Notification permissions are used solely on-device for timetable export and class/exam reminders.</p>
+  </div>
+</body>
+</html>

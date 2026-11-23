@@ -36,6 +36,9 @@ import { COLORS } from '../theme/colors';
 import { AppSettings, CampusPresetKey, PeriodTime, SyncReceipt } from '../types/models';
 
 const APP_VERSION = appConfig.expo.version;
+const APP_DISTRIBUTION = (process.env.EXPO_PUBLIC_APP_DISTRIBUTION || 'sideload').toLowerCase();
+const IS_APPLE_OFFICIAL_STORE =
+  Platform.OS === 'ios' && (APP_DISTRIBUTION === 'testflight' || APP_DISTRIBUTION === 'appstore');
 
 interface Props {
   settings: AppSettings;
@@ -238,122 +241,139 @@ export const SettingsScreen: React.FC<Props> = ({
             </Text>
           </View>
         </View>
-        {/* Version & GitHub Releases Update Card */}
-        <View style={styles.card}>
-          <View style={styles.cardHeader}>
-            <Ionicons name="cloud-download-outline" size={20} color={COLORS.oceanPrimary} />
-            <Text style={styles.cardTitle}>检查更新与下载（GitHub Releases）</Text>
-          </View>
-          <Text style={styles.cardDesc}>
-            当前版本：v{APP_VERSION} · 官方发布地址：{GITHUB_RELEASES_PAGE_URL}
-          </Text>
-
-          <View style={styles.updateBtnRow}>
-            <TouchableOpacity
-              style={[styles.updatePrimaryBtn, checkingUpdate && { opacity: 0.65 }]}
-              onPress={handleCheckUpdate}
-              disabled={checkingUpdate}
-            >
-              {checkingUpdate ? (
-                <ActivityIndicator size="small" color={COLORS.white} />
-              ) : (
-                <Ionicons name="refresh-outline" size={16} color={COLORS.white} />
-              )}
-              <Text style={styles.updatePrimaryBtnText}>
-                {checkingUpdate ? '正在检查...' : '检查新版本'}
+        {/* Version & Update Card (TestFlight / App Store uses Apple channel; Android & sideload use GitHub Releases) */}
+        {IS_APPLE_OFFICIAL_STORE ? (
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="checkmark-circle-outline" size={20} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>
+                版本信息（{APP_DISTRIBUTION === 'testflight' ? 'TestFlight 官方测试版' : 'App Store 正式版'}）
               </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.updateSecondaryBtn}
-              onPress={() => void handleOpenTrustedUrl(GITHUB_RELEASES_PAGE_URL)}
-            >
-              <Ionicons name="open-outline" size={15} color={COLORS.oceanPrimary} />
-              <Text style={styles.updateSecondaryBtnText}>前往 Releases 下载</Text>
-            </TouchableOpacity>
-          </View>
-
-          {updateError && (
-            <View style={styles.updateErrorBox}>
-              <Ionicons name="alert-circle-outline" size={16} color={COLORS.danger} />
-              <Text style={styles.updateErrorText}>{updateError}</Text>
             </View>
-          )}
+            <Text style={styles.cardDesc}>
+              当前版本：v{APP_VERSION}（Build {appConfig.expo.ios.buildNumber}）{'\n'}
+              {APP_DISTRIBUTION === 'testflight'
+                ? '新版本发布后将通过 Apple TestFlight 自动推送更新，无需手动下载或重新签名。'
+                : '新版本发布后将通过 Apple App Store 自动推送更新。'}
+            </Text>
+          </View>
+        ) : (
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="cloud-download-outline" size={20} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>检查更新与下载（GitHub Releases）</Text>
+            </View>
+            <Text style={styles.cardDesc}>
+              当前版本：v{APP_VERSION} · 官方发布地址：{GITHUB_RELEASES_PAGE_URL}
+            </Text>
 
-          {updateResult && (
-            <View
-              style={[
-                styles.updateResultBox,
-                updateResult.hasUpdate ? styles.updateResultHighlight : styles.updateResultUpToDate,
-              ]}
-            >
-              <Text
+            <View style={styles.updateBtnRow}>
+              <TouchableOpacity
+                style={[styles.updatePrimaryBtn, checkingUpdate && { opacity: 0.65 }]}
+                onPress={handleCheckUpdate}
+                disabled={checkingUpdate}
+              >
+                {checkingUpdate ? (
+                  <ActivityIndicator size="small" color={COLORS.white} />
+                ) : (
+                  <Ionicons name="refresh-outline" size={16} color={COLORS.white} />
+                )}
+                <Text style={styles.updatePrimaryBtnText}>
+                  {checkingUpdate ? '正在检查...' : '检查新版本'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.updateSecondaryBtn}
+                onPress={() => void handleOpenTrustedUrl(GITHUB_RELEASES_PAGE_URL)}
+              >
+                <Ionicons name="open-outline" size={15} color={COLORS.oceanPrimary} />
+                <Text style={styles.updateSecondaryBtnText}>前往 Releases 下载</Text>
+              </TouchableOpacity>
+            </View>
+
+            {updateError && (
+              <View style={styles.updateErrorBox}>
+                <Ionicons name="alert-circle-outline" size={16} color={COLORS.danger} />
+                <Text style={styles.updateErrorText}>{updateError}</Text>
+              </View>
+            )}
+
+            {updateResult && (
+              <View
                 style={[
-                  styles.updateResultTitle,
-                  { color: updateResult.hasUpdate ? '#9A3412' : '#065F46' },
+                  styles.updateResultBox,
+                  updateResult.hasUpdate ? styles.updateResultHighlight : styles.updateResultUpToDate,
                 ]}
               >
-                {updateResult.hasUpdate
-                  ? `🎉 发现新版本 v${updateResult.latestVersion}（当前 v${updateResult.currentVersion}）`
-                  : updateResult.statusNote ||
-                    `✅ 当前 v${updateResult.currentVersion} 已是最新版本（远端 v${updateResult.latestVersion}）`}
-              </Text>
-
-              {updateResult.releaseNotes ? (
-                <Text style={styles.updateNotes} numberOfLines={5}>
-                  {updateResult.releaseNotes}
-                </Text>
-              ) : null}
-
-              {updateResult.hasUpdate && (
-                <TouchableOpacity
-                  style={styles.downloadReleaseBtn}
-                  onPress={() => void handleOpenTrustedUrl(updateResult.downloadUrl)}
+                <Text
+                  style={[
+                    styles.updateResultTitle,
+                    { color: updateResult.hasUpdate ? '#9A3412' : '#065F46' },
+                  ]}
                 >
-                  <Ionicons name="download-outline" size={16} color={COLORS.white} />
-                  <Text style={styles.downloadReleaseBtnText}>
-                    {updateResult.assetName
-                      ? `直接下载 ${updateResult.assetName}${
-                          updateResult.assetSizeBytes
-                            ? ` (${formatBytesCompact(updateResult.assetSizeBytes)})`
-                            : ''
-                        }`
-                      : `前往下载 v${updateResult.latestVersion}`}
-                  </Text>
-                </TouchableOpacity>
-              )}
-            </View>
-          )}
+                  {updateResult.hasUpdate
+                    ? `🎉 发现新版本 v${updateResult.latestVersion}（当前 v${updateResult.currentVersion}）`
+                    : updateResult.statusNote ||
+                      `✅ 当前 v${updateResult.currentVersion} 已是最新版本（远端 v${updateResult.latestVersion}）`}
+                </Text>
 
-          {/* iOS On-Device Source (Feather / ESign / SideStore) */}
-          <View style={styles.iosSourceBox}>
-            <Text style={styles.iosSourceTitle}>
-              iOS 手机端免电脑软件源（Feather / 轻松签 / SideStore）
-            </Text>
-            <Text style={styles.iosSourceDesc}>
-              在手机端签名器添加本源后，发新版可直接拉取并签名覆盖更新，无需连接电脑：
-            </Text>
-            <Text style={styles.iosSourceUrl} selectable>
-              {IOS_ALTSTORE_SOURCE_URL}
-            </Text>
-            <View style={styles.iosSourceBtnRow}>
-              <TouchableOpacity
-                style={styles.iosSourceBtn}
-                onPress={() => void handleOpenFeatherSource()}
-              >
-                <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
-                <Text style={styles.iosSourceBtnText}>Feather 一键加源</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.iosSourceBtn}
-                onPress={() => void handleShareIosSource()}
-              >
-                <Ionicons name="copy-outline" size={14} color={COLORS.oceanPrimary} />
-                <Text style={styles.iosSourceBtnText}>复制 / 分享源地址</Text>
-              </TouchableOpacity>
+                {updateResult.releaseNotes ? (
+                  <Text style={styles.updateNotes} numberOfLines={5}>
+                    {updateResult.releaseNotes}
+                  </Text>
+                ) : null}
+
+                {updateResult.hasUpdate && (
+                  <TouchableOpacity
+                    style={styles.downloadReleaseBtn}
+                    onPress={() => void handleOpenTrustedUrl(updateResult.downloadUrl)}
+                  >
+                    <Ionicons name="download-outline" size={16} color={COLORS.white} />
+                    <Text style={styles.downloadReleaseBtnText}>
+                      {updateResult.assetName
+                        ? `直接下载 ${updateResult.assetName}${
+                            updateResult.assetSizeBytes
+                              ? ` (${formatBytesCompact(updateResult.assetSizeBytes)})`
+                              : ''
+                          }`
+                        : `前往下载 v${updateResult.latestVersion}`}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            )}
+
+            {/* iOS On-Device Source (Feather / ESign / SideStore) */}
+            <View style={styles.iosSourceBox}>
+              <Text style={styles.iosSourceTitle}>
+                iOS 手机端免电脑软件源（Feather / 轻松签 / SideStore）
+              </Text>
+              <Text style={styles.iosSourceDesc}>
+                在手机端签名器添加本源后，发新版可直接拉取并签名覆盖更新，无需连接电脑：
+              </Text>
+              <Text style={styles.iosSourceUrl} selectable>
+                {IOS_ALTSTORE_SOURCE_URL}
+              </Text>
+              <View style={styles.iosSourceBtnRow}>
+                <TouchableOpacity
+                  style={styles.iosSourceBtn}
+                  onPress={() => void handleOpenFeatherSource()}
+                >
+                  <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
+                  <Text style={styles.iosSourceBtnText}>Feather 一键加源</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.iosSourceBtn}
+                  onPress={() => void handleShareIosSource()}
+                >
+                  <Ionicons name="copy-outline" size={14} color={COLORS.oceanPrimary} />
+                  <Text style={styles.iosSourceBtnText}>复制 / 分享源地址</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
-        </View>
+        )}
 
         {/* Privacy Zero-Retention Audit Card */}
         <View style={[styles.card, styles.auditCard]}>
