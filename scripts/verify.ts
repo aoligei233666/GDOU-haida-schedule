@@ -3,8 +3,10 @@ import appJson from '../app.json';
 import pkgLockJson from '../package-lock.json';
 import pkgJson from '../package.json';
 import {
+  ensureAuthLoginServiceParam,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
+  normalizeWfwAuthUrl,
   upgradeGdouHttpToHttps,
 } from '../src/constants/gdouEndpoints';
 import {
@@ -27,6 +29,7 @@ import {
 } from '../src/services/cryptoAes';
 import { getExamCountdown, parseExamDateTime, parseZfExamResponse } from '../src/services/examParser';
 import {
+  buildIncognitoWebViewPreloadScript,
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
   completeWfwSubAuthAndSync,
@@ -272,12 +275,48 @@ async function run() {
     assert.equal(upgradeGdouHttpToHttps('http://evil.example.com/phish'), null);
     assert.equal(upgradeGdouHttpToHttps('http://gdou.edu.cn.evil.com/phish'), null);
     assert.equal(upgradeGdouHttpToHttps('javascript:alert(1)'), null);
+    assert.equal(
+      normalizeWfwAuthUrl(
+        'https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?isMultifactor=true'
+      ),
+      'https://wfw.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?isMultifactor=true'
+    );
+    assert.equal(
+      normalizeWfwAuthUrl(
+        'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/authserver/login?type=dynamicLogin'
+      ),
+      'https://wfw.gdou.edu.cn/authserver/login?type=dynamicLogin'
+    );
+    assert.equal(normalizeWfwAuthUrl('https://wfw.gdou.edu.cn/authserver/login'), null);
+    assert.equal(
+      ensureAuthLoginServiceParam(
+        'https://authserver.gdou.edu.cn/authserver/login',
+        'https://wfw.gdou.edu.cn/'
+      ),
+      'https://authserver.gdou.edu.cn/authserver/login?service=https%3A%2F%2Fwfw.gdou.edu.cn%2F'
+    );
+    assert.equal(
+      ensureAuthLoginServiceParam(
+        'https://authserver.gdou.edu.cn/authserver/login?service=https%3A%2F%2Fjw.gdou.edu.cn%2Fsso%2Fjziotlogin',
+        'https://wfw.gdou.edu.cn/'
+      ),
+      'https://authserver.gdou.edu.cn/authserver/login?service=https%3A%2F%2Fjw.gdou.edu.cn%2Fsso%2Fjziotlogin'
+    );
     assert.equal(isTrustedWebViewMessageUrl('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn'), true);
     assert.equal(isTrustedWebViewMessageUrl('https://evil.example.com'), false);
+    const preloadScript = buildIncognitoWebViewPreloadScript();
+    assert.ok(preloadScript.includes('upgrade-insecure-requests'), 'Preload script must inject HTTPS upgrade CSP');
+    assert.ok(preloadScript.includes('XMLHttpRequest.prototype.open'), 'Preload script must hook XHR for wfw /authserver/ cookies');
+    assert.ok(preloadScript.includes('window.fetch'), 'Preload script must hook fetch for wfw /authserver/ cookies');
+    // Syntax-validate both injected WebView scripts so malformed escapes fail fast
+    new Function(preloadScript);
     const token = generateSecureHex(16);
-    const injected = buildIncognitoWebViewSyncScript(undefined, token);
+    const injected = buildIncognitoWebViewSyncScript(undefined, token, 'https://wfw.gdou.edu.cn/');
+    new Function(injected);
     assert.ok(injected.includes(token), 'WebView script must embed bridgeToken');
     assert.ok(injected.includes('upgrade-insecure-requests'), 'WebView script must inject HTTPS upgrade CSP');
+    assert.ok(injected.includes('__gdou_wfw_step2_banner__'), 'WebView script must render Step 2 guidance banner on wfw auth');
+    assert.ok(injected.includes('/authserver/index.do'), 'WebView script must auto-recover from CAS index.do');
     assert.ok(injected.includes('xskbcx_cxRjc.html'), 'WebView script must query official section period times');
     assert.ok(injected.includes('sessionStorage.clear()'), 'WebView script must clear sessionStorage');
     assert.ok(injected.includes('storageCleaned: storageCleaned'), 'WebView script must report verified storageCleaned');
@@ -727,7 +766,35 @@ async function run() {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pluginFn = require('../plugins/withGdouZeroRetention.js') as unknown;
   assert.equal(typeof pluginFn, 'function', 'Config plugin must export a function');
-  console.log(`   OK: Calendar legacy guard, updater, iOS source JSON, single-source version v${appJson.expo.version} & config plugin verified.`);
+  const pluginSrc = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'plugins', 'withGdouZeroRetention.js'),
+    'utf8'
+  );
+  assert.ok(
+    pluginSrc.includes('ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider'),
+    'iOS plugin must hook Expo SDK 58 ExpoFetchCustomExtension so global fetch uses GdouEphemeralURLProtocol'
+  );
+  assert.ok(
+    pluginSrc.includes('readBodyStream') && pluginSrc.includes('if didRedirect {'),
+    'iOS GdouEphemeralURLProtocol must materialize httpBodyStream and guard didRedirect callbacks'
+  );
+  assert.ok(
+    pluginSrc.includes('wfw.gdou.edu.cn'),
+    'Native cookie stores must pin route cookie on wfw.gdou.edu.cn as well as authserver'
+  );
+  const modalSrc = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'src', 'components', 'EphemeralSyncModal.tsx'),
+    'utf8'
+  );
+  assert.ok(
+    !modalSrc.includes('setActiveWebViewUri'),
+    'EphemeralSyncModal must NOT mutate WebView source prop during onShouldStartLoadWithRequest (causes iOS 302 race)'
+  );
+  assert.ok(
+    modalSrc.includes('injectedJavaScriptBeforeContentLoaded={preloadedWebViewJs}'),
+    'EphemeralSyncModal must pass document-start preload script to WebView'
+  );
+  console.log(`   OK: Calendar legacy guard, updater, iOS ExpoFetch/WebView guards, single-source version v${appJson.expo.version} & config plugin verified.`);
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

@@ -20,14 +20,23 @@
       "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
       "tintColor": "#0284C7",
       "category": "utilities",
-      "version": "1.3.1",
-      "buildVersion": "4",
+      "version": "1.3.2",
+      "buildVersion": "5",
       "versionDate": "2026-11-23",
-      "versionDescription": "v1.3.1：修复 Expo SDK 58 日历同步报错、官网无痕网页拦截海大 HTTP 跳转、校外微门户 MFA 后直连两步同步；按海大官方作息校准课程时间并支持自动拉取教务节次与自定义编辑；新增 GitHub Releases 检查更新与 iOS 手机端软件源；iOS IPA 采用完整 ad-hoc 签名槽位以兼容 Feather / 轻松签 / 爱思助手。",
-      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.3.1/haida-schedule-v1.3.1-ios-unsigned.ipa",
+      "versionDescription": "v1.3.2：彻底修复 iOS 极速直连触发 ATS 报错（接入 Expo SDK 58 ExpoFetchCustomExtension 纯内存隔离与 HTTPS 重定向升级）；修复官网无痕网页在 iOS 上登录后直接重置的问题（消除 302 跳转竞态、文档加载前注入 HTTPS/Cookie 路径修复与校外微门户第 2 步引导）。",
+      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.3.2/haida-schedule-v1.3.2-ios-unsigned.ipa",
       "size": 11893251,
       "minOSVersion": "16.4",
       "versions": [
+        {
+          "version": "1.3.2",
+          "buildVersion": "5",
+          "date": "2026-11-23",
+          "localizedDescription": "v1.3.2：\n1. 修复 iOS 极速直连登录后触发 App Transport Security 报错：将 GdouEphemeralURLProtocol 接入 Expo SDK 58 ExpoFetchCustomExtension，并补齐 POST httpBodyStream 读取与 302 跳转竞态防护；\n2. 修复官网无痕网页在 iOS 上登录后直接重置的问题：移除同步修改 WebView source 属性导致的 WKWebView 取消/重载竞态，改用文档加载前注入脚本（injectedJavaScriptBeforeContentLoaded）+ 无竞态 location.replace；\n3. 修复校外微门户（wfw.gdou.edu.cn）代理路径导致 Path=/authserver 的 JSESSIONID/route Cookie 丢失问题，并新增第 2 步页内明确引导与双端 wfw route 节点固定。",
+          "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.3.2/haida-schedule-v1.3.2-ios-unsigned.ipa",
+          "size": 11893251,
+          "minOSVersion": "16.4"
+        },
         {
           "version": "1.3.1",
           "buildVersion": "4",

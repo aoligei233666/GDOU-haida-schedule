@@ -99,8 +99,10 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
     val now = System.currentTimeMillis()
     for (cookie in cookies) {
       val key = "\${cookie.domain}|\${cookie.path}|\${cookie.name}"
-      // Pin load-balancer \`route\` cookie once set for authserver so session stays on one node
-      if (cookie.name == "route" && url.host.contains("authserver.gdou.edu.cn")) {
+      // Pin load-balancer \`route\` cookie once set for authserver or wfw /authserver so session stays on one node
+      val isAuthRouteHost = url.host.contains("authserver.gdou.edu.cn") ||
+        url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
+      if (cookie.name == "route" && isAuthRouteHost) {
         val existing = store[key]
         if (existing != null && existing.expiresAt > now) {
           continue
@@ -214,7 +216,9 @@ class MainApplication : Application(), ReactApplication {
           val builder = resp.newBuilder()
 
           // Drop duplicate Set-Cookie: route=... headers once pinned
-          if (hasPinnedRoute && effectiveReq.url.host.contains("authserver.gdou.edu.cn")) {
+          val isAuthRouteHost = effectiveReq.url.host.contains("authserver.gdou.edu.cn") ||
+            effectiveReq.url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
+          if (hasPinnedRoute && isAuthRouteHost) {
             val allCookies = resp.headers("Set-Cookie")
             if (allCookies.any { it.trim().startsWith("route=") }) {
               val filtered = Headers.Builder()
@@ -231,7 +235,7 @@ class MainApplication : Application(), ReactApplication {
             }
           }
 
-          // Upgrade cleartext http://*.gdou.edu.cn redirects to https:// and fix relative wfw/jw redirects
+          // Upgrade cleartext http://*.gdou.edu.cn redirects to https://, normalize wfw /authserver/ paths, and fix relative wfw/jw redirects
           val loc = resp.header("Location")
           var rewrittenLoc: String? = null
           if (loc != null) {
@@ -240,9 +244,21 @@ class MainApplication : Application(), ReactApplication {
               parsedLoc.scheme.equals("http", ignoreCase = true) &&
               (parsedLoc.host.equals("gdou.edu.cn", ignoreCase = true) ||
                 parsedLoc.host.endsWith(".gdou.edu.cn", ignoreCase = true))
+            val upgradedCandidate = if (isGdouHttpLoc && parsedLoc != null) {
+              parsedLoc.newBuilder().scheme("https").port(443).build().toString()
+            } else {
+              loc
+            }
+            val wfwAuthPrefixRe = Regex(
+              "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn)?/https?://(?:authserver|jw)\\\\.gdou\\\\.edu\\\\.cn(/authserver/.*)$",
+              RegexOption.IGNORE_CASE
+            )
+            val wfwAuthMatch = wfwAuthPrefixRe.matchEntire(upgradedCandidate)
             rewrittenLoc = when {
-              isGdouHttpLoc && parsedLoc != null ->
-                parsedLoc.newBuilder().scheme("https").port(443).build().toString()
+              wfwAuthMatch != null ->
+                "https://wfw.gdou.edu.cn\${wfwAuthMatch.groupValues[1]}"
+              isGdouHttpLoc ->
+                upgradedCandidate
               loc.startsWith("/") &&
                 !loc.startsWith("/https://") &&
                 !loc.startsWith("/http://") &&
@@ -289,14 +305,15 @@ class MainApplication : Application(), ReactApplication {
 }
 `;
 
-const IOS_EPHEMERAL_NETWORKING_SWIFT = `import Foundation
+const IOS_EPHEMERAL_NETWORKING_SWIFT = `import Expo
+import Foundation
 import React
 import WebKit
 
 /// Pure volatile RAM-only cookie store for iOS zero-retention GDOU authentication.
 /// Mirrors Android's GdouEphemeralCookieJar:
 /// - Never persists cookies to Cookies.binarycookies or disk URLCache.
-/// - Pins GDOU authserver load-balancer \`route\` cookie per session.
+/// - Pins GDOU authserver & wfw load-balancer \`route\` cookie per session.
 /// - Purges shared HTTPCookieStorage, URLCache, and WKWebsiteDataStore on reset/clear.
 final class GdouEphemeralCookieStore: @unchecked Sendable {
   static let shared = GdouEphemeralCookieStore()
@@ -338,13 +355,14 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
 
     let now = Date()
     let host = (url.host ?? "").lowercased()
+    let isAuthRouteHost = host.contains("authserver.gdou.edu.cn") || host == "wfw.gdou.edu.cn"
 
     lock.lock()
     defer { lock.unlock() }
 
     for cookie in parsed {
       let key = "\\(cookie.domain.lowercased())|\\(cookie.path)|\\(cookie.name)"
-      if cookie.name == "route" && host.contains("authserver.gdou.edu.cn") {
+      if cookie.name == "route" && isAuthRouteHost {
         if let existing = cookiesByKey[key] {
           let notExpired = existing.expiresDate.map { $0 > now } ?? true
           if notExpired {
@@ -404,7 +422,7 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
       let bare = String(cookieDomain.dropFirst())
       return requestHost == bare || requestHost.hasSuffix(cookieDomain)
     }
-    return requestHost == cookieDomain || requestHost.hasSuffix("." + cookieDomain)
+    return requestHost == cookieDomain
   }
 
   private static func pathMatches(cookiePath: String, requestPath: String) -> Bool {
@@ -419,10 +437,13 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
   }
 }
 
-/// Custom URLProtocol attached to React Native's ephemeral URLSessionConfiguration.
+/// Custom URLProtocol attached to BOTH Expo SDK 58+ \`expo/fetch\` (ExpoFetchCustomExtension)
+/// and React Native's RCTHTTPRequestHandler ephemeral URLSessionConfiguration.
 /// - Strips internal control headers (\`X-Gdou-Reset-Cookies-Before\`, \`X-Gdou-Clear-Cookies-After\`)
 ///   so they are NEVER transmitted to upstream servers.
-/// - Enforces RAM-only cookie isolation, bounded timeouts, HTTPS upgrades, and wfw redirect fixes.
+/// - Materializes \`httpBodyStream\` into \`httpBody\` so POST forms preserve Content-Length.
+/// - Enforces RAM-only cookie isolation, bounded timeouts, HTTPS upgrades for \`http://*.gdou.edu.cn\`,
+///   wfw \`/authserver/\` path normalization, and relative \`wfw/jw\` redirect fixes.
 final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unchecked Sendable {
   private static let handledKey = "GdouEphemeralURLProtocolHandled"
   private static let resetHeader = "X-Gdou-Reset-Cookies-Before"
@@ -432,6 +453,71 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
   private var innerTask: URLSessionDataTask?
   private var clearAfter = false
   private var didRedirect = false
+  private var shouldFollowRedirects = true
+
+  private static func isOfficialGdouHost(_ host: String) -> Bool {
+    let lower = host.lowercased()
+    return lower == "gdou.edu.cn" || lower.hasSuffix(".gdou.edu.cn")
+  }
+
+  private static func upgradeGdouHttpUrl(_ url: URL) -> URL? {
+    guard url.scheme?.lowercased() == "http",
+          let host = url.host,
+          isOfficialGdouHost(host),
+          var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+      return nil
+    }
+    comps.scheme = "https"
+    if comps.port == 80 {
+      comps.port = nil
+    }
+    return comps.url
+  }
+
+  private static func upgradeGdouHttpUrl(from raw: String) -> URL? {
+    guard let parsed = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+      return nil
+    }
+    return upgradeGdouHttpUrl(parsed)
+  }
+
+  private static func normalizeWfwAuthRedirectUrl(_ raw: String) -> URL? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefixes = [
+      "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/",
+      "https://wfw.gdou.edu.cn/http://authserver.gdou.edu.cn/authserver/",
+      "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/authserver/",
+      "https://wfw.gdou.edu.cn/http://jw.gdou.edu.cn/authserver/",
+      "/https://authserver.gdou.edu.cn/authserver/",
+      "/http://authserver.gdou.edu.cn/authserver/",
+      "/https://jw.gdou.edu.cn/authserver/",
+      "/http://jw.gdou.edu.cn/authserver/",
+    ]
+    let lower = trimmed.lowercased()
+    for prefix in prefixes {
+      if lower.hasPrefix(prefix) {
+        let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
+        let suffix = String(trimmed[suffixStart...])
+        return URL(string: "https://wfw.gdou.edu.cn/authserver/" + suffix)
+      }
+    }
+    return nil
+  }
+
+  private static func readBodyStream(_ stream: InputStream, maxBytes: Int) -> Data {
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let chunkSize = 16 * 1024
+    var buffer = [UInt8](repeating: 0, count: chunkSize)
+    while stream.hasBytesAvailable && data.count < maxBytes {
+      let remaining = maxBytes - data.count
+      let readCount = stream.read(&buffer, maxLength: min(chunkSize, remaining))
+      if readCount <= 0 { break }
+      data.append(buffer, count: readCount)
+    }
+    return data
+  }
 
   override class func canInit(with request: URLRequest) -> Bool {
     guard URLProtocol.property(forKey: handledKey, in: request) == nil else {
@@ -455,6 +541,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     let mutable = ((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest) ?? NSMutableURLRequest(url: initialUrl)
     URLProtocol.setProperty(true, forKey: Self.handledKey, in: mutable)
 
+    shouldFollowRedirects = (URLProtocol.property(forKey: "shouldFollowRedirects", in: request) as? Bool) ?? true
     let resetBefore = mutable.value(forHTTPHeaderField: Self.resetHeader) == "1"
     clearAfter = mutable.value(forHTTPHeaderField: Self.clearHeader) == "1"
 
@@ -471,16 +558,23 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     mutable.setValue(nil, forHTTPHeaderField: Self.resetHeader)
     mutable.setValue(nil, forHTTPHeaderField: Self.clearHeader)
 
-    // Upgrade cleartext http://*.gdou.edu.cn/ to https://
-    if let curUrl = mutable.url,
-       curUrl.scheme?.lowercased() == "http",
-       let host = curUrl.host?.lowercased(),
-       (host == "gdou.edu.cn" || host.hasSuffix(".gdou.edu.cn")),
-       var comps = URLComponents(url: curUrl, resolvingAgainstBaseURL: false) {
-      comps.scheme = "https"
-      if comps.port == 80 { comps.port = nil }
-      if let upgraded = comps.url {
+    // Materialize httpBodyStream -> httpBody so POST forms keep explicit Content-Length (never chunked)
+    if mutable.httpBody == nil, let stream = mutable.httpBodyStream {
+      let bodyData = Self.readBodyStream(stream, maxBytes: 16 * 1024 * 1024)
+      mutable.httpBodyStream = nil
+      mutable.httpBody = bodyData
+      if mutable.value(forHTTPHeaderField: "Content-Length") == nil {
+        mutable.setValue(String(bodyData.count), forHTTPHeaderField: "Content-Length")
+      }
+    }
+
+    // Upgrade cleartext http://*.gdou.edu.cn/ to https:// and normalize wfw /authserver/ paths
+    if let curUrl = mutable.url {
+      if let upgraded = Self.upgradeGdouHttpUrl(curUrl) {
         mutable.url = upgraded
+      }
+      if let normalized = Self.normalizeWfwAuthRedirectUrl(mutable.url?.absoluteString ?? "") {
+        mutable.url = normalized
       }
     }
 
@@ -491,6 +585,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       } else {
         mutable.setValue(nil, forHTTPHeaderField: "Cookie")
       }
+    } else {
+      mutable.setValue(nil, forHTTPHeaderField: "Cookie")
     }
     mutable.httpShouldHandleCookies = false
     mutable.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -530,6 +626,11 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       GdouEphemeralCookieStore.shared.save(from: response, for: respUrl)
     }
 
+    if !shouldFollowRedirects {
+      completionHandler(nil)
+      return
+    }
+
     guard let nextUrl = request.url else {
       completionHandler(nil)
       return
@@ -537,28 +638,48 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     let nextMutable = ((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest) ?? NSMutableURLRequest(url: nextUrl)
     URLProtocol.removeProperty(forKey: Self.handledKey, in: nextMutable)
 
-    // Match Android OkHttp redirect fixes (http://*.gdou.edu.cn -> https:// and relative wfw/jw paths)
+    // Match Android OkHttp redirect fixes:
+    // 1) Upgrade cleartext http://*.gdou.edu.cn -> https://
+    // 2) Normalize wfw /https://(authserver|jw).gdou.edu.cn/authserver/... -> /authserver/...
+    // 3) Rewrite relative paths under wfw.gdou.edu.cn/https://jw.gdou.edu.cn
     let rawLoc = response.value(forHTTPHeaderField: "Location")
-    let origUrlStr = task.originalRequest?.url?.absoluteString ?? ""
+    let sourceUrlStr =
+      response.url?.absoluteString ??
+      task.currentRequest?.url?.absoluteString ??
+      task.originalRequest?.url?.absoluteString ??
+      ""
+
     if let loc = rawLoc {
-      if let locUrl = URL(string: loc),
-         locUrl.scheme?.lowercased() == "http",
-         let locHost = locUrl.host?.lowercased(),
-         (locHost == "gdou.edu.cn" || locHost.hasSuffix(".gdou.edu.cn")),
-         var comps = URLComponents(url: locUrl, resolvingAgainstBaseURL: false) {
-        comps.scheme = "https"
-        if comps.port == 80 { comps.port = nil }
-        if let upgraded = comps.url {
-          nextMutable.url = upgraded
-        }
+      if let normalizedWfw = Self.normalizeWfwAuthRedirectUrl(loc) {
+        nextMutable.url = normalizedWfw
+      } else if let upgraded = Self.upgradeGdouHttpUrl(from: loc) {
+        nextMutable.url = upgraded
       } else if loc.hasPrefix("/"),
                 !loc.hasPrefix("/https://"),
                 !loc.hasPrefix("/http://"),
                 !loc.hasPrefix("/authserver"),
-                origUrlStr.contains("wfw.gdou.edu.cn/https://jw.gdou.edu.cn"),
+                sourceUrlStr.contains("wfw.gdou.edu.cn/https://jw.gdou.edu.cn"),
                 let rewritten = URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" + loc) {
         nextMutable.url = rewritten
       }
+    }
+
+    // Fallback check on Foundation's resolved URL (covers relative/unencoded Locations)
+    if let resolvedUrl = nextMutable.url {
+      if let upgradedResolved = Self.upgradeGdouHttpUrl(resolvedUrl) {
+        nextMutable.url = upgradedResolved
+      }
+      if let normalizedResolved = Self.normalizeWfwAuthRedirectUrl(nextMutable.url?.absoluteString ?? "") {
+        nextMutable.url = normalizedResolved
+      }
+    }
+
+    // Clean body/content headers if 301/302/303 switched request to GET
+    if nextMutable.httpMethod.uppercased() == "GET" {
+      nextMutable.httpBody = nil
+      nextMutable.httpBodyStream = nil
+      nextMutable.setValue(nil, forHTTPHeaderField: "Content-Length")
+      nextMutable.setValue(nil, forHTTPHeaderField: "Content-Type")
     }
 
     // Propagate clearAfter flag through redirect chain so final logout hop triggers purge
@@ -568,11 +689,13 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       nextMutable.setValue(nil, forHTTPHeaderField: Self.clearHeader)
     }
     nextMutable.setValue(nil, forHTTPHeaderField: Self.resetHeader)
+    nextMutable.setValue(nil, forHTTPHeaderField: "Cookie")
     nextMutable.httpShouldHandleCookies = true
 
     didRedirect = true
     client?.urlProtocol(self, wasRedirectedTo: nextMutable as URLRequest, redirectResponse: response)
     completionHandler(nil)
+    task.cancel()
   }
 
   func urlSession(
@@ -581,6 +704,10 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     didReceive response: URLResponse,
     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
   ) {
+    if didRedirect {
+      completionHandler(.cancel)
+      return
+    }
     if let httpResp = response as? HTTPURLResponse, let url = httpResp.url {
       GdouEphemeralCookieStore.shared.save(from: httpResp, for: url)
     }
@@ -589,6 +716,9 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
   }
 
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    if didRedirect {
+      return
+    }
     client?.urlProtocol(self, didLoad: data)
   }
 
@@ -614,21 +744,32 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
 }
 
 @objc public final class GdouEphemeralNetworking: NSObject {
+  private static func makeEphemeralSessionConfiguration() -> URLSessionConfiguration {
+    let config = URLSessionConfiguration.ephemeral
+    config.urlCache = nil
+    config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    config.urlCredentialStorage = nil
+    config.httpCookieStorage = nil
+    config.httpShouldSetCookies = false
+    config.httpCookieAcceptPolicy = .never
+    config.timeoutIntervalForRequest = 25
+    config.timeoutIntervalForResource = 45
+    config.protocolClasses = [GdouEphemeralURLProtocol.self]
+    return config
+  }
+
+  @MainActor
   @objc public static func install() {
     GdouEphemeralCookieStore.shared.clearAll()
 
+    // Hook Expo SDK 58+ WinterCG expo/fetch (globalThis.fetch) URLSession
+    ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider {
+      return GdouEphemeralNetworking.makeEphemeralSessionConfiguration()
+    }
+
+    // Hook legacy React Native RCTHTTPRequestHandler (XMLHttpRequest / RN fetch fallback)
     RCTSetCustomNSURLSessionConfigurationProvider {
-      let config = URLSessionConfiguration.ephemeral
-      config.urlCache = nil
-      config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-      config.urlCredentialStorage = nil
-      config.httpCookieStorage = nil
-      config.httpShouldSetCookies = false
-      config.httpCookieAcceptPolicy = .never
-      config.timeoutIntervalForRequest = 25
-      config.timeoutIntervalForResource = 45
-      config.protocolClasses = [GdouEphemeralURLProtocol.self]
-      return config
+      return GdouEphemeralNetworking.makeEphemeralSessionConfiguration()
     }
 
     // Defense-in-depth: unconditionally strip unexpected/non-http X-Gdou-* headers before transport
@@ -751,8 +892,8 @@ function withGdouGradleProperties(config) {
 function withGdouAppBuildGradle(config) {
   return withAppBuildGradle(config, (mod) => {
     let contents = mod.modResults.contents;
-    const versionName = config.version || '1.3.1';
-    const versionCode = Number(config.android?.versionCode) || 4;
+    const versionName = config.version || '1.3.2';
+    const versionCode = Number(config.android?.versionCode) || 5;
 
     // 1. Sync versionCode & versionName from app.json (single source of truth)
     contents = contents.replace(/versionCode\s+\d+/, `versionCode ${versionCode}`);
@@ -826,8 +967,8 @@ function withGdouProguardRules(config) {
 
 function withGdouIosInfoPlist(config) {
   return withInfoPlist(config, (mod) => {
-    mod.modResults.CFBundleShortVersionString = config.version || '1.3.1';
-    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '4');
+    mod.modResults.CFBundleShortVersionString = config.version || '1.3.2';
+    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '5');
     mod.modResults.NSAppTransportSecurity = {
       NSAllowsArbitraryLoads: false,
       NSAllowsLocalNetworking: true,

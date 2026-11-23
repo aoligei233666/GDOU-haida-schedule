@@ -15,18 +15,21 @@ import {
 } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import {
+  ensureAuthLoginServiceParam,
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
   GDOU_JW_SSO_SERVICE,
   GDOU_WFW_ORIGIN,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
+  normalizeWfwAuthUrl,
   upgradeGdouHttpToHttps,
 } from '../constants/gdouEndpoints';
 import { deriveCurrentTermParams, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
 import { generateSecureHex, purgeEphemeralCredentials } from '../services/cryptoAes';
 import { parseZfExamResponse } from '../services/examParser';
 import {
+  buildIncognitoWebViewPreloadScript,
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
   clearPendingMfaSecret,
@@ -95,9 +98,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const [xnmOverride, setXnmOverride] = useState('');
   const [xqmOverride, setXqmOverride] = useState('');
 
-  // WebView ephemeral state + route detection + seamless HTTPS upgrade
+  // WebView ephemeral state + route detection + zero-race HTTPS/wfw redirect upgrade
   const [webViewKey, setWebViewKey] = useState(0);
-  const [activeWebViewUri, setActiveWebViewUri] = useState<string | null>(null);
   const [webViewProgress, setWebViewProgress] = useState(0);
   const [webViewRoutePref, setWebViewRoutePref] = useState<WebViewRoutePref>('auto');
   const [probedWebViewIsVpn, setProbedWebViewIsVpn] = useState<boolean | null>(null);
@@ -114,10 +116,32 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const bridgeTokenRef = useRef<string>(bridgeToken);
   const autoReinitCountRef = useRef<number>(0);
   const webViewCompletingRef = useRef<boolean>(false);
-  const lastHttpUpgradeRef = useRef<{ url: string; ts: number }>({ url: '', ts: 0 });
+  const lastRedirectRewriteRef = useRef<{ url: string; ts: number }>({ url: '', ts: 0 });
+  const pendingWebViewRedirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   bridgeTokenRef.current = bridgeToken;
 
   const MAX_AUTO_REINIT = 2;
+
+  const clearPendingWebViewRedirectTimer = () => {
+    if (pendingWebViewRedirectTimerRef.current) {
+      clearTimeout(pendingWebViewRedirectTimerRef.current);
+      pendingWebViewRedirectTimerRef.current = null;
+    }
+  };
+
+  const scheduleWebViewLocationReplace = (targetUrl: string) => {
+    clearPendingWebViewRedirectTimer();
+    pendingWebViewRedirectTimerRef.current = setTimeout(() => {
+      pendingWebViewRedirectTimerRef.current = null;
+      try {
+        webViewRef.current?.injectJavaScript(
+          `window.location.replace(${JSON.stringify(targetUrl)}); true;`
+        );
+      } catch {
+        // Ignore if WebView already unmounted
+      }
+    }, 120);
+  };
 
   const abortActiveRequests = () => {
     if (activeAbortRef.current) {
@@ -177,6 +201,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   };
 
   useEffect(() => {
+    clearPendingWebViewRedirectTimer();
     if (visible) {
       autoReinitCountRef.current = 0;
       webViewCompletingRef.current = false;
@@ -184,8 +209,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setStatusLog([]);
       setMfaChallenge(null);
       setWfwSubAuth(null);
-      setActiveWebViewUri(null);
-      lastHttpUpgradeRef.current = { url: '', ts: 0 };
+      lastRedirectRewriteRef.current = { url: '', ts: 0 };
       if (mode === 'direct') {
         void initDirectSession();
       } else {
@@ -214,11 +238,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       setSyncing(false);
       setMfaChallenge(null);
       setWfwSubAuth(null);
-      setActiveWebViewUri(null);
       setSession(null);
       autoReinitCountRef.current = 0;
     }
     return () => {
+      clearPendingWebViewRedirectTimer();
       abortActiveRequests();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -786,6 +810,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
    * aborts active network calls, wipes inputs, and flushes ephemeral cookies.
    */
   const handleClose = () => {
+    clearPendingWebViewRedirectTimer();
     abortActiveRequests();
     clearPendingMfaSecret();
     const shouldCleanWebView = mode === 'webview' && !webViewCompletingRef.current;
@@ -814,23 +839,26 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     onClose();
   };
 
-  const effectiveWebViewUrl = useMemo(() => {
+  const expectedWebViewServiceUrl = useMemo(() => {
     const useCampusDirect =
       webViewRoutePref === 'campus' ||
       (webViewRoutePref === 'auto' && probedWebViewIsVpn === false);
-    if (useCampusDirect) {
-      return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
-        GDOU_JW_SSO_SERVICE
-      )}`;
-    }
-    return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
-      `${GDOU_WFW_ORIGIN}/`
-    )}`;
+    return useCampusDirect ? GDOU_JW_SSO_SERVICE : `${GDOU_WFW_ORIGIN}/`;
   }, [webViewRoutePref, probedWebViewIsVpn]);
 
-  useEffect(() => {
-    setActiveWebViewUri(null);
-  }, [effectiveWebViewUrl]);
+  const effectiveWebViewUrl = useMemo(() => {
+    return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+      expectedWebViewServiceUrl
+    )}`;
+  }, [expectedWebViewServiceUrl]);
+
+  // Keep source object strictly memoized per session so React/Fabric NEVER mutates `source` mid-login
+  const initialWebViewSource = useMemo(
+    () => ({ uri: effectiveWebViewUrl }),
+    [effectiveWebViewUrl]
+  );
+
+  const preloadedWebViewJs = useMemo(() => buildIncognitoWebViewPreloadScript(), []);
 
   const injectedWebViewJs = useMemo(
     () =>
@@ -838,20 +866,24 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         xnmOverride || xqmOverride
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
-        bridgeToken
+        bridgeToken,
+        expectedWebViewServiceUrl
       ),
-    [xnmOverride, xqmOverride, bridgeToken]
+    [xnmOverride, xqmOverride, bridgeToken, expectedWebViewServiceUrl]
   );
 
   const reloadWebView = (nextPref?: WebViewRoutePref) => {
+    clearPendingWebViewRedirectTimer();
     if (nextPref) setWebViewRoutePref(nextPref);
     setErrorText(null);
-    setActiveWebViewUri(null);
-    lastHttpUpgradeRef.current = { url: '', ts: 0 };
+    lastRedirectRewriteRef.current = { url: '', ts: 0 };
     setBridgeToken(generateSecureHex(16));
     setWebViewProgress(0.15);
     setWebViewKey((k) => k + 1);
   };
+
+  const waitingInitialAutoProbe =
+    webViewRoutePref === 'auto' && probedWebViewIsVpn === null && probingWebViewRoute;
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={handleClose}>
@@ -1356,57 +1388,110 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                 <Text style={styles.errorText}>{errorText}</Text>
               </View>
             )}
-            <WebView<object>
-              key={`${webViewKey}-${effectiveWebViewUrl}`}
-              ref={webViewRef}
-              source={{ uri: activeWebViewUri ?? effectiveWebViewUrl }}
-              incognito={true}
-              cacheEnabled={false}
-              saveFormDataDisabled={true}
-              sharedCookiesEnabled={false}
-              thirdPartyCookiesEnabled={false}
-              javaScriptEnabled={true}
-              domStorageEnabled={true}
-              scalesPageToFit={false}
-              setBuiltInZoomControls={false}
-              mixedContentMode="never"
-              injectedJavaScript={injectedWebViewJs}
-              onShouldStartLoadWithRequest={(req) => {
-                // Seamlessly upgrade GDOU server cleartext redirects (e.g. http://authserver.gdou.edu.cn/authserver/reAuthCheck/...) to HTTPS
-                const upgradedHttps = upgradeGdouHttpToHttps(req.url);
-                if (upgradedHttps) {
-                  const nowTs = Date.now();
-                  if (
-                    lastHttpUpgradeRef.current.url !== upgradedHttps ||
-                    nowTs - lastHttpUpgradeRef.current.ts > 1200
-                  ) {
-                    lastHttpUpgradeRef.current = { url: upgradedHttps, ts: nowTs };
-                    setErrorText(null);
-                    if (upgradedHttps.includes('reAuthLoginView')) {
-                      setWebViewStatus('第 1 步：请完成海大多因子安全验证（短信 / 企业微信）');
-                    }
-                    setActiveWebViewUri(upgradedHttps);
+            {waitingInitialAutoProbe ? (
+              <View style={styles.webViewProbeWrap}>
+                <ActivityIndicator size="large" color={COLORS.oceanPrimary} />
+                <Text style={styles.webViewProbeText}>
+                  正在自动识别校内直连 / 校外微门户通道...
+                </Text>
+              </View>
+            ) : (
+              <WebView<object>
+                key={`${webViewKey}-${effectiveWebViewUrl}`}
+                ref={webViewRef}
+                source={initialWebViewSource}
+                incognito={true}
+                cacheEnabled={false}
+                saveFormDataDisabled={true}
+                sharedCookiesEnabled={false}
+                thirdPartyCookiesEnabled={false}
+                javaScriptEnabled={true}
+                domStorageEnabled={true}
+                scalesPageToFit={false}
+                setBuiltInZoomControls={false}
+                mixedContentMode="never"
+                injectedJavaScriptBeforeContentLoaded={preloadedWebViewJs}
+                injectedJavaScript={injectedWebViewJs}
+                onShouldStartLoadWithRequest={(req) => {
+                  // Note: on iOS, react-native-webview computes `isTopFrame` via `[request.URL isEqual:request.mainDocumentURL]`,
+                  // which can report `false` during legitimate main-frame 302 redirects (e.g. login -> reAuthLoginView.do).
+                  // Only skip top-frame rewrite for non-auth subframes.
+                  const isNonAuthSubframe =
+                    req.isTopFrame === false &&
+                    Boolean(req.mainDocumentURL) &&
+                    req.mainDocumentURL !== req.url &&
+                    !/authserver|reAuth|jziotlogin|wfw\.gdou\.edu\.cn\/?(\?|$)/i.test(req.url);
+                  if (isNonAuthSubframe) {
+                    return isAllowedWebViewNavigationUrl(req.url);
                   }
-                  return false;
-                }
-                if (!isAllowedWebViewNavigationUrl(req.url)) {
-                  setErrorText(`已拦截非海大官方 HTTPS 链接：${req.url.slice(0, 60)}`);
-                  return false;
-                }
-                setErrorText((prev) =>
-                  prev && prev.startsWith('已拦截非海大官方') ? null : prev
-                );
-                return true;
-              }}
-              onLoadProgress={({ nativeEvent }) => {
-                setWebViewProgress(nativeEvent.progress);
-              }}
-              onLoadEnd={() => {
-                setWebViewProgress(1);
-              }}
-              onMessage={handleWebViewMessage}
-              style={styles.webView}
-            />
+
+                  // 1) Seamlessly upgrade GDOU server cleartext redirects (e.g. http://authserver.gdou.edu.cn/authserver/reAuthCheck/...) to HTTPS
+                  // 2) Normalize wfw /https://(authserver|jw).gdou.edu.cn/authserver/... -> /authserver/... so Path=/authserver cookies always attach
+                  const upgradedHttps = upgradeGdouHttpToHttps(req.url);
+                  const normalizedWfw = normalizeWfwAuthUrl(upgradedHttps ?? req.url);
+                  if (upgradedHttps || normalizedWfw) {
+                    const rawTarget = normalizedWfw ?? upgradedHttps!;
+                    const fallbackService = rawTarget.includes('wfw.gdou.edu.cn/authserver/')
+                      ? GDOU_JW_SSO_SERVICE
+                      : expectedWebViewServiceUrl;
+                    const targetUrl = ensureAuthLoginServiceParam(rawTarget, fallbackService);
+                    const nowTs = Date.now();
+                    if (
+                      lastRedirectRewriteRef.current.url !== targetUrl ||
+                      nowTs - lastRedirectRewriteRef.current.ts > 1000
+                    ) {
+                      lastRedirectRewriteRef.current = { url: targetUrl, ts: nowTs };
+                      setErrorText(null);
+                      if (targetUrl.includes('reAuthLoginView')) {
+                        setWebViewStatus(
+                          targetUrl.includes('wfw.gdou.edu.cn')
+                            ? '第 2 步：请完成校外教务多因子安全验证'
+                            : '第 1 步：请完成海大多因子安全验证（短信 / 企业微信）'
+                        );
+                      }
+                      // Let WKNavigationActionPolicyCancel settle first; navigate via JS location.replace without mutating `source` prop
+                      scheduleWebViewLocationReplace(targetUrl);
+                    }
+                    return false;
+                  }
+
+                  if (!isAllowedWebViewNavigationUrl(req.url)) {
+                    setErrorText(`已拦截非海大官方 HTTPS 链接：${req.url.slice(0, 60)}`);
+                    return false;
+                  }
+                  setErrorText((prev) =>
+                    prev && prev.startsWith('已拦截非海大官方') ? null : prev
+                  );
+                  return true;
+                }}
+                onError={(event) => {
+                  const { url, code, description } = event.nativeEvent;
+                  if (code === -999) {
+                    event.preventDefault();
+                    return;
+                  }
+                  const upgraded = upgradeGdouHttpToHttps(url || '');
+                  if (upgraded) {
+                    event.preventDefault();
+                    setErrorText(null);
+                    scheduleWebViewLocationReplace(upgraded);
+                    return;
+                  }
+                  event.preventDefault();
+                  setErrorText(
+                    `无痕网页加载异常（${description || `错误码 ${code}`}），请点右上角刷新或切换上方网络通道`
+                  );
+                }}
+                onLoadProgress={({ nativeEvent }) => {
+                  setWebViewProgress(nativeEvent.progress);
+                }}
+                onLoadEnd={() => {
+                  setWebViewProgress(1);
+                }}
+                onMessage={handleWebViewMessage}
+                style={styles.webView}
+              />
+            )}
           </View>
         )}
       </KeyboardAvoidingView>
@@ -1814,5 +1899,17 @@ const styles = StyleSheet.create({
   },
   webView: {
     flex: 1,
+  },
+  webViewProbeWrap: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    paddingHorizontal: 24,
+  },
+  webViewProbeText: {
+    fontSize: 13.5,
+    color: COLORS.textSecondary,
+    textAlign: 'center',
   },
 });

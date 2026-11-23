@@ -159,6 +159,9 @@ jobs:
             exit 1
           fi
           grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
+          grep -q "ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider" "$SWIFT_FILE"
+          grep -q "readBodyStream" "$SWIFT_FILE"
+          grep -q "if didRedirect {" "$SWIFT_FILE"
           grep -q "URLSessionConfiguration.ephemeral" "$SWIFT_FILE"
           grep -q "X-Gdou-Clear-Cookies-After" "$SWIFT_FILE"
           grep -q "GdouEphemeralNetworking.install()" ios/*/AppDelegate.swift

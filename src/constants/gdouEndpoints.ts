@@ -136,6 +136,52 @@ export function upgradeGdouHttpToHttps(rawUrl: string): string | null {
 }
 
 /**
+ * Normalize GDOU off-campus WebVPN (`wfw.gdou.edu.cn`) proxied authserver URLs such as
+ * `https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/...` or
+ * `https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/authserver/...` back to
+ * `https://wfw.gdou.edu.cn/authserver/...`.
+ *
+ * Why: `wfw.gdou.edu.cn` emits `JSESSIONID` and `route` with `Path=/authserver`.
+ * Requests whose path starts with `/https://...` omit both cookies, causing captcha,
+ * SMS dynamic codes, and MFA (`reAuthLoginView.do`) to lose session and reset to login.
+ */
+export function normalizeWfwAuthUrl(rawUrl: string): string | null {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(
+    /^https?:\/\/wfw\.gdou\.edu\.cn\/https?:\/\/(?:authserver|jw)\.gdou\.edu\.cn(\/authserver\/.*)$/i
+  );
+  if (!match) return null;
+  return `${GDOU_WFW_ORIGIN}${match[1]}`;
+}
+
+/**
+ * Ensure bare GDOU CAS `/authserver/login` bounces (e.g. after expired MFA redirect)
+ * preserve the target `?service=` query parameter so the user never lands stranded on
+ * CAS personal center instead of redirecting back into `wfw` or `jw`.
+ */
+export function ensureAuthLoginServiceParam(rawUrl: string, fallbackServiceUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed || !fallbackServiceUrl) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      parsed.protocol === 'https:' &&
+      (host === 'authserver.gdou.edu.cn' || host === 'wfw.gdou.edu.cn') &&
+      parsed.pathname === GDOU_AUTH_PATHS.login &&
+      !parsed.searchParams.get('service')
+    ) {
+      parsed.searchParams.set('service', fallbackServiceUrl);
+      return parsed.toString();
+    }
+  } catch {
+    // Return original string if URL parsing fails
+  }
+  return trimmed;
+}
+
+/**
  * Strictly validate WebView navigation URLs:
  * only allow `about:blank` or HTTPS URLs under `*.gdou.edu.cn`.
  */
