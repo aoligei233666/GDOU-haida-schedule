@@ -122,10 +122,20 @@ jobs:
   build-ios-ipa:
     name: Build iOS Unsigned IPA (Sideloadly / AltStore / TrollStore)
     needs: quality-gate
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Select latest Xcode 26+ toolchain (Swift >= 6.2 for Expo SDK 58)
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          LATEST_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$LATEST_XCODE" ]; then
+            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+          swift --version
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -137,7 +147,7 @@ jobs:
         run: npm ci
 
       - name: Prebuild iOS native project via Expo Config Plugin
-        run: npx expo prebuild --platform ios --clean
+        run: npx expo prebuild --platform ios --clean --no-install
 
       - name: Verify iOS zero-retention ephemeral networking survived prebuild
         run: |
@@ -187,6 +197,7 @@ jobs:
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \

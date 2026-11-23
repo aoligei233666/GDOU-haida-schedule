@@ -120,7 +120,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-android-apk.ps1 -CleanP
 产物输出至 `dist/haida-schedule-v1.3.1-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
 
 ### 3. 构建 iOS IPA
-- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码至 GitHub 后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`typecheck` + `verify`），再在 `macos-15` 执行 `npx expo prebuild --platform ios --clean`、`pod install` 与 `xcodebuild`，产出含完整 iOS 原生 `GdouEphemeralURLProtocol` 的未签名 `haida-schedule-v1.3.1-ios-unsigned.ipa`，下载后通过 **AltStore / Sideloadly / TrollStore** 安装。
+- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码至 GitHub 后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`typecheck` + `verify`），再在 `macos-26`（Xcode 26 / Swift 6.2+）执行 `npx expo prebuild --platform ios --clean --no-install`、`pod install` 与 `xcodebuild`，产出含完整 iOS 原生 `GdouEphemeralURLProtocol` 的未签名 `haida-schedule-v1.3.1-ios-unsigned.ipa`，下载后通过 **AltStore / Sideloadly / TrollStore** 安装。
 - **macOS 本机 Xcode 构建**：
   ```bash
   npx expo prebuild --platform ios --clean
