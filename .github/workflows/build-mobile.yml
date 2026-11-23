@@ -205,7 +205,7 @@ jobs:
             DEVELOPMENT_TEAM="" \
             build
 
-      - name: Package .app into installable unsigned .ipa
+      - name: Package .app into installable unsigned .ipa (ad-hoc signed for iOS 18 re-signing)
         working-directory: ios
         run: |
           APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
@@ -213,6 +213,17 @@ jobs:
             echo "ERROR: .app bundle not found"
             exit 1
           fi
+          # Bottom-up ad-hoc sign all embedded frameworks/dylibs first, then the main .app bundle,
+          # so every Mach-O binary has a valid LC_CODE_SIGNATURE slot & _CodeSignature/CodeResources
+          # for maximum compatibility with Feather / ESign / i4Tools / SideStore on iOS 18+.
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' fw; do
+              echo "Ad-hoc signing embedded binary: $fw"
+              codesign --force --sign - --timestamp=none "$fw"
+            done
+          fi
+          codesign --force --sign - --timestamp=none "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           OUT_NAME="haida-schedule-v${APP_VERSION}-ios-unsigned.ipa"
           rm -rf Payload "$OUT_NAME"
           mkdir -p Payload

@@ -6,6 +6,7 @@ import {
   Linking,
   Platform,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -24,8 +25,10 @@ import { parseLocalDateStrict } from '../services/scheduleParser';
 import { auditLocalStorageZeroCredentials } from '../services/storageService';
 import {
   checkForAppUpdate,
+  FEATHER_ADD_SOURCE_URL,
   formatBytesCompact,
   GITHUB_RELEASES_PAGE_URL,
+  IOS_ALTSTORE_SOURCE_URL,
   isTrustedGithubReleaseUrl,
   UpdateCheckResult,
 } from '../services/updateService';
@@ -144,6 +147,32 @@ export const SettingsScreen: React.FC<Props> = ({
         '无法打开浏览器',
         `请手动访问：\n${target}\n\n（${err instanceof Error ? err.message : String(err)}）`
       );
+    }
+  };
+
+  const handleOpenFeatherSource = async () => {
+    try {
+      await Linking.openURL(FEATHER_ADD_SOURCE_URL);
+    } catch {
+      Alert.alert(
+        '未检测到 Feather 客户端',
+        `请先在手机端安装 Feather 或轻松签（ESign），然后在「软件源 → 添加」粘贴以下源地址即可免电脑拉取更新：\n\n${IOS_ALTSTORE_SOURCE_URL}`,
+        [
+          { text: '关闭', style: 'cancel' },
+          { text: '分享/复制源地址', onPress: () => void handleShareIosSource() },
+        ]
+      );
+    }
+  };
+
+  const handleShareIosSource = async () => {
+    try {
+      await Share.share({
+        message: IOS_ALTSTORE_SOURCE_URL,
+        title: '海大课表 iOS 软件源地址（Feather / 轻松签 / SideStore）',
+      });
+    } catch {
+      Alert.alert('iOS 软件源地址', IOS_ALTSTORE_SOURCE_URL);
     }
   };
 
@@ -295,6 +324,35 @@ export const SettingsScreen: React.FC<Props> = ({
               )}
             </View>
           )}
+
+          {/* iOS On-Device Source (Feather / ESign / SideStore) */}
+          <View style={styles.iosSourceBox}>
+            <Text style={styles.iosSourceTitle}>
+              iOS 手机端免电脑软件源（Feather / 轻松签 / SideStore）
+            </Text>
+            <Text style={styles.iosSourceDesc}>
+              在手机端签名器添加本源后，发新版可直接拉取并签名覆盖更新，无需连接电脑：
+            </Text>
+            <Text style={styles.iosSourceUrl} selectable>
+              {IOS_ALTSTORE_SOURCE_URL}
+            </Text>
+            <View style={styles.iosSourceBtnRow}>
+              <TouchableOpacity
+                style={styles.iosSourceBtn}
+                onPress={() => void handleOpenFeatherSource()}
+              >
+                <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
+                <Text style={styles.iosSourceBtnText}>Feather 一键加源</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.iosSourceBtn}
+                onPress={() => void handleShareIosSource()}
+              >
+                <Ionicons name="copy-outline" size={14} color={COLORS.oceanPrimary} />
+                <Text style={styles.iosSourceBtnText}>复制 / 分享源地址</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
         </View>
 
         {/* Privacy Zero-Retention Audit Card */}
@@ -1084,5 +1142,57 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
     color: COLORS.white,
+  },
+  iosSourceBox: {
+    marginTop: 12,
+    backgroundColor: COLORS.bg,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.borderLight,
+    padding: 10,
+  },
+  iosSourceTitle: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+  },
+  iosSourceDesc: {
+    fontSize: 11.5,
+    color: COLORS.textSecondary,
+    lineHeight: 16,
+    marginTop: 3,
+  },
+  iosSourceUrl: {
+    fontSize: 11,
+    color: COLORS.oceanPrimary,
+    backgroundColor: COLORS.surface,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    marginTop: 6,
+  },
+  iosSourceBtnRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  iosSourceBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    height: 34,
+    borderRadius: 9,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.oceanLight,
+  },
+  iosSourceBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.oceanPrimary,
   },
 });

@@ -1,0 +1,53 @@
+{
+  "name": "海大课表官方源",
+  "identifier": "cn.edu.gdou.schedule.source",
+  "subtitle": "广东海洋大学课表 · 考试 · 绩点（凭据用完即删）",
+  "description": "面向广东海洋大学（GDOU）在校生的开源课表与教务助手，兼容 Feather、轻松签（ESign）、KSign、AltStore 与 SideStore 手机端直接安装与拉取更新。",
+  "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
+  "headerURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/splash-icon.png",
+  "website": "https://github.com/aoligei233666/GDOU-haida-schedule",
+  "tintColor": "#0284C7",
+  "featuredApps": [
+    "cn.edu.gdou.schedule"
+  ],
+  "apps": [
+    {
+      "name": "海大课表",
+      "bundleIdentifier": "cn.edu.gdou.schedule",
+      "developerName": "种果仁 (aoligei233666)",
+      "subtitle": "广东海洋大学无痕课表 · 考试 · 绩点 · 闹钟日历",
+      "localizedDescription": "面向广东海洋大学在校生的开源课表与教务助手。\n\n核心特性：\n• 凭据用完即删：双端纯内存无盘 Cookie 隔离，CSPRNG AES-128-CBC 加密，真实校验注销；\n• 双通道同步：支持极速直连（含校外微门户 MFA 两步鉴权）与官网无痕网页（自动升级海大 HTTPS 跳转）；\n• 精准课表时间：内置海大官方作息，自动拉取正方教务节次时间并对齐学期开学首周，支持自定义编辑；\n• 成绩与学分仪表盘、考试倒计时、系统日历同步、RFC 5545 .ics 导出与幂等课前闹钟。",
+      "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
+      "tintColor": "#0284C7",
+      "category": "utilities",
+      "version": "1.3.1",
+      "buildVersion": "4",
+      "versionDate": "2026-11-23",
+      "versionDescription": "v1.3.1：修复 Expo SDK 58 日历同步报错、官网无痕网页拦截海大 HTTP 跳转、校外微门户 MFA 后直连两步同步；按海大官方作息校准课程时间并支持自动拉取教务节次与自定义编辑；新增 GitHub Releases 检查更新与 iOS 手机端软件源；iOS IPA 采用完整 ad-hoc 签名槽位以兼容 Feather / 轻松签 / 爱思助手。",
+      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.3.1/haida-schedule-v1.3.1-ios-unsigned.ipa",
+      "size": 12582056,
+      "minOSVersion": "16.4",
+      "versions": [
+        {
+          "version": "1.3.1",
+          "buildVersion": "4",
+          "date": "2026-11-23",
+          "localizedDescription": "v1.3.1：\n1. 修复系统日历同步在 Expo SDK 58 下报错的问题，并固定东八区时间避免漂移；\n2. 修复官网无痕网页拦截海大 http://authserver.gdou.edu.cn/authserver/reAuthCheck/... 跳转；\n3. 修复校外微门户 MFA 通过后直连无法继续同步的问题（零密码留存两步验证）与第 4 步重复日志；\n4. 校准海大官方作息时间，自动拉取正方教务节次时间并对齐开学首周，支持自定义编辑；\n5. 新增 GitHub Releases 检查更新与 iOS 软件源（兼容 Feather / 轻松签 / SideStore）；\n6. iOS IPA 全量写入标准 ad-hoc 签名槽位并移除多余 APNs 推送权限，提升 iOS 18 重签安装兼容性。",
+          "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.3.1/haida-schedule-v1.3.1-ios-unsigned.ipa",
+          "size": 12582056,
+          "minOSVersion": "16.4"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",
+          "NSCalendarsFullAccessUsageDescription": "用于创建并同步“海大课表”专属系统日历及考试提醒",
+          "NSRemindersUsageDescription": "用于设置课前提醒与考前提醒事项"
+        }
+      },
+      "screenshotURLs": []
+    }
+  ],
+  "news": []
+}

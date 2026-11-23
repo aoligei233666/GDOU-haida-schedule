@@ -661,10 +661,35 @@ async function run() {
     (appJson.expo.plugins as unknown[]).includes('./plugins/withGdouZeroRetention'),
     'app.json must register ./plugins/withGdouZeroRetention'
   );
+  // Verify AltStore / Feather / ESign iOS software source JSON matches app.json
+  const iosSourceRaw = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'altstore-source.json'),
+    'utf8'
+  );
+  const iosSource = JSON.parse(iosSourceRaw) as {
+    apps: Array<{
+      bundleIdentifier: string;
+      version: string;
+      buildVersion: string;
+      downloadURL: string;
+      versions: Array<{ version: string; buildVersion: string; downloadURL: string; size: number }>;
+    }>;
+  };
+  assert.ok(Array.isArray(iosSource.apps) && iosSource.apps.length >= 1, 'altstore-source.json must list app');
+  const iosAppEntry = iosSource.apps[0];
+  assert.equal(iosAppEntry.bundleIdentifier, appJson.expo.ios.bundleIdentifier);
+  assert.equal(iosAppEntry.version, appJson.expo.version);
+  assert.equal(iosAppEntry.buildVersion, appJson.expo.ios.buildNumber);
+  assert.equal(iosAppEntry.versions[0]?.version, appJson.expo.version);
+  assert.equal(iosAppEntry.versions[0]?.buildVersion, appJson.expo.ios.buildNumber);
+  assert.equal(isTrustedGithubReleaseUrl(iosAppEntry.downloadURL), true);
+  assert.equal(isTrustedGithubReleaseUrl(iosAppEntry.versions[0]?.downloadURL), true);
+  assert.ok((iosAppEntry.versions[0]?.size ?? 0) > 1000000, 'altstore-source.json size must be realistic');
+
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pluginFn = require('../plugins/withGdouZeroRetention.js') as unknown;
   assert.equal(typeof pluginFn, 'function', 'Config plugin must export a function');
-  console.log(`   OK: Calendar legacy guard, updater, single-source version v${appJson.expo.version} & config plugin verified.`);
+  console.log(`   OK: Calendar legacy guard, updater, iOS source JSON, single-source version v${appJson.expo.version} & config plugin verified.`);
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

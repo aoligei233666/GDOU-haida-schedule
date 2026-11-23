@@ -17,6 +17,12 @@
       "supportsTablet": true,
       "infoPlist": {
         "CFBundleDisplayName": "海大课表",
+        "LSApplicationQueriesSchemes": [
+          "feather",
+          "esign",
+          "sidestore",
+          "altstore"
+        ],
         "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",
         "NSCalendarsFullAccessUsageDescription": "用于创建并同步“海大课表”专属系统日历及考试提醒",
         "NSRemindersUsageDescription": "用于设置课前提醒与考前提醒事项",

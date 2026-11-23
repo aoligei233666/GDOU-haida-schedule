@@ -4,6 +4,12 @@ export const GITHUB_LATEST_RELEASE_API_URL =
   'https://api.github.com/repos/aoligei233666/GDOU-haida-schedule/releases/latest';
 export const GITHUB_RELEASES_LIST_API_URL =
   'https://api.github.com/repos/aoligei233666/GDOU-haida-schedule/releases?per_page=5';
+export const IOS_ALTSTORE_SOURCE_URL =
+  'https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/altstore-source.json';
+export const FEATHER_ADD_SOURCE_URL = `feather://source/${IOS_ALTSTORE_SOURCE_URL}`;
+export const SIDESTORE_ADD_SOURCE_URL = `sidestore://source?url=${encodeURIComponent(
+  IOS_ALTSTORE_SOURCE_URL
+)}`;
 
 const UPDATE_CHECK_TIMEOUT_MS = 12_000;
 
