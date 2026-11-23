@@ -175,7 +175,12 @@ jobs:
         working-directory: ios
         run: |
           WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
-          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          SCHEME_FILE=$(find *.xcodeproj/xcshareddata/xcschemes -maxdepth 1 -name "*.xcscheme" 2>/dev/null | head -n 1)
+          if [ -n "$SCHEME_FILE" ]; then
+            SCHEME=$(basename "$SCHEME_FILE" .xcscheme)
+          else
+            SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          fi
           echo "Building workspace=$WORKSPACE scheme=$SCHEME"
           xcodebuild \
             -workspace "$WORKSPACE" \
@@ -186,6 +191,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
             build
 
       - name: Package .app into installable unsigned .ipa
