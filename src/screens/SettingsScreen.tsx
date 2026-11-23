@@ -165,12 +165,18 @@ export const SettingsScreen: React.FC<Props> = ({
                   styles.receiptLine,
                   {
                     fontWeight: '700',
-                    color: lastSyncReceipt.sessionLoggedOut ? COLORS.emerald : COLORS.coral,
+                    color:
+                      lastSyncReceipt.credentialsPurged &&
+                      lastSyncReceipt.sessionLoggedOut &&
+                      Boolean(lastSyncReceipt.storageCleaned) &&
+                      Boolean(lastSyncReceipt.cookiesFlushed)
+                        ? COLORS.emerald
+                        : COLORS.coral,
                     marginBottom: 4,
                   },
                 ]}
               >
-                凭据引用清除：{lastSyncReceipt.credentialsPurged ? '已校验' : '未确认'} · 远端注销：
+                凭据释放：{lastSyncReceipt.credentialsPurged ? '已校验' : '未确认'} · 远端注销：
                 {lastSyncReceipt.sessionLoggedOut
                   ? `已确认 (${lastSyncReceipt.logoutDetails?.succeeded ?? 1}/${
                       lastSyncReceipt.logoutDetails?.attempted ?? 1
@@ -178,6 +184,8 @@ export const SettingsScreen: React.FC<Props> = ({
                   : `未完全确认 (${lastSyncReceipt.logoutDetails?.succeeded ?? 0}/${
                       lastSyncReceipt.logoutDetails?.attempted ?? 0
                     })`}
+                {'\n'}存储清理：{lastSyncReceipt.storageCleaned ? '已校验' : '未确认'} · Cookie冲洗：
+                {lastSyncReceipt.cookiesFlushed ? '已校验' : '未确认'}
               </Text>
               {lastSyncReceipt.steps.map((s, idx) => (
                 <Text key={idx} style={styles.receiptLine}>

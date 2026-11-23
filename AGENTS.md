@@ -11,11 +11,12 @@
      - **Android**：RAM-only `GdouEphemeralCookieJar`、OkHttp 拦截器与头部剥离、WebView `CookieManager`/`WebStorage` 清理、`allowBackup=false`、`usesCleartextTraffic=false`、精简权限、`<queries> SET_ALARM`、R8 混淆与私有 release 签名配置。
      - **iOS**：`GdouEphemeralNetworking.swift`（`URLSessionConfiguration.ephemeral` + `GdouEphemeralURLProtocol` RAM-only Cookie 隔离、自定义头剥离、`route` Cookie 固定、HTTPS 升级与 `wfw` 重定向修复、`WKWebsiteDataStore` 清理）、`AppDelegate.swift` 启动挂载与 `NSAppTransportSecurity` 强制 HTTPS。
    - **严禁**把任何 `.keystore` / `.jks` / `keystore.properties` 提交进 Git，也**严禁**让 release 构建回退到 `debug.keystore`。
-3. **单一版本来源**：版本号统一由 `app.json`（`expo.version`、`android.versionCode`、`ios.buildNumber`）维护，与 `package.json` 保持同步，构建脚本与原生配置插件自动读取。
+3. **单一版本来源**：版本号统一由 `app.json`（`expo.version`、`android.versionCode`、`ios.buildNumber`）维护，与 `package.json` 及 `package-lock.json` 保持同步，构建脚本与原生配置插件自动读取。
 4. **隐私零留存红线**：
-   - 凭据不得落盘（`src/services/zeroRetentionSanitizer.ts` 递归剔除），不得留存在模块级全局变量中（MFA 期间也不保留明文密码）。
+   - 凭据不得落盘（`src/services/zeroRetentionSanitizer.ts` 键级 + 值级递归剔除与脱敏），不得留存在模块级全局变量中（MFA 期间也不保留明文密码）。
    - 缺失 `pwdEncryptSalt` 时必须抛错终止（`src/services/cryptoAes.ts`），严禁降级明文传输；随机数必须使用 CSPRNG（`expo-crypto` / WebCrypto）。
-   - `SyncReceipt.sessionLoggedOut` 与 `credentialsPurged` 必须是真实 HTTP/引用校验结果，严禁硬编码为 `true`。
+   - `SyncReceipt` 的 `credentialsPurged`、`sessionLoggedOut`、`storageCleaned`、`cookiesFlushed` 必须是真实校验结果，严禁硬编码为 `true`。
+   - `X-Gdou-*` 内部控制头仅在 React Native 原生运行时附加，并在 Android OkHttp 与 iOS URLProtocol 中无条件剥离。
    - 所有网络请求必须经由 `fetchWithTimeout`（带超时 + `AbortSignal` 可取消）。
    - 检测到账号冻结/锁定提示时立即熔断停止重试。
 

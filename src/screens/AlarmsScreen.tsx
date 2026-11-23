@@ -16,6 +16,7 @@ import {
   cancelScheduledAlarm,
   createWeeklyMorningWakeupAlarms,
   formatHourMinute,
+  mergeAlarmsIdempotently,
   setNativeAndroidSystemClockAlarm,
   toggleAlarmEnabled,
 } from '../services/alarmService';
@@ -63,22 +64,25 @@ export const AlarmsScreen: React.FC<Props> = ({
     }
     setBusy('wakeup');
     try {
-      const { created, skippedPast, failed, exactAlarmHint } =
+      const { created, replacedCount, skippedPast, failed, exactAlarmHint } =
         await createWeeklyMorningWakeupAlarms(
           courses,
           targetWeek,
           wakeupMinutes,
-          settings
+          settings,
+          alarms
         );
       if (created.length > 0) {
-        onAlarmsUpdated([...created, ...alarms]);
+        const { merged } = mergeAlarmsIdempotently(alarms, created);
+        onAlarmsUpdated(merged);
       }
+      const dedupeNote = replacedCount > 0 ? `（已覆盖更新 ${replacedCount} 条旧闹钟，无重复响铃）` : '';
       const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
       Alert.alert(
         '早起闹钟生成结果',
         created.length > 0
-          ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${
+          ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${dedupeNote}${
               skippedPast > 0 ? `，已跳过 ${skippedPast} 个过期时段` : ''
             }${failNote}。${hintNote}`
           : `第 ${targetWeek} 周所有首课时间均已过去，请切换到下一周再生成。`
@@ -98,22 +102,35 @@ export const AlarmsScreen: React.FC<Props> = ({
     setBusy('cal');
     try {
       let courseCount = 0;
+      let courseUpdated = 0;
       let examCount = 0;
+      let examUpdated = 0;
       let totalFailed = 0;
+      let calendarTitle = '海大课表 (GDOU)';
+      let isDedicated = true;
       if (courses.length > 0) {
         const cRes = await syncAllCoursesToCalendar(courses, settings, { replaceExisting: true });
-        courseCount = cRes.eventsCreated;
+        courseCount = cRes.eventsCreated + cRes.eventsUpdated;
+        courseUpdated = cRes.eventsUpdated;
         totalFailed += cRes.failed;
+        calendarTitle = cRes.calendarTitle;
+        isDedicated = cRes.isDedicated;
       }
       if (exams.length > 0) {
         const eRes = await syncExamsToCalendar(exams);
-        examCount = eRes.eventsCreated;
+        examCount = eRes.eventsCreated + eRes.eventsUpdated;
+        examUpdated = eRes.eventsUpdated;
         totalFailed += eRes.failed;
+        calendarTitle = eRes.calendarTitle;
+        isDedicated = eRes.isDedicated;
       }
+      const modeHint = isDedicated ? '' : '\n（系统限制新建独立日历，已自动兼容写入默认日历并按标签隔离）';
+      const updateNote =
+        courseUpdated + examUpdated > 0 ? `\n• 原位更新：${courseUpdated + examUpdated} 条` : '';
       const failNote = totalFailed > 0 ? `\n• 写入失败：${totalFailed} 条` : '';
       Alert.alert(
         '系统日历同步成功',
-        `已在手机系统日历中更新「海大课表 (GDOU)」：\n• 上课日程：${courseCount} 条\n• 考试日程：${examCount} 条${failNote}`
+        `已在系统日历「${calendarTitle}」中同步完成：${modeHint}\n• 上课日程：${courseCount} 条\n• 考试日程：${examCount} 条${updateNote}${failNote}`
       );
     } catch (err) {
       Alert.alert('日历同步失败', err instanceof Error ? err.message : String(err));
@@ -138,21 +155,33 @@ export const AlarmsScreen: React.FC<Props> = ({
   };
 
   const handleClearGdouCalendar = async () => {
-    Alert.alert('移除海大专属日历', '将仅删除由本应用创建的「海大课表 (GDOU)」日历，不影响您的其他系统日程。确定继续？', [
-      { text: '取消', style: 'cancel' },
-      {
-        text: '移除',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            const removed = await deleteGdouCalendar();
-            Alert.alert('完成', removed ? '已移除「海大课表 (GDOU)」系统日历。' : '未找到已创建的海大课表日历。');
-          } catch (err) {
-            Alert.alert('移除失败', err instanceof Error ? err.message : String(err));
-          }
+    Alert.alert(
+      '移除海大课表日程',
+      '将仅删除本应用创建的「海大课表 (GDOU)」专属日历及带海大课表标签的日程，绝不影响您的其他个人日程。确定继续？',
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '移除',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const { removedCalendar, removedEvents } = await deleteGdouCalendar();
+              if (removedCalendar || removedEvents > 0) {
+                const parts = [
+                  removedCalendar ? '已移除「海大课表 (GDOU)」专属日历' : '',
+                  removedEvents > 0 ? `已清理兼容日历中的 ${removedEvents} 条海大日程` : '',
+                ].filter(Boolean);
+                Alert.alert('清理完成', `${parts.join('，')}。`);
+              } else {
+                Alert.alert('未找到数据', '系统中未发现已导入的海大课表日历或日程。');
+              }
+            } catch (err) {
+              Alert.alert('移除失败', err instanceof Error ? err.message : String(err));
+            }
+          },
         },
-      },
-    ]);
+      ]
+    );
   };
 
   const handleToggleAlarm = async (alarm: AlarmRule, nextVal: boolean) => {

@@ -34,6 +34,7 @@ const VISIBLE_SECTIONS = 12;
 
 interface Props {
   courses: CourseItem[];
+  alarms: AlarmRule[];
   termLabel: string;
   settings: AppSettings;
   onOpenSync: () => void;
@@ -43,6 +44,7 @@ interface Props {
 
 export const ScheduleScreen: React.FC<Props> = ({
   courses,
+  alarms,
   termLabel,
   settings,
   onOpenSync,
@@ -95,7 +97,13 @@ export const ScheduleScreen: React.FC<Props> = ({
     setBusyAction('calendar');
     try {
       const res = await syncAllCoursesToCalendar(courses, settings, { replaceExisting: true });
+      const totalWritten = res.eventsCreated + res.eventsUpdated;
+      const modeNote = res.isDedicated
+        ? `专属日历「${res.calendarTitle}」`
+        : `系统日历「${res.calendarTitle}」（系统限制新建独立日历，已自动兼容写入并按标签隔离）`;
       const extra = [
+        res.eventsUpdated > 0 ? `原位更新 ${res.eventsUpdated} 条` : '',
+        res.eventsRemoved > 0 ? `清理旧日程 ${res.eventsRemoved} 条` : '',
         res.skippedUnparsed > 0 ? `已跳过 ${res.skippedUnparsed} 门时间未解析课程` : '',
         res.failed > 0 ? `有 ${res.failed} 条日程写入失败` : '',
       ]
@@ -103,8 +111,8 @@ export const ScheduleScreen: React.FC<Props> = ({
         .join('；');
       Alert.alert(
         '整学期课表已导入系统日历',
-        `已更新「海大课表 (GDOU)」专属日历（保留原有考试安排），写入 ${res.eventsCreated} 条上课日程，均已配置课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。${
-          extra ? `\n\n注：${extra}` : ''
+        `已同步至${modeNote}（保留原有考试安排），共处理 ${totalWritten} 条上课日程（新增 ${res.eventsCreated} 条），均已配置课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。${
+          extra ? `\n\n详情：${extra}` : ''
         }`
       );
     } catch (err) {
@@ -121,22 +129,24 @@ export const ScheduleScreen: React.FC<Props> = ({
     }
     setBusyAction('alarm');
     try {
-      const { created, skippedPast, failed, exactAlarmHint } =
+      const { created, replacedCount, skippedPast, failed, exactAlarmHint } =
         await createWeeklyMorningWakeupAlarms(
           courses,
           selectedWeek,
           settings.defaultWakeupMinutes,
-          settings
+          settings,
+          alarms
         );
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
+      const dedupeNote = replacedCount > 0 ? `（已自动覆盖更新 ${replacedCount} 条旧闹钟，无重复响铃）` : '';
       const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
       Alert.alert(
         '早起闹钟生成完成',
         created.length > 0
-          ? `已为第 ${selectedWeek} 周生成 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${
+          ? `已为第 ${selectedWeek} 周配置 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${
               skippedPast > 0 ? `，已自动跳过 ${skippedPast} 个过去时段` : ''
             }${failNote}。${hintNote}`
           : `第 ${selectedWeek} 周的所有课程时间均已过去，请切换到未来周次后生成。`
@@ -395,6 +405,7 @@ export const ScheduleScreen: React.FC<Props> = ({
         course={activeCourse}
         selectedWeek={selectedWeek}
         settings={settings}
+        existingAlarms={alarms}
         onClose={() => setActiveCourse(null)}
         onAlarmCreated={(alarm) => onAlarmsAdded([alarm])}
       />

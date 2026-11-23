@@ -61,6 +61,36 @@ export interface GradeItem {
   passed: boolean;
 }
 
+export interface TermGradeBreakdown {
+  termKey: string;
+  academicYear: string;
+  semester: string;
+  coursesCount: number;
+  passedCount: number;
+  failedCount: number;
+  creditsEarned: number;
+  creditsAttempted: number;
+  weightedGpa: number;
+  weightedAvgScore: number;
+}
+
+export interface ScoreTierBucket {
+  key: 'excellent' | 'good' | 'medium' | 'pass' | 'fail';
+  label: string;
+  rangeText: string;
+  count: number;
+  credits: number;
+  ratio: number; // 0..1
+}
+
+export interface CreditCategorySummary {
+  category: string;
+  credits: number;
+  attemptedCredits: number;
+  count: number;
+  share: number; // 0..1
+}
+
 export interface GpaSummary {
   totalCreditsEarned: number;
   totalCreditsAttempted: number;
@@ -69,14 +99,19 @@ export interface GpaSummary {
   weightedAvgScore: number;
   totalCourses: number;
   passedCourses: number;
+  failedCourses: number;
+  passRate: number; // 0..100
   hasEstimatedItems: boolean;
-  byCategory: { category: string; credits: number; count: number }[];
+  byCategory: CreditCategorySummary[];
+  byTerm: TermGradeBreakdown[];
+  scoreDistribution: ScoreTierBucket[];
 }
 
 export type AlarmKind = 'class' | 'morning_wakeup' | 'exam';
 
 export interface AlarmRule {
   id: string;
+  dedupeKey?: string;
   kind: AlarmKind;
   title: string;
   body: string;
@@ -118,6 +153,8 @@ export interface SyncReceipt {
   gradesCount: number;
   credentialsPurged: boolean;
   sessionLoggedOut: boolean;
+  storageCleaned: boolean;
+  cookiesFlushed: boolean;
   logoutDetails?: LogoutVerificationDetails;
   warnings?: string[];
   steps: string[];

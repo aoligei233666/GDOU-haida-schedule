@@ -24,9 +24,9 @@
   - **官网无痕网页**：内置 `incognito` 无痕沙箱 WebView，启用 `https://*.gdou.edu.cn` 导航白名单、每会话随机 `bridgeToken` 消息校验与严格 HTTPS（禁止混合内容与第三方 Cookie），支持滑块验证与手机验证码免密登录，同步完毕自动清空 `sessionStorage`/`localStorage`、缓存与原生 Cookie。
 - **双端原生零留存架构（Expo CNG Config Plugin 持久化）**：
   - 通过 `plugins/withGdouZeroRetention.js` 统一管理 Android 与 iOS 原生安全改造，即使 `expo prebuild --clean` 也能 100% 确定性重建；
-  - **Android 原生层**：纯内存无盘 HTTP 缓存的 `GdouEphemeralCookieJar`、OkHttp 内部控制头剥离、WebView `CookieManager`/`WebStorage` 清理、`allowBackup=false`、`usesCleartextTraffic=false`、精简权限、R8 混淆与私有签名；
-  - **iOS 原生层**：`GdouEphemeralNetworking.swift` 基于 `URLSessionConfiguration.ephemeral` + 自定义 `GdouEphemeralURLProtocol` 实现纯内存 Cookie 隔离、控制头剥离、`route` Cookie 固定、HTTPS 升级及 `WKWebsiteDataStore`/`HTTPCookieStorage.shared` 清理；
-  - **真实可审计回执**：`sessionLoggedOut` 与 `credentialsPurged` 均基于真实 HTTP 状态码与引用检查生成，并在「关于设置 -> 零留存实时核验」展示完整核验结果。
+  - **Android 原生层**：纯内存无盘 HTTP 缓存的 `GdouEphemeralCookieJar`、OkHttp 无条件 `X-Gdou-*` 控制头剥离、WebView `CookieManager`/`WebStorage` 清理、`allowBackup=false`、`usesCleartextTraffic=false`、精简权限、R8 混淆与私有签名；
+  - **iOS 原生层**：`GdouEphemeralNetworking.swift` 基于 `URLSessionConfiguration.ephemeral` + 自定义 `GdouEphemeralURLProtocol` 实现纯内存 Cookie 隔离、无条件控制头剥离、`route` Cookie 固定、HTTPS 升级及 `WKWebsiteDataStore`/`HTTPCookieStorage.shared` 清理；
+  - **真实四项可审计回执**：`credentialsPurged`、`sessionLoggedOut`、`storageCleaned`、`cookiesFlushed` 全部基于真实 HTTP / WebStorage / 引用校验生成，严禁硬编码；持久化层提供键级 + 值级敏感凭据脱敏与审计。
 
 ### 2. 课表查询
 - **周课表网格视图**（周一至周日，第 1–12 节）与 **今日课表速览**，切 Tab 自动保留滚动与周次状态；
@@ -37,16 +37,18 @@
 - 自动拉取教务考试信息：考试日期、起止时间、剩余天数倒计时、考场地点、座位号高亮、考核方式；
 - 支持手动补充随堂测验或自定义考试，一键同步至系统日历与考前闹钟。
 
-### 4. 绩点与学分查询
-- 一次性拉取全学程历年成绩单，自动汇总 **加权平均绩点（GPA）**、**必修课 GPA**、**加权均分**、**已修 / 总学分**与分类学分构成；
-- 对教务未返回官方绩点而本地按规则换算的课程清晰标注 **「估算」**。
+### 4. 成绩与学分总览仪表盘
+- 一次性拉取全学程历年成绩单，提供 **「成绩学分总览」** 与 **「课程成绩明细」** 双视图一键切换；
+- **总览视图**：汇总总平均绩点 GPA、必修课 GPA、加权均分、累计已获/修读学分、通过率、**各学期 GPA/学分对比总览表**（点击任意学期直达明细）、**课程性质学分构成条形图**、**成绩分段分布**（90+/80-89/70-79/60-69/未通过）以及高分优势课 / 待补考提示；
+- **明细视图**：支持按学期、课程性质、未通过筛选，按课程名/课程号/教师搜索，以及按学期/绩点/学分排序；对本地换算绩点清晰标注 **「估算」**。
 
-### 5. 幂等写入系统日历 & 严格 RFC 5545 `.ics` 导出
-- 原生调用 **iOS EventKit** 与 **Android CalendarProvider**，通过分类标签幂等更新「海大课表 (GDOU)」专属日历——同步课表**绝不误删考试**，重复导入单门课程或考试自动去重；
+### 5. 原位幂等写入系统日历 & 严格 RFC 5545 `.ics` 导出
+- 原生调用 **iOS EventKit** 与 **Android CalendarProvider**，显式配置 `isVisible`/`isSynced`/`timeZone`/`allowedReminders` 并自动修复旧版不可见日历；遇到限制新建本地日历的国产 Android ROM 或受限 iOS 账户时，自动兼容降级写入系统默认可写日历并严格按 `[GDOU-COURSE:...]` / `[GDOU-EXAM:...]` 标签隔离；
+- 使用 `updateEventAsync` 原位更新既有日程，顺序写入避免 SQLite 锁竞争，同步课表**绝不误删考试**，清理时绝不影响用户个人日程；
 - 严格遵循 **RFC 5545** 规范生成 `.ics`：75 字节 UTF-8 安全折行、UTC `DTSTAMP (Z)`、不随设备时区漂移的 `Asia/Shanghai` 时间与稳定 `UID`。
 
-### 6. 课程与考试闹钟
-- 批量事务化创建每周每日首课起床闹钟、单节课前提醒与考前双闹钟（前晚 20:00 + 考前出发），确保 UI 状态与系统通知一致；
+### 6. 幂等课程与考试闹钟
+- 基于确定性 `dedupeKey` 实现闹钟幂等更新：重复点击生成本周起床闹钟、单节课前提醒或考前双闹钟时，自动取消旧系统通知并覆盖更新，彻底避免重复响铃；
 - **Android** 支持通过 `android.intent.action.SET_ALARM` 直接写入系统原生时钟，并提供 Android 12+ 精确闹钟权限快捷检查入口。
 
 ---
@@ -56,7 +58,7 @@
 ```text
 GDOU-haida-schedule/
 ├── App.tsx                             # 应用主入口、ErrorBoundary 与状态保留 5 Tab 导航
-├── app.json                            # 单一版本号来源 (1.2.0) 与 Expo 插件配置
+├── app.json                            # 单一版本号来源 (1.3.0) 与 Expo 插件配置
 ├── plugins/
 │   └── withGdouZeroRetention.js        # Android + iOS 双端零留存原生配置插件 (CNG)
 ├── src/
@@ -111,10 +113,10 @@ npm start              # 启动 Expo 开发服务
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-android-apk.ps1 -CleanPrebuild
 ```
-产物输出至 `dist/haida-schedule-v1.2.0-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
+产物输出至 `dist/haida-schedule-v1.3.0-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
 
 ### 3. 构建 iOS IPA
-- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码至 GitHub 后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`typecheck` + `verify`），再在 `macos-15` 执行 `npx expo prebuild --platform ios --clean`、`pod install` 与 `xcodebuild`，产出含完整 iOS 原生 `GdouEphemeralURLProtocol` 的未签名 `haida-schedule-v1.2.0-ios-unsigned.ipa`，下载后通过 **AltStore / Sideloadly / TrollStore** 安装。
+- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码至 GitHub 后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`typecheck` + `verify`），再在 `macos-15` 执行 `npx expo prebuild --platform ios --clean`、`pod install` 与 `xcodebuild`，产出含完整 iOS 原生 `GdouEphemeralURLProtocol` 的未签名 `haida-schedule-v1.3.0-ios-unsigned.ipa`，下载后通过 **AltStore / Sideloadly / TrollStore** 安装。
 - **macOS 本机 Xcode 构建**：
   ```bash
   npx expo prebuild --platform ios --clean

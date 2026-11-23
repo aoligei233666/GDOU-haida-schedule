@@ -4,46 +4,135 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
 import { computeGpaSummary } from '../services/gradeParser';
 import { COLORS } from '../theme/colors';
-import { GradeItem } from '../types/models';
+import { GradeItem, ScoreTierBucket } from '../types/models';
 
 interface Props {
   grades: GradeItem[];
   onOpenSync: () => void;
 }
 
+type ViewTab = 'overview' | 'details';
+type SortMode = 'term' | 'gpa' | 'credit';
+
+const TIER_COLORS: Record<ScoreTierBucket['key'], { bar: string; bg: string; text: string }> = {
+  excellent: { bar: '#059669', bg: '#D1FAE5', text: '#065F46' },
+  good: { bar: '#0284C7', bg: '#E0F2FE', text: '#075985' },
+  medium: { bar: '#2563EB', bg: '#DBEAFE', text: '#1E40AF' },
+  pass: { bar: '#D97706', bg: '#FEF3C7', text: '#92400E' },
+  fail: { bar: '#DC2626', bg: '#FEE2E2', text: '#991B1B' },
+};
+
+function getGpaColor(gpa: number): { bg: string; text: string } {
+  if (gpa >= 4.0) return { bg: COLORS.emeraldLight, text: COLORS.emerald };
+  if (gpa >= 3.0) return { bg: COLORS.oceanLight, text: COLORS.oceanPrimary };
+  if (gpa >= 2.0) return { bg: COLORS.amberLight, text: COLORS.amber };
+  return { bg: COLORS.dangerLight, text: COLORS.danger };
+}
+
 export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
+  const [viewTab, setViewTab] = useState<ViewTab>('overview');
   const [selectedTerm, setSelectedTerm] = useState<string>('ALL');
+  const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [sortMode, setSortMode] = useState<SortMode>('term');
+  const [onlyFailed, setOnlyFailed] = useState<boolean>(false);
 
-  const terms = useMemo(() => {
-    const set = new Set<string>();
-    for (const g of grades) {
-      if (g.termKey) set.add(g.termKey);
-    }
-    return Array.from(set).sort((a, b) => b.localeCompare(a));
-  }, [grades]);
+  const overallSummary = useMemo(() => computeGpaSummary(grades), [grades]);
 
-  const filteredGrades = useMemo(() => {
+  const terms = useMemo(() => overallSummary.byTerm.map((t) => t.termKey), [overallSummary.byTerm]);
+
+  const categories = useMemo(
+    () => overallSummary.byCategory.map((c) => c.category),
+    [overallSummary.byCategory]
+  );
+
+  // Scope for detail list & hero summary when in detail tab
+  const termScopedGrades = useMemo(() => {
     if (selectedTerm === 'ALL') return grades;
     return grades.filter((g) => g.termKey === selectedTerm);
   }, [grades, selectedTerm]);
 
-  const summary = useMemo(() => computeGpaSummary(filteredGrades), [filteredGrades]);
-  const overallSummary = useMemo(() => computeGpaSummary(grades), [grades]);
+  const detailGrades = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const list = termScopedGrades.filter((g) => {
+      if (selectedCategory !== 'ALL' && g.courseCategory !== selectedCategory) return false;
+      if (onlyFailed && g.passed) return false;
+      if (q) {
+        const hay = `${g.courseName} ${g.courseCode} ${g.teacher} ${g.courseCategory}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    const sorted = [...list];
+    if (sortMode === 'gpa') {
+      sorted.sort((a, b) => b.gpa - a.gpa || (b.numericScore ?? 0) - (a.numericScore ?? 0));
+    } else if (sortMode === 'credit') {
+      sorted.sort((a, b) => b.credit - a.credit || b.gpa - a.gpa);
+    } else {
+      sorted.sort((a, b) => b.termKey.localeCompare(a.termKey) || b.credit - a.credit);
+    }
+    return sorted;
+  }, [termScopedGrades, selectedCategory, onlyFailed, searchQuery, sortMode]);
+
+  const activeSummary = useMemo(
+    () => (viewTab === 'overview' ? overallSummary : computeGpaSummary(termScopedGrades)),
+    [viewTab, overallSummary, termScopedGrades]
+  );
+
+  const failedGrades = useMemo(() => grades.filter((g) => !g.passed), [grades]);
+
+  const topCourses = useMemo(() => {
+    return [...grades]
+      .filter((g) => g.passed && g.credit > 0)
+      .sort((a, b) => b.gpa - a.gpa || b.credit - a.credit)
+      .slice(0, 3);
+  }, [grades]);
+
+  const requiredVsElective = useMemo(() => {
+    let requiredCredits = 0;
+    let otherCredits = 0;
+    for (const c of overallSummary.byCategory) {
+      if (c.category.includes('必修')) requiredCredits += c.credits;
+      else otherCredits += c.credits;
+    }
+    return {
+      required: Math.round(requiredCredits * 100) / 100,
+      other: Math.round(otherCredits * 100) / 100,
+    };
+  }, [overallSummary.byCategory]);
+
+  const jumpToTermDetails = (termKey: string) => {
+    setSelectedTerm(termKey);
+    setSelectedCategory('ALL');
+    setOnlyFailed(false);
+    setViewTab('details');
+  };
+
+  const jumpToCategoryDetails = (category: string) => {
+    setSelectedTerm('ALL');
+    setSelectedCategory(category);
+    setOnlyFailed(false);
+    setViewTab('details');
+  };
 
   return (
     <View style={styles.root}>
-      {/* Header */}
+      {/* Ocean Header + Hero KPI Dashboard */}
       <View style={styles.header}>
         <View style={styles.headerRow}>
-          <View>
-            <Text style={styles.headerTitle}>绩点与学分查询</Text>
-            <Text style={styles.headerSub}>
-              累计已获 {overallSummary.totalCreditsEarned} 学分 · 总平均绩点 {overallSummary.weightedGpa.toFixed(2)}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.headerTitle}>成绩与学分总览</Text>
+            <Text style={styles.headerSub} numberOfLines={1}>
+              {grades.length > 0
+                ? `共 ${overallSummary.byTerm.length} 学期 · ${overallSummary.totalCourses} 门课 · 已获 ${overallSummary.totalCreditsEarned}/${overallSummary.totalCreditsAttempted} 学分`
+                : '同步海大教务成绩单，自动汇总各学期绩点与学分'}
             </Text>
           </View>
           <TouchableOpacity style={styles.syncPill} onPress={onOpenSync}>
@@ -52,165 +141,567 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
           </TouchableOpacity>
         </View>
 
-        {/* GPA & Credits Hero Dashboard */}
         <View style={styles.heroGrid}>
           <View style={styles.heroCardPrimary}>
-            <Text style={styles.heroValueBig}>{summary.weightedGpa.toFixed(2)}</Text>
+            <Text style={styles.heroValueBig}>{activeSummary.weightedGpa.toFixed(2)}</Text>
             <Text style={styles.heroLabelPrimary}>
-              {selectedTerm === 'ALL' ? '总平均绩点 (GPA)' : '本学期平均绩点'}
+              {viewTab === 'overview' || selectedTerm === 'ALL' ? '总平均绩点 GPA' : '本学期 GPA'}
             </Text>
+            <Text style={styles.heroMiniSub}>均分 {activeSummary.weightedAvgScore.toFixed(1)}</Text>
           </View>
+
           <View style={styles.heroCard}>
-            <Text style={styles.heroValue}>{summary.totalCreditsEarned}</Text>
+            <Text style={styles.heroValue}>{activeSummary.totalCreditsEarned}</Text>
             <Text style={styles.heroLabel}>已获学分</Text>
+            <Text style={styles.heroMiniSub}>修读 {activeSummary.totalCreditsAttempted}</Text>
           </View>
+
           <View style={styles.heroCard}>
-            <Text style={styles.heroValue}>{summary.weightedAvgScore.toFixed(1)}</Text>
-            <Text style={styles.heroLabel}>加权平均分</Text>
+            <Text style={styles.heroValue}>{activeSummary.requiredGpa.toFixed(2)}</Text>
+            <Text style={styles.heroLabel}>必修 GPA</Text>
+            <Text style={styles.heroMiniSub}>必修 {requiredVsElective.required}分</Text>
           </View>
+
           <View style={styles.heroCard}>
-            <Text style={styles.heroValue}>{summary.requiredGpa.toFixed(2)}</Text>
-            <Text style={styles.heroLabel}>必修课绩点</Text>
+            <Text style={styles.heroValue}>
+              {activeSummary.totalCourses > 0 ? `${Math.round(activeSummary.passRate)}%` : '0%'}
+            </Text>
+            <Text style={styles.heroLabel}>通过率</Text>
+            <Text style={styles.heroMiniSub}>
+              {activeSummary.passedCourses}/{activeSummary.totalCourses} 门
+            </Text>
           </View>
         </View>
       </View>
 
-      {/* Term Filter Bar */}
-      {terms.length > 0 && (
-        <View style={styles.termBarWrap}>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.termBar}
+      {/* Segmented View Toggle: Overview vs Details */}
+      {grades.length > 0 && (
+        <View style={styles.segmentWrap}>
+          <TouchableOpacity
+            style={[styles.segmentBtn, viewTab === 'overview' && styles.segmentBtnActive]}
+            onPress={() => setViewTab('overview')}
           >
-            <TouchableOpacity
-              style={[styles.termChip, selectedTerm === 'ALL' && styles.termChipActive]}
-              onPress={() => setSelectedTerm('ALL')}
-            >
-              <Text style={[styles.termChipText, selectedTerm === 'ALL' && styles.termChipTextActive]}>
-                全部学期 ({grades.length})
-              </Text>
-            </TouchableOpacity>
-            {terms.map((t) => (
-              <TouchableOpacity
-                key={t}
-                style={[styles.termChip, selectedTerm === t && styles.termChipActive]}
-                onPress={() => setSelectedTerm(t)}
-              >
-                <Text style={[styles.termChipText, selectedTerm === t && styles.termChipTextActive]}>
-                  {t}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
+            <Ionicons
+              name="stats-chart"
+              size={15}
+              color={viewTab === 'overview' ? COLORS.white : COLORS.textSecondary}
+            />
+            <Text style={[styles.segmentText, viewTab === 'overview' && styles.segmentTextActive]}>
+              成绩学分总览
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.segmentBtn, viewTab === 'details' && styles.segmentBtnActive]}
+            onPress={() => setViewTab('details')}
+          >
+            <Ionicons
+              name="list"
+              size={16}
+              color={viewTab === 'details' ? COLORS.white : COLORS.textSecondary}
+            />
+            <Text style={[styles.segmentText, viewTab === 'details' && styles.segmentTextActive]}>
+              课程成绩明细 ({grades.length})
+            </Text>
+          </TouchableOpacity>
         </View>
       )}
 
-      <ScrollView contentContainerStyle={styles.content}>
-        {grades.length === 0 ? (
+      {grades.length === 0 ? (
+        <ScrollView contentContainerStyle={styles.content}>
           <View style={styles.emptyBox}>
-            <Ionicons name="ribbon-outline" size={46} color={COLORS.textMuted} />
+            <Ionicons name="ribbon-outline" size={48} color={COLORS.textMuted} />
             <Text style={styles.emptyTitle}>暂无成绩与学分数据</Text>
             <Text style={styles.emptyDesc}>
-              点击右上角「教务同步」登录海大教务系统，即可一次性拉取全部学期的课程成绩、学分与平均学分绩点（账号密码用完即删）。
+              点击右上角「教务同步」登录海大教务系统，即可一次性拉取全部学期的成绩单，自动生成分学期 GPA 趋势、学分结构与成绩分布总览（账号密码用完即删）。
             </Text>
             <TouchableOpacity style={styles.emptyBtn} onPress={onOpenSync}>
               <Ionicons name="cloud-download-outline" size={18} color={COLORS.white} />
               <Text style={styles.emptyBtnText}>立即无痕同步成绩与学分</Text>
             </TouchableOpacity>
           </View>
-        ) : (
-          <>
-            {/* Credit Category Breakdown */}
-            {summary.byCategory.length > 0 && (
-              <View style={styles.catCard}>
-                <View style={styles.catHeader}>
-                  <Ionicons name="pie-chart-outline" size={17} color={COLORS.oceanPrimary} />
-                  <Text style={styles.catTitle}>
-                    学分构成统计（通过 {summary.passedCourses}/{summary.totalCourses} 门 · 修读 {summary.totalCreditsAttempted} 学分）
-                  </Text>
-                </View>
-                <View style={styles.catGrid}>
-                  {summary.byCategory.map((item) => (
-                    <View key={item.category} style={styles.catPill}>
-                      <Text style={styles.catName}>{item.category}</Text>
-                      <Text style={styles.catValue}>
-                        {item.credits} 学分 ({item.count}门)
-                      </Text>
-                    </View>
-                  ))}
-                </View>
+        </ScrollView>
+      ) : viewTab === 'overview' ? (
+        /* ==================== OVERVIEW DASHBOARD ==================== */
+        <ScrollView contentContainerStyle={styles.content}>
+          {/* 1. Credit Progress Banner */}
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="ribbon-outline" size={18} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>学分完成总览</Text>
+              <Text style={styles.cardHeaderRight}>
+                {overallSummary.totalCreditsEarned} / {overallSummary.totalCreditsAttempted} 学分
+              </Text>
+            </View>
+
+            <View style={styles.creditSummaryRow}>
+              <View style={styles.creditStatPill}>
+                <Text style={styles.creditStatVal}>{overallSummary.totalCreditsEarned}</Text>
+                <Text style={styles.creditStatLbl}>累计实得学分</Text>
+              </View>
+              <View style={styles.creditStatPill}>
+                <Text style={[styles.creditStatVal, { color: COLORS.oceanPrimary }]}>
+                  {requiredVsElective.required}
+                </Text>
+                <Text style={styles.creditStatLbl}>必修课学分</Text>
+              </View>
+              <View style={styles.creditStatPill}>
+                <Text style={[styles.creditStatVal, { color: COLORS.emerald }]}>
+                  {requiredVsElective.other}
+                </Text>
+                <Text style={styles.creditStatLbl}>选修/其他学分</Text>
+              </View>
+              <View style={styles.creditStatPill}>
+                <Text
+                  style={[
+                    styles.creditStatVal,
+                    { color: overallSummary.failedCourses > 0 ? COLORS.danger : COLORS.emerald },
+                  ]}
+                >
+                  {overallSummary.failedCourses}
+                </Text>
+                <Text style={styles.creditStatLbl}>未通过门数</Text>
+              </View>
+            </View>
+
+            {/* Category Breakdown Bars */}
+            {overallSummary.byCategory.length > 0 && (
+              <View style={styles.barSection}>
+                <Text style={styles.subSectionHint}>按课程性质分布（点击任意行筛选明细）</Text>
+                {overallSummary.byCategory.map((cat) => {
+                  const pct = Math.round(cat.share * 100);
+                  const widthPct = Math.max(4, Math.min(100, pct));
+                  return (
+                    <TouchableOpacity
+                      key={cat.category}
+                      style={styles.barRow}
+                      onPress={() => jumpToCategoryDetails(cat.category)}
+                    >
+                      <View style={styles.barLabelRow}>
+                        <Text style={styles.barName} numberOfLines={1}>
+                          {cat.category}
+                        </Text>
+                        <Text style={styles.barValue}>
+                          {cat.credits} 学分 · {cat.count} 门 ({pct}%)
+                        </Text>
+                      </View>
+                      <View style={styles.progressTrack}>
+                        <View
+                          style={[
+                            styles.progressFill,
+                            {
+                              width: `${widthPct}%`,
+                              backgroundColor: cat.category.includes('必修')
+                                ? COLORS.oceanPrimary
+                                : COLORS.emerald,
+                            },
+                          ]}
+                        />
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
               </View>
             )}
+          </View>
 
-            {/* Estimated GPA disclosure when local grade-to-GPA fallback was used */}
-            {summary.hasEstimatedItems && (
+          {/* 2. Term-by-Term GPA & Credits Overview Table */}
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="calendar-outline" size={18} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>各学期绩点与学分总览</Text>
+              <Text style={styles.cardHeaderRight}>点击学期看明细</Text>
+            </View>
+
+            <View style={styles.termTableHeader}>
+              <Text style={[styles.termColLabel, { flex: 1.8 }]}>学期</Text>
+              <Text style={[styles.termColLabel, { flex: 0.9, textAlign: 'center' }]}>GPA</Text>
+              <Text style={[styles.termColLabel, { flex: 0.85, textAlign: 'center' }]}>均分</Text>
+              <Text style={[styles.termColLabel, { flex: 1.1, textAlign: 'right' }]}>学分 / 门</Text>
+            </View>
+
+            {overallSummary.byTerm.map((t) => {
+              const badge = getGpaColor(t.weightedGpa);
+              const gpaBarPct = Math.max(6, Math.min(100, Math.round((t.weightedGpa / 5) * 100)));
+              return (
+                <TouchableOpacity
+                  key={t.termKey}
+                  style={styles.termRow}
+                  onPress={() => jumpToTermDetails(t.termKey)}
+                >
+                  <View style={{ flex: 1.8, paddingRight: 6 }}>
+                    <Text style={styles.termRowName} numberOfLines={1}>
+                      {t.termKey}
+                    </Text>
+                    <View style={styles.miniGpaTrack}>
+                      <View
+                        style={[
+                          styles.miniGpaFill,
+                          { width: `${gpaBarPct}%`, backgroundColor: badge.text },
+                        ]}
+                      />
+                    </View>
+                  </View>
+
+                  <View style={{ flex: 0.9, alignItems: 'center' }}>
+                    <View style={[styles.gpaPill, { backgroundColor: badge.bg }]}>
+                      <Text style={[styles.gpaPillText, { color: badge.text }]}>
+                        {t.weightedGpa.toFixed(2)}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <Text style={[styles.termRowAvg, { flex: 0.85 }]}>
+                    {t.weightedAvgScore.toFixed(1)}
+                  </Text>
+
+                  <View style={{ flex: 1.1, alignItems: 'flex-end' }}>
+                    <Text style={styles.termRowCredits}>{t.creditsEarned} 分</Text>
+                    <Text style={styles.termRowSub}>
+                      {t.passedCount}/{t.coursesCount} 门
+                      {t.failedCount > 0 ? ` · ${t.failedCount}挂` : ''}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+
+          {/* 3. Score Tier Distribution */}
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="bar-chart-outline" size={18} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>成绩分段分布</Text>
+              <Text style={styles.cardHeaderRight}>共 {overallSummary.totalCourses} 门</Text>
+            </View>
+
+            <View style={{ gap: 9 }}>
+              {overallSummary.scoreDistribution.map((bucket) => {
+                const palette = TIER_COLORS[bucket.key];
+                const pct = Math.round(bucket.ratio * 100);
+                const widthPct = bucket.count > 0 ? Math.max(4, pct) : 0;
+                return (
+                  <View key={bucket.key} style={styles.tierRow}>
+                    <View style={[styles.tierBadge, { backgroundColor: palette.bg }]}>
+                      <Text style={[styles.tierBadgeText, { color: palette.text }]}>
+                        {bucket.label}
+                      </Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <View style={styles.barLabelRow}>
+                        <Text style={styles.tierRange}>{bucket.rangeText}</Text>
+                        <Text style={styles.barValue}>
+                          {bucket.count} 门 · {bucket.credits} 学分 ({pct}%)
+                        </Text>
+                      </View>
+                      <View style={styles.progressTrack}>
+                        <View
+                          style={[
+                            styles.progressFill,
+                            { width: `${widthPct}%`, backgroundColor: palette.bar },
+                          ]}
+                        />
+                      </View>
+                    </View>
+                  </View>
+                );
+              })}
+            </View>
+          </View>
+
+          {/* 4. Attention / Failed Courses Alert (if any) */}
+          {failedGrades.length > 0 && (
+            <View style={[styles.card, styles.failedCard]}>
+              <View style={styles.cardHeader}>
+                <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
+                <Text style={[styles.cardTitle, { color: COLORS.danger }]}>
+                  未通过 / 待关注课程 ({failedGrades.length} 门)
+                </Text>
+              </View>
+              {failedGrades.map((g) => (
+                <View key={g.id} style={styles.highlightRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.highlightName}>{g.courseName}</Text>
+                    <Text style={styles.highlightMeta}>
+                      {g.termKey} · {g.credit} 学分 · {g.examNature}
+                    </Text>
+                  </View>
+                  <Text style={[styles.highlightScore, { color: COLORS.danger }]}>
+                    {g.scoreText}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {/* 5. Top GPA Courses Highlight */}
+          {topCourses.length > 0 && (
+            <View style={styles.card}>
+              <View style={styles.cardHeader}>
+                <Ionicons name="trophy-outline" size={18} color={COLORS.amber} />
+                <Text style={styles.cardTitle}>高分优势课程 Top {topCourses.length}</Text>
+              </View>
+              {topCourses.map((g, idx) => (
+                <View key={g.id} style={styles.highlightRow}>
+                  <View style={styles.rankCircle}>
+                    <Text style={styles.rankText}>{idx + 1}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.highlightName} numberOfLines={1}>
+                      {g.courseName}
+                    </Text>
+                    <Text style={styles.highlightMeta}>
+                      {g.termKey} · {g.credit} 学分 · {g.courseCategory}
+                    </Text>
+                  </View>
+                  <View style={{ alignItems: 'flex-end' }}>
+                    <Text style={[styles.highlightScore, { color: COLORS.emerald }]}>
+                      {g.scoreText}
+                    </Text>
+                    <Text style={styles.highlightGpa}>GPA {g.gpa.toFixed(2)}</Text>
+                  </View>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {overallSummary.hasEstimatedItems && (
+            <View style={styles.estimateBanner}>
+              <Ionicons name="information-circle-outline" size={16} color={COLORS.amber} />
+              <Text style={styles.estimateText}>
+                注：部分课程因教务未返回官方绩点/百分制字段，已按五级制与海大常规规则估算，仅供参考，以教务系统官方成绩单为准。
+              </Text>
+            </View>
+          )}
+
+          <TouchableOpacity
+            style={styles.viewAllBtn}
+            onPress={() => {
+              setSelectedTerm('ALL');
+              setSelectedCategory('ALL');
+              setOnlyFailed(false);
+              setViewTab('details');
+            }}
+          >
+            <Text style={styles.viewAllBtnText}>查看全部 {grades.length} 门课程明细</Text>
+            <Ionicons name="arrow-forward" size={16} color={COLORS.oceanPrimary} />
+          </TouchableOpacity>
+        </ScrollView>
+      ) : (
+        /* ==================== DETAILS VIEW ==================== */
+        <>
+          {/* Term Filter Chips */}
+          <View style={styles.filterSection}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.termBar}
+            >
+              <TouchableOpacity
+                style={[styles.termChip, selectedTerm === 'ALL' && styles.termChipActive]}
+                onPress={() => setSelectedTerm('ALL')}
+              >
+                <Text
+                  style={[styles.termChipText, selectedTerm === 'ALL' && styles.termChipTextActive]}
+                >
+                  全部学期 ({grades.length})
+                </Text>
+              </TouchableOpacity>
+              {terms.map((t) => (
+                <TouchableOpacity
+                  key={t}
+                  style={[styles.termChip, selectedTerm === t && styles.termChipActive]}
+                  onPress={() => setSelectedTerm(t)}
+                >
+                  <Text style={[styles.termChipText, selectedTerm === t && styles.termChipTextActive]}>
+                    {t}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+
+            {/* Search & Sort Controls */}
+            <View style={styles.searchRow}>
+              <View style={styles.searchInputWrap}>
+                <Ionicons name="search-outline" size={15} color={COLORS.textMuted} />
+                <TextInput
+                  style={styles.searchInput}
+                  placeholder="搜索课程名 / 课程号 / 任课教师..."
+                  placeholderTextColor={COLORS.textMuted}
+                  value={searchQuery}
+                  onChangeText={setSearchQuery}
+                />
+                {searchQuery.length > 0 && (
+                  <TouchableOpacity onPress={() => setSearchQuery('')} hitSlop={8}>
+                    <Ionicons name="close-circle" size={16} color={COLORS.textMuted} />
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.sortBar}
+            >
+              {(
+                [
+                  { key: 'term', label: '按学期' },
+                  { key: 'gpa', label: '按绩点↓' },
+                  { key: 'credit', label: '按学分↓' },
+                ] as { key: SortMode; label: string }[]
+              ).map((opt) => (
+                <TouchableOpacity
+                  key={opt.key}
+                  style={[styles.miniChip, sortMode === opt.key && styles.miniChipActive]}
+                  onPress={() => setSortMode(opt.key)}
+                >
+                  <Text
+                    style={[styles.miniChipText, sortMode === opt.key && styles.miniChipTextActive]}
+                  >
+                    {opt.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+
+              {categories.length > 1 && (
+                <>
+                  <TouchableOpacity
+                    style={[styles.miniChip, selectedCategory === 'ALL' && styles.miniChipActiveAlt]}
+                    onPress={() => setSelectedCategory('ALL')}
+                  >
+                    <Text
+                      style={[
+                        styles.miniChipText,
+                        selectedCategory === 'ALL' && styles.miniChipTextActiveAlt,
+                      ]}
+                    >
+                      全部性质
+                    </Text>
+                  </TouchableOpacity>
+                  {categories.map((cat) => (
+                    <TouchableOpacity
+                      key={cat}
+                      style={[
+                        styles.miniChip,
+                        selectedCategory === cat && styles.miniChipActiveAlt,
+                      ]}
+                      onPress={() => setSelectedCategory(selectedCategory === cat ? 'ALL' : cat)}
+                    >
+                      <Text
+                        style={[
+                          styles.miniChipText,
+                          selectedCategory === cat && styles.miniChipTextActiveAlt,
+                        ]}
+                      >
+                        {cat}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </>
+              )}
+
+              {failedGrades.length > 0 && (
+                <TouchableOpacity
+                  style={[
+                    styles.miniChip,
+                    onlyFailed && { backgroundColor: COLORS.dangerLight, borderColor: COLORS.danger },
+                  ]}
+                  onPress={() => setOnlyFailed((v) => !v)}
+                >
+                  <Text style={[styles.miniChipText, onlyFailed && { color: COLORS.danger }]}>
+                    仅看未通过 ({failedGrades.length})
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </ScrollView>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.content}>
+            {activeSummary.hasEstimatedItems && (
               <View style={styles.estimateBanner}>
                 <Ionicons name="information-circle-outline" size={16} color={COLORS.amber} />
                 <Text style={styles.estimateText}>
-                  注：标注「估算」的课程因教务未返回官方绩点/百分制字段，已按五级制与海大常规规则估算，仅供参考，以教务系统官方成绩单为准。
+                  注：标注「估算」的课程因教务未返回官方绩点/百分制字段，已按五级制与海大常规规则估算，仅供参考。
                 </Text>
               </View>
             )}
 
-            {/* Course Grade Items */}
-            {filteredGrades.map((item) => {
-              const scoreBadge = !item.passed
-                ? { bg: COLORS.dangerLight, color: COLORS.danger }
-                : item.gpa >= 4.0
-                  ? { bg: COLORS.emeraldLight, color: COLORS.emerald }
-                  : item.gpa >= 3.0
-                    ? { bg: COLORS.oceanLight, color: COLORS.oceanPrimary }
-                    : { bg: COLORS.amberLight, color: COLORS.amber };
+            {detailGrades.length === 0 ? (
+              <View style={styles.emptyFilterBox}>
+                <Ionicons name="filter-outline" size={32} color={COLORS.textMuted} />
+                <Text style={styles.emptyFilterText}>没有符合当前筛选条件的课程成绩</Text>
+                <TouchableOpacity
+                  style={styles.resetFilterBtn}
+                  onPress={() => {
+                    setSelectedTerm('ALL');
+                    setSelectedCategory('ALL');
+                    setSearchQuery('');
+                    setOnlyFailed(false);
+                  }}
+                >
+                  <Text style={styles.resetFilterText}>重置筛选条件</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              detailGrades.map((item) => {
+                const scoreBadge = !item.passed
+                  ? { bg: COLORS.dangerLight, color: COLORS.danger }
+                  : item.gpa >= 4.0
+                    ? { bg: COLORS.emeraldLight, color: COLORS.emerald }
+                    : item.gpa >= 3.0
+                      ? { bg: COLORS.oceanLight, color: COLORS.oceanPrimary }
+                      : { bg: COLORS.amberLight, color: COLORS.amber };
 
-              return (
-                <View key={item.id} style={styles.gradeCard}>
-                  <View style={styles.gradeMain}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.courseName}>{item.courseName}</Text>
-                      <View style={styles.tagRow}>
-                        <View style={styles.tag}>
-                          <Text style={styles.tagText}>{item.courseCategory}</Text>
-                        </View>
-                        <View style={styles.tag}>
-                          <Text style={styles.tagText}>{item.credit} 学分</Text>
-                        </View>
-                        <View style={styles.tag}>
-                          <Text style={styles.tagText}>
-                            绩点 {item.gpa.toFixed(2)}
-                            {item.gpaEstimated ? ' (估算)' : ''}
-                          </Text>
-                        </View>
-                        {item.examNature && item.examNature !== '正常考试' && (
-                          <View style={[styles.tag, { backgroundColor: COLORS.coralLight }]}>
-                            <Text style={[styles.tagText, { color: COLORS.coral }]}>
-                              {item.examNature}
+                return (
+                  <View key={item.id} style={styles.gradeCard}>
+                    <View style={styles.gradeMain}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.courseName}>{item.courseName}</Text>
+                        <View style={styles.tagRow}>
+                          <View style={styles.tag}>
+                            <Text style={styles.tagText}>{item.courseCategory}</Text>
+                          </View>
+                          <View style={styles.tag}>
+                            <Text style={styles.tagText}>{item.credit} 学分</Text>
+                          </View>
+                          <View style={styles.tag}>
+                            <Text style={styles.tagText}>
+                              绩点 {item.gpa.toFixed(2)}
+                              {item.gpaEstimated ? ' (估算)' : ''}
                             </Text>
                           </View>
-                        )}
+                          {item.examNature && item.examNature !== '正常考试' && (
+                            <View style={[styles.tag, { backgroundColor: COLORS.coralLight }]}>
+                              <Text style={[styles.tagText, { color: COLORS.coral }]}>
+                                {item.examNature}
+                              </Text>
+                            </View>
+                          )}
+                        </View>
+                        <Text style={styles.termSubText}>
+                          {item.termKey}
+                          {item.courseCode ? ` · 代码 ${item.courseCode}` : ''}
+                          {item.teacher ? ` · ${item.teacher}` : ''}
+                        </Text>
                       </View>
-                      <Text style={styles.termSubText}>
-                        {item.termKey}
-                        {item.courseCode ? ` · 代码 ${item.courseCode}` : ''}
-                        {item.teacher ? ` · ${item.teacher}` : ''}
-                      </Text>
-                    </View>
 
-                    <View style={[styles.scoreBadge, { backgroundColor: scoreBadge.bg }]}>
-                      <Text style={[styles.scoreText, { color: scoreBadge.color }]}>
-                        {item.scoreText}
-                      </Text>
-                      <Text style={[styles.gpaMini, { color: scoreBadge.color }]}>
-                        GPA {item.gpa.toFixed(1)}
-                      </Text>
+                      <View style={[styles.scoreBadge, { backgroundColor: scoreBadge.bg }]}>
+                        <Text style={[styles.scoreText, { color: scoreBadge.color }]}>
+                          {item.scoreText}
+                        </Text>
+                        <Text style={[styles.gpaMini, { color: scoreBadge.color }]}>
+                          GPA {item.gpa.toFixed(1)}
+                        </Text>
+                      </View>
                     </View>
                   </View>
-                </View>
-              );
-            })}
-          </>
-        )}
-      </ScrollView>
+                );
+              })
+            )}
+          </ScrollView>
+        </>
+      )}
     </View>
   );
 };
@@ -230,6 +721,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 8,
   },
   headerTitle: {
     fontSize: 20,
@@ -237,7 +729,7 @@ const styles = StyleSheet.create({
     color: COLORS.white,
   },
   headerSub: {
-    fontSize: 12,
+    fontSize: 11.5,
     color: '#93C5FD',
     marginTop: 2,
   },
@@ -257,15 +749,15 @@ const styles = StyleSheet.create({
   },
   heroGrid: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 7,
     marginTop: 12,
   },
   heroCardPrimary: {
     flex: 1.35,
     backgroundColor: COLORS.oceanPrimary,
     borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -277,15 +769,15 @@ const styles = StyleSheet.create({
   heroLabelPrimary: {
     fontSize: 10.5,
     color: '#E0F2FE',
-    marginTop: 2,
+    marginTop: 1,
     fontWeight: '600',
   },
   heroCard: {
     flex: 1,
     backgroundColor: 'rgba(255,255,255,0.12)',
     borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 6,
+    paddingVertical: 9,
+    paddingHorizontal: 5,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -296,23 +788,297 @@ const styles = StyleSheet.create({
   },
   heroLabel: {
     fontSize: 10.5,
-    color: '#CBD5E1',
-    marginTop: 2,
+    color: '#E2E8F0',
+    marginTop: 1,
     fontWeight: '600',
   },
-  termBarWrap: {
+  heroMiniSub: {
+    fontSize: 9.5,
+    color: '#BAE6FD',
+    marginTop: 2,
+  },
+  segmentWrap: {
+    flexDirection: 'row',
     backgroundColor: COLORS.surface,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    gap: 8,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
-  termBar: {
-    paddingHorizontal: 14,
-    paddingVertical: 9,
+  segmentBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: COLORS.bg,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    gap: 6,
+  },
+  segmentBtnActive: {
+    backgroundColor: COLORS.oceanPrimary,
+    borderColor: COLORS.oceanPrimary,
+  },
+  segmentText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+  },
+  segmentTextActive: {
+    color: COLORS.white,
+  },
+  content: {
+    padding: 14,
+    paddingBottom: 32,
+    gap: 12,
+  },
+  card: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  failedCard: {
+    borderColor: '#FCA5A5',
+    backgroundColor: '#FFF5F5',
+  },
+  cardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 10,
+  },
+  cardTitle: {
+    fontSize: 14.5,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+    flex: 1,
+  },
+  cardHeaderRight: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: COLORS.textMuted,
+  },
+  creditSummaryRow: {
+    flexDirection: 'row',
+    gap: 7,
+    marginBottom: 12,
+  },
+  creditStatPill: {
+    flex: 1,
+    backgroundColor: COLORS.bg,
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.borderLight,
+  },
+  creditStatVal: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: COLORS.oceanDeep,
+  },
+  creditStatLbl: {
+    fontSize: 10,
+    color: COLORS.textSecondary,
+    marginTop: 2,
+    fontWeight: '600',
+  },
+  barSection: {
+    gap: 9,
+  },
+  subSectionHint: {
+    fontSize: 11,
+    color: COLORS.textMuted,
+    marginBottom: 2,
+  },
+  barRow: {
+    gap: 4,
+  },
+  barLabelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     gap: 8,
   },
+  barName: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    flex: 1,
+  },
+  barValue: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  progressTrack: {
+    height: 7,
+    borderRadius: 999,
+    backgroundColor: COLORS.borderLight,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  termTableHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingBottom: 7,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.borderLight,
+    marginBottom: 4,
+  },
+  termColLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.textMuted,
+  },
+  termRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 9,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLORS.borderLight,
+  },
+  termRowName: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  miniGpaTrack: {
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: COLORS.borderLight,
+    marginTop: 5,
+    overflow: 'hidden',
+  },
+  miniGpaFill: {
+    height: '100%',
+    borderRadius: 999,
+  },
+  gpaPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  gpaPillText: {
+    fontSize: 12.5,
+    fontWeight: '800',
+  },
+  termRowAvg: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    textAlign: 'center',
+  },
+  termRowCredits: {
+    fontSize: 12.5,
+    fontWeight: '800',
+    color: COLORS.oceanDeep,
+  },
+  termRowSub: {
+    fontSize: 10,
+    color: COLORS.textMuted,
+    marginTop: 1,
+  },
+  tierRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  tierBadge: {
+    width: 48,
+    paddingVertical: 5,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  tierBadgeText: {
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  tierRange: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: COLORS.textPrimary,
+  },
+  highlightRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 7,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: COLORS.borderLight,
+    gap: 10,
+  },
+  rankCircle: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: COLORS.amberLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rankText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLORS.amber,
+  },
+  highlightName: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  highlightMeta: {
+    fontSize: 11,
+    color: COLORS.textMuted,
+    marginTop: 2,
+  },
+  highlightScore: {
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  highlightGpa: {
+    fontSize: 10.5,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  viewAllBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.oceanTint,
+    borderWidth: 1,
+    borderColor: COLORS.oceanLight,
+    borderRadius: 12,
+    height: 44,
+    gap: 6,
+  },
+  viewAllBtnText: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: COLORS.oceanPrimary,
+  },
+  filterSection: {
+    backgroundColor: COLORS.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+    paddingBottom: 8,
+  },
+  termBar: {
+    paddingHorizontal: 14,
+    paddingTop: 9,
+    paddingBottom: 6,
+    gap: 6,
+  },
   termChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: 11,
+    paddingVertical: 5,
     borderRadius: 999,
     backgroundColor: COLORS.bg,
     borderWidth: 1,
@@ -331,10 +1097,59 @@ const styles = StyleSheet.create({
   termChipTextActive: {
     color: COLORS.white,
   },
-  content: {
-    padding: 14,
-    paddingBottom: 32,
-    gap: 10,
+  searchRow: {
+    paddingHorizontal: 14,
+    paddingVertical: 4,
+  },
+  searchInputWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.bg,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    height: 36,
+    gap: 6,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 13,
+    color: COLORS.textPrimary,
+    paddingVertical: 0,
+  },
+  sortBar: {
+    paddingHorizontal: 14,
+    paddingTop: 6,
+    gap: 6,
+  },
+  miniChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: COLORS.bg,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    marginRight: 6,
+  },
+  miniChipActive: {
+    backgroundColor: COLORS.oceanLight,
+    borderColor: COLORS.oceanPrimary,
+  },
+  miniChipActiveAlt: {
+    backgroundColor: COLORS.emeraldLight,
+    borderColor: COLORS.emerald,
+  },
+  miniChipText: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  miniChipTextActive: {
+    color: COLORS.oceanPrimary,
+  },
+  miniChipTextActiveAlt: {
+    color: COLORS.emerald,
   },
   emptyBox: {
     alignItems: 'center',
@@ -370,13 +1185,25 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: COLORS.white,
   },
-  catCard: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 14,
-    padding: 13,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginBottom: 2,
+  emptyFilterBox: {
+    alignItems: 'center',
+    paddingVertical: 38,
+    gap: 10,
+  },
+  emptyFilterText: {
+    fontSize: 13.5,
+    color: COLORS.textSecondary,
+  },
+  resetFilterBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: COLORS.oceanLight,
+  },
+  resetFilterText: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: COLORS.oceanPrimary,
   },
   estimateBanner: {
     flexDirection: 'row',
@@ -392,41 +1219,6 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     color: '#92400E',
     lineHeight: 16,
-  },
-  catHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    marginBottom: 8,
-  },
-  catTitle: {
-    fontSize: 12.5,
-    fontWeight: '700',
-    color: COLORS.oceanDeep,
-  },
-  catGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  catPill: {
-    backgroundColor: COLORS.oceanTint,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderWidth: 1,
-    borderColor: COLORS.oceanLight,
-  },
-  catName: {
-    fontSize: 11,
-    color: COLORS.textSecondary,
-    fontWeight: '600',
-  },
-  catValue: {
-    fontSize: 13,
-    color: COLORS.oceanDeep,
-    fontWeight: '800',
-    marginTop: 1,
   },
   gradeCard: {
     backgroundColor: COLORS.surface,

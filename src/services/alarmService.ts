@@ -3,6 +3,13 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 import { DAY_FULL_LABELS, getActivePeriods } from '../constants/gdouTimetable';
 import { AlarmRule, AppSettings, CourseItem, ExamItem } from '../types/models';
+import {
+  buildClassAlarmDedupeKey,
+  buildExamAlarmDedupeKey,
+  buildWakeupAlarmDedupeKey,
+  mergeAlarmsIdempotently,
+  resolveAlarmDedupeKey,
+} from './alarmDedupe';
 import { generateSecureHex } from './cryptoAes';
 import { parseExamIsoLocal } from './examParser';
 import {
@@ -13,6 +20,14 @@ import {
   isCourseSchedulable,
   parseLocalDateStrict,
 } from './scheduleParser';
+
+export {
+  buildClassAlarmDedupeKey,
+  buildExamAlarmDedupeKey,
+  buildWakeupAlarmDedupeKey,
+  mergeAlarmsIdempotently,
+  resolveAlarmDedupeKey,
+};
 
 export const ALARM_CHANNEL_ID = 'gdou-alarm-channel';
 
@@ -120,14 +135,28 @@ async function rollbackNotifications(notificationIds: string[]): Promise<void> {
   );
 }
 
+async function cancelExistingByDedupeKey(
+  existingAlarms: AlarmRule[] | undefined,
+  dedupeKey: string
+): Promise<number> {
+  if (!existingAlarms || existingAlarms.length === 0) return 0;
+  const matched = existingAlarms.filter((a) => resolveAlarmDedupeKey(a) === dedupeKey);
+  for (const old of matched) {
+    await cancelScheduledAlarm(old);
+  }
+  return matched.length;
+}
+
 /**
- * Schedule an advance reminder alarm for a specific course in a specific week.
+ * Idempotently schedule an advance reminder alarm for a specific course in a specific week.
+ * Cancels any existing OS notification for the same `(course.id, week)` before scheduling.
  */
 export async function createClassAlarm(
   course: CourseItem,
   week: number,
   advanceMinutes: number,
-  settings: AppSettings
+  settings: AppSettings,
+  existingAlarms?: AlarmRule[]
 ): Promise<AlarmRule> {
   if (!isCourseSchedulable(course)) {
     throw new Error(`《${course.name}》缺少有效上课时间信息，无法设定闹钟`);
@@ -141,6 +170,9 @@ export async function createClassAlarm(
   const dayDate = getDateForWeekAndDay(settings.termStartDate, week, course.dayOfWeek);
   const classStart = applyTimeToDate(dayDate, startText);
   const triggerDate = new Date(classStart.getTime() - advanceMinutes * 60 * 1000);
+  const dedupeKey = buildClassAlarmDedupeKey(course.id, week);
+
+  await cancelExistingByDedupeKey(existingAlarms, dedupeKey);
 
   const title = `⏰ 上课提醒：${course.name}`;
   const body = `${advanceMinutes} 分钟后上课（${startText}）· 地点：${course.location} · 教师：${course.teacher}`;
@@ -148,6 +180,7 @@ export async function createClassAlarm(
 
   return {
     id: `alarm-cls-${Date.now()}-${generateSecureHex(4)}`,
+    dedupeKey,
     kind: 'class',
     title,
     body,
@@ -163,16 +196,23 @@ export async function createClassAlarm(
 }
 
 /**
- * Smart Morning Wake-Up Generator (transactional batch):
- * Uses Promise.allSettled so only genuinely scheduled OS alarms are returned;
- * if any alarm fails to schedule and rollbackOnPartialError is enabled, rolls back partial notifications.
+ * Smart Morning Wake-Up Generator (idempotent transactional batch):
+ * Cancels any pre-existing wakeup alarms for the same `(week, dayOfWeek)` before scheduling
+ * so repeated taps update cleanly with zero duplicate OS notifications.
  */
 export async function createWeeklyMorningWakeupAlarms(
   courses: CourseItem[],
   week: number,
   wakeupMinutesBefore: number,
-  settings: AppSettings
-): Promise<{ created: AlarmRule[]; skippedPast: number; failed: number; exactAlarmHint?: string }> {
+  settings: AppSettings,
+  existingAlarms?: AlarmRule[]
+): Promise<{
+  created: AlarmRule[];
+  replacedCount: number;
+  skippedPast: number;
+  failed: number;
+  exactAlarmHint?: string;
+}> {
   if (!parseLocalDateStrict(settings.termStartDate)) {
     throw new Error(`开学基准日期无效（${settings.termStartDate}），请先在设置页修正`);
   }
@@ -182,8 +222,10 @@ export async function createWeeklyMorningWakeupAlarms(
   const nowMs = Date.now();
 
   let skippedPast = 0;
+  let replacedCount = 0;
   const tasks: {
     dayOfWeek: number;
+    dedupeKey: string;
     firstCourse: CourseItem;
     triggerDate: Date;
     title: string;
@@ -204,7 +246,18 @@ export async function createWeeklyMorningWakeupAlarms(
     const dayLabel = DAY_FULL_LABELS[dayOfWeek - 1] ?? `周${dayOfWeek}`;
     const title = `🌅 ${dayLabel}早起闹钟（首课 ${startText}）`;
     const body = `第 ${week} 周首节课：${firstCourse.name} · 教室 ${firstCourse.location}，距离上课还有 ${wakeupMinutesBefore} 分钟`;
-    tasks.push({ dayOfWeek, firstCourse, triggerDate, title, body });
+    tasks.push({
+      dayOfWeek,
+      dedupeKey: buildWakeupAlarmDedupeKey(week, dayOfWeek),
+      firstCourse,
+      triggerDate,
+      title,
+      body,
+    });
+  }
+
+  for (const t of tasks) {
+    replacedCount += await cancelExistingByDedupeKey(existingAlarms, t.dedupeKey);
   }
 
   const settled = await Promise.allSettled(
@@ -212,6 +265,7 @@ export async function createWeeklyMorningWakeupAlarms(
       const notificationId = await scheduleLocalAlarmNotification(t.title, t.body, t.triggerDate);
       const rule: AlarmRule = {
         id: `alarm-wake-${week}-${t.dayOfWeek}-${Date.now()}-${generateSecureHex(3)}`,
+        dedupeKey: t.dedupeKey,
         kind: 'morning_wakeup',
         title: t.title,
         body: t.body,
@@ -240,30 +294,38 @@ export async function createWeeklyMorningWakeupAlarms(
     }
   }
 
-  // If every single scheduling attempt failed, roll back and surface real error
   if (tasks.length > 0 && created.length === 0) {
     throw firstError instanceof Error ? firstError : new Error('系统闹钟通知注册失败');
   }
 
-  return { created, skippedPast, failed, exactAlarmHint };
+  return { created, replacedCount, skippedPast, failed, exactAlarmHint };
 }
 
 /**
- * Schedule dual exam alarms for each upcoming exam using Promise.allSettled
- * with automatic rollback if an exam fails completely, ensuring UI/OS parity.
+ * Schedule dual exam alarms for each upcoming exam idempotently:
+ * cancels any existing OS notifications for the same `(exam.id, eve|pre)` before rescheduling.
  */
 export async function createExamAlarms(
   exams: ExamItem[],
-  settings: AppSettings
-): Promise<{ created: AlarmRule[]; skipped: number; failed: number; exactAlarmHint?: string }> {
+  settings: AppSettings,
+  existingAlarms?: AlarmRule[]
+): Promise<{
+  created: AlarmRule[];
+  replacedCount: number;
+  skipped: number;
+  failed: number;
+  exactAlarmHint?: string;
+}> {
   const { exactAlarmHint } = await ensureNotificationPermission();
   const advanceMin = settings.examAdvanceMinutes || 90;
   const nowMs = Date.now();
   let skipped = 0;
+  let replacedCount = 0;
 
   interface ExamAlarmCandidate {
     exam: ExamItem;
     suffix: 'eve' | 'pre';
+    dedupeKey: string;
     triggerDate: Date;
     title: string;
     body: string;
@@ -293,6 +355,7 @@ export async function createExamAlarms(
       candidates.push({
         exam,
         suffix: 'eve',
+        dedupeKey: buildExamAlarmDedupeKey(exam.id, 'eve'),
         triggerDate: eve,
         title: `📝 明日考试提醒：${exam.courseName}`,
         body: `明天 ${exam.startTimeText} 开考 · 考场：${exam.location}${seatInfo}，请带好学生证/身份证与文具`,
@@ -305,6 +368,7 @@ export async function createExamAlarms(
       candidates.push({
         exam,
         suffix: 'pre',
+        dedupeKey: buildExamAlarmDedupeKey(exam.id, 'pre'),
         triggerDate: preExam,
         title: `🚨 考前出发闹钟：${exam.courseName}`,
         body: `距离开考还有 ${advanceMin} 分钟（${exam.startTimeText}）· 考场：${exam.location}${seatInfo}`,
@@ -315,11 +379,16 @@ export async function createExamAlarms(
     }
   }
 
+  for (const c of candidates) {
+    replacedCount += await cancelExistingByDedupeKey(existingAlarms, c.dedupeKey);
+  }
+
   const settled = await Promise.allSettled(
     candidates.map(async (c) => {
       const notificationId = await scheduleLocalAlarmNotification(c.title, c.body, c.triggerDate);
       const rule: AlarmRule = {
         id: `alarm-exam-${c.suffix}-${c.exam.id}-${Date.now()}-${generateSecureHex(3)}`,
+        dedupeKey: c.dedupeKey,
         kind: 'exam',
         title: c.title,
         body: c.body,
@@ -356,7 +425,7 @@ export async function createExamAlarms(
     throw firstError instanceof Error ? firstError : new Error('系统考试闹钟注册失败');
   }
 
-  return { created, skipped, failed, exactAlarmHint };
+  return { created, replacedCount, skipped, failed, exactAlarmHint };
 }
 
 export async function cancelScheduledAlarm(alarm: AlarmRule): Promise<void> {

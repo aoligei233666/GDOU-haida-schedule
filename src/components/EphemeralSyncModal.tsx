@@ -100,7 +100,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const captchaSessionKeyRef = useRef<string>('');
   const activeAbortRef = useRef<AbortController | null>(null);
   const bridgeTokenRef = useRef<string>(bridgeToken);
+  const autoReinitCountRef = useRef<number>(0);
+  const webViewCompletingRef = useRef<boolean>(false);
   bridgeTokenRef.current = bridgeToken;
+
+  const MAX_AUTO_REINIT = 2;
 
   const abortActiveRequests = () => {
     if (activeAbortRef.current) {
@@ -128,20 +132,38 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
     captchaSessionKeyRef.current = '';
   };
 
-  const cleanupWebViewStorage = () => {
+  const cleanupWebViewStorage = async (
+    cookieFlushTimeoutMs = 8_000
+  ): Promise<{
+    webViewStorageCleared: boolean;
+    cookiesFlushed: boolean;
+  }> => {
+    let webViewStorageCleared = false;
     try {
-      webViewRef.current?.injectJavaScript(
-        'try{sessionStorage.clear();localStorage.clear();}catch(e){}true;'
-      );
-      webViewRef.current?.clearCache?.(true);
-    } catch {
-      // Ignore if WebView already unmounted
+      const wv = webViewRef.current;
+      if (wv) {
+        wv.injectJavaScript(
+          'try{sessionStorage.clear();localStorage.clear();}catch(e){}true;'
+        );
+        if (typeof wv.clearCache === 'function') {
+          wv.clearCache(true);
+        }
+        webViewStorageCleared = true;
+      }
+    } catch (err) {
+      console.warn('WebView local storage cleanup warning:', err);
+      webViewStorageCleared = false;
     }
-    void flushNativeEphemeralCookies();
+    const cookiesFlushed = await flushNativeEphemeralCookies(GDOU_AUTH_ORIGIN, {
+      timeoutMs: cookieFlushTimeoutMs,
+    });
+    return { webViewStorageCleared, cookiesFlushed };
   };
 
   useEffect(() => {
     if (visible) {
+      autoReinitCountRef.current = 0;
+      webViewCompletingRef.current = false;
       setErrorText(null);
       setStatusLog([]);
       setMfaChallenge(null);
@@ -165,13 +187,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
           mfaChallenge.session.isWebVpn
         );
       }
-      if (mode === 'webview') {
-        cleanupWebViewStorage();
+      if (mode === 'webview' && !webViewCompletingRef.current) {
+        void cleanupWebViewStorage();
       }
       wipeFormInputs(false);
       setSyncing(false);
       setMfaChallenge(null);
       setSession(null);
+      autoReinitCountRef.current = 0;
     }
     return () => {
       abortActiveRequests();
@@ -436,6 +459,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         setSession(null);
         return;
       }
+      if (autoReinitCountRef.current >= MAX_AUTO_REINIT) {
+        setSession(null);
+        setErrorText(
+          `${msg}（已达自动重连上限 ${MAX_AUTO_REINIT} 次，请点击上方“重新连接”或切换「官网无痕网页」）`
+        );
+        return;
+      }
+      autoReinitCountRef.current += 1;
       const needForceCaptcha = msg.includes('验证码') || msg.includes('动态码');
       await initDirectSession(trimmedUser, true, needForceCaptcha);
       setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 120);
@@ -511,6 +542,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         scheduleRaw?: unknown;
         examRaw?: unknown;
         gradeRaw?: unknown;
+        storageCleaned?: boolean;
         logoutDetails?: LogoutVerificationDetails;
       };
 
@@ -530,71 +562,101 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
       }
 
       if (data.type === 'SYNC_COMPLETE') {
-        const parsedSchedule = parseZfScheduleResponse(data.scheduleRaw);
-        const parsedExams = parseZfExamResponse(data.examRaw);
-        const parsedGrades = parseZfGradesResponse(data.gradeRaw);
-        const derived = deriveCurrentTermParams();
-        const xnm = data.xnm || derived.xnm;
-        const xqm = data.xqm || derived.xqm;
-        const semText = xqm === '3' ? '第1学期' : xqm === '12' ? '第2学期' : '当前学期';
-        const yearNum = parseInt(xnm, 10);
-        const fallbackLabel = Number.isFinite(yearNum)
-          ? `${yearNum}-${yearNum + 1}学年 ${semText}`
-          : derived.label;
+        if (webViewCompletingRef.current) return;
+        webViewCompletingRef.current = true;
+        setWebViewStatus('数据提取完成，正在校验注销并清理容器缓存与 Cookie...');
 
-        // Clean up WebView storage + native cookies immediately upon receiving data
-        cleanupWebViewStorage();
+        void (async () => {
+          try {
+            const parsedSchedule = parseZfScheduleResponse(data.scheduleRaw);
+            const parsedExams = parseZfExamResponse(data.examRaw);
+            const parsedGrades = parseZfGradesResponse(data.gradeRaw);
+            const derived = deriveCurrentTermParams();
+            const xnm = data.xnm || derived.xnm;
+            const xqm = data.xqm || derived.xqm;
+            const semText = xqm === '3' ? '第1学期' : xqm === '12' ? '第2学期' : '当前学期';
+            const yearNum = parseInt(xnm, 10);
+            const fallbackLabel = Number.isFinite(yearNum)
+              ? `${yearNum}-${yearNum + 1}学年 ${semText}`
+              : derived.label;
 
-        const logoutDetails: LogoutVerificationDetails = data.logoutDetails ?? {
-          attempted: 0,
-          succeeded: 0,
-          casLoggedOut: false,
-          failedEndpoints: ['未收到注销回执'],
-        };
-        const sessionLoggedOut =
-          logoutDetails.casLoggedOut &&
-          logoutDetails.succeeded > 0 &&
-          logoutDetails.failedEndpoints.length === 0;
+            // Await WebView storage + native cookie flush BEFORE unmounting modal
+            wipeFormInputs(false);
+            const cleanupRes = await cleanupWebViewStorage();
+            const storageCleaned =
+              Boolean(data.storageCleaned) && cleanupRes.webViewStorageCleared;
+            const cookiesFlushed = cleanupRes.cookiesFlushed;
+            // WebView mode never receives user credentials in React JS state; verify form fields are clean
+            const credentialsPurged =
+              captchaSessionKeyRef.current === '' && cleanupRes.webViewStorageCleared;
 
-        const warnings = [...parsedSchedule.warnings];
-        if (!sessionLoggedOut) {
-          warnings.push(
-            `无痕网页注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项，本地 WebView 容器与 Cookie 已清理，但建议确认官网退出状态`
-          );
-        }
+            const logoutDetails: LogoutVerificationDetails = data.logoutDetails ?? {
+              attempted: 0,
+              succeeded: 0,
+              casLoggedOut: false,
+              failedEndpoints: ['未收到注销回执'],
+            };
+            const sessionLoggedOut =
+              logoutDetails.casLoggedOut &&
+              logoutDetails.succeeded > 0 &&
+              logoutDetails.failedEndpoints.length === 0;
 
-        const result: SyncResult = {
-          courses: parsedSchedule.courses,
-          exams: parsedExams,
-          grades: parsedGrades,
-          termLabel: parsedSchedule.termLabel || fallbackLabel,
-          academicYear: xnm,
-          semesterCode: xqm,
-          receipt: {
-            syncedAtIso: new Date().toISOString(),
-            mode: 'webview',
-            networkRoute: data.isWebVpn === false ? 'campus-direct' : 'wfw-webvpn',
-            termLabel: parsedSchedule.termLabel || fallbackLabel,
-            coursesCount: parsedSchedule.courses.length,
-            examsCount: parsedExams.length,
-            gradesCount: parsedGrades.length,
-            credentialsPurged: true,
-            sessionLoggedOut,
-            logoutDetails,
-            warnings: warnings.length > 0 ? warnings : undefined,
-            steps: [
-              '1. 已在独立无痕沙箱 (incognito WebView + 域名白名单) 打开海大教务入口',
-              '2. 用户通过官方统一身份认证完成一次性验证',
-              `3. 同源拉取课表 ${parsedSchedule.courses.length} 项、考试 ${parsedExams.length} 场、成绩 ${parsedGrades.length} 门`,
-              sessionLoggedOut
-                ? `4. 已向教务与认证中心确认注销（${logoutDetails.succeeded}/${logoutDetails.attempted} 项 HTTP 确认）并销毁容器及 WebStorage`
-                : `4. 本地容器与 WebStorage 已清理，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议核对官网退出）`,
-            ],
-          },
-        };
+            const warnings = [...parsedSchedule.warnings];
+            if (!sessionLoggedOut) {
+              warnings.push(
+                `无痕网页远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项，建议核对官网退出状态`
+              );
+            }
+            if (!storageCleaned) {
+              warnings.push('WebView 本地存储清理未能全部确认，建议在「关于设置」复核零留存状态');
+            }
+            if (!cookiesFlushed) {
+              warnings.push('原生 Cookie 冲洗请求未收到 2xx/3xx 确认（可能受网络波动影响）');
+            }
 
-        onSyncSuccess(result);
-        onClose();
+            const result: SyncResult = {
+              courses: parsedSchedule.courses,
+              exams: parsedExams,
+              grades: parsedGrades,
+              termLabel: parsedSchedule.termLabel || fallbackLabel,
+              academicYear: xnm,
+              semesterCode: xqm,
+              receipt: {
+                syncedAtIso: new Date().toISOString(),
+                mode: 'webview',
+                networkRoute: data.isWebVpn === false ? 'campus-direct' : 'wfw-webvpn',
+                termLabel: parsedSchedule.termLabel || fallbackLabel,
+                coursesCount: parsedSchedule.courses.length,
+                examsCount: parsedExams.length,
+                gradesCount: parsedGrades.length,
+                credentialsPurged,
+                sessionLoggedOut,
+                storageCleaned,
+                cookiesFlushed,
+                logoutDetails,
+                warnings: warnings.length > 0 ? warnings : undefined,
+                steps: [
+                  '1. 已在独立无痕沙箱 (incognito WebView + 域名白名单) 打开海大教务入口',
+                  '2. 用户通过官方统一身份认证完成一次性验证',
+                  `3. 同源拉取课表 ${parsedSchedule.courses.length} 项、考试 ${parsedExams.length} 场、成绩 ${parsedGrades.length} 门`,
+                  sessionLoggedOut && storageCleaned && cookiesFlushed
+                    ? `4. 已确认注销（${logoutDetails.succeeded}/${logoutDetails.attempted} 项 HTTP 确认）、清空 WebStorage 并完成原生 Cookie 冲洗`
+                    : `4. 清理回执：远端注销 ${logoutDetails.succeeded}/${logoutDetails.attempted} · WebStorage=${
+                        storageCleaned ? '已清空' : '未确认'
+                      } · Cookie冲洗=${cookiesFlushed ? '已确认' : '未确认'}`,
+                ],
+              },
+            };
+
+            onSyncSuccess(result);
+            onClose();
+          } catch (err) {
+            webViewCompletingRef.current = false;
+            setErrorText(
+              `无痕网页结果解析失败：${err instanceof Error ? err.message : String(err)}`
+            );
+          }
+        })();
       }
     } catch {
       // Ignore malformed messages
@@ -608,14 +670,21 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
   const handleClose = () => {
     abortActiveRequests();
     clearPendingMfaSecret();
-    if (mode === 'webview') {
-      cleanupWebViewStorage();
-    } else if (syncing || mfaChallenge) {
-      void flushNativeEphemeralCookies();
-    }
+    const shouldCleanWebView = mode === 'webview' && !webViewCompletingRef.current;
+    const shouldFlushDirect = mode === 'direct' && (syncing || Boolean(mfaChallenge));
     setSyncing(false);
     setMfaChallenge(null);
     wipeFormInputs(false);
+    if (shouldCleanWebView) {
+      webViewCompletingRef.current = true;
+      void cleanupWebViewStorage(2_500).finally(() => {
+        onClose();
+      });
+      return;
+    }
+    if (shouldFlushDirect) {
+      void flushNativeEphemeralCookies();
+    }
     onClose();
   };
 
@@ -745,7 +814,13 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
                   </Text>
                 </View>
               ) : (
-                <TouchableOpacity onPress={() => void initDirectSession(username)} style={styles.rowCenter}>
+                <TouchableOpacity
+                  onPress={() => {
+                    autoReinitCountRef.current = 0;
+                    void initDirectSession(username);
+                  }}
+                  style={styles.rowCenter}
+                >
                   <Ionicons name="refresh" size={18} color={COLORS.coral} />
                   <Text style={[styles.routeText, { color: COLORS.coral }]}>
                     点击重新连接海大认证入口

@@ -22,6 +22,7 @@ import { AlarmRule, AppSettings, ExamItem } from '../types/models';
 
 interface Props {
   exams: ExamItem[];
+  alarms: AlarmRule[];
   settings: AppSettings;
   onOpenSync: () => void;
   onAddManualExam: (exam: ExamItem) => void;
@@ -31,6 +32,7 @@ interface Props {
 
 export const ExamsScreen: React.FC<Props> = ({
   exams,
+  alarms,
   settings,
   onOpenSync,
   onAddManualExam,
@@ -68,10 +70,11 @@ export const ExamsScreen: React.FC<Props> = ({
     setBusy(true);
     try {
       const res = await syncExamsToCalendar(exams);
+      const total = res.eventsCreated + res.eventsUpdated;
       const failNote = res.failed > 0 ? `（另有 ${res.failed} 场写入失败）` : '';
       Alert.alert(
         '考试已导入系统日历',
-        `已写入 ${res.eventsCreated} 场考试至「海大课表 (GDOU)」日历（已自动去重并保留原有课程），均已设置考前 1 天 + 考前 1 小时双重提醒${failNote}。`
+        `已同步 ${total} 场考试至「${res.calendarTitle}」（新增 ${res.eventsCreated} 场，原位更新 ${res.eventsUpdated} 场，保留原有课程），均已设置考前 1 天 + 考前 1 小时双重提醒${failNote}。`
       );
     } catch (err) {
       Alert.alert('导入日历失败', err instanceof Error ? err.message : String(err));
@@ -87,16 +90,18 @@ export const ExamsScreen: React.FC<Props> = ({
     }
     setBusy(true);
     try {
-      const { created, skipped, failed, exactAlarmHint } = await createExamAlarms(exams, settings);
+      const { created, replacedCount, skipped, failed, exactAlarmHint } =
+        await createExamAlarms(exams, settings, alarms);
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
+      const dedupeNote = replacedCount > 0 ? `（已覆盖更新 ${replacedCount} 条旧闹钟，无重复响铃）` : '';
       const failNote = failed > 0 ? `，另有 ${failed} 条创建失败` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
       Alert.alert(
         '考试闹钟已配置',
         created.length > 0
-          ? `已创建 ${created.length} 条考前闹钟（含前晚 20:00 提醒 + 考前 ${settings.examAdvanceMinutes} 分钟出发闹钟）${
+          ? `已配置 ${created.length} 条考前闹钟（含前晚 20:00 提醒 + 考前 ${settings.examAdvanceMinutes} 分钟出发闹钟）${dedupeNote}${
               skipped > 0 ? `，已跳过 ${skipped} 场已结束或时间待定考试` : ''
             }${failNote}。${hintNote}`
           : '暂无可设置的未来考试提醒。'
@@ -111,8 +116,11 @@ export const ExamsScreen: React.FC<Props> = ({
   const handleSingleExamCalendar = async (exam: ExamItem) => {
     try {
       const res = await syncExamsToCalendar([exam]);
-      if (res.eventsCreated > 0) {
-        Alert.alert('已添加到日历', `《${exam.courseName}》考试日程已写入系统日历。`);
+      if (res.eventsCreated + res.eventsUpdated > 0) {
+        Alert.alert(
+          '已同步到日历',
+          `《${exam.courseName}》考试日程已${res.eventsUpdated > 0 ? '更新' : '写入'}至「${res.calendarTitle}」。`
+        );
       } else {
         Alert.alert('时间待公布', '该考试尚无明确时间，暂无法写入日历。');
       }
@@ -123,10 +131,13 @@ export const ExamsScreen: React.FC<Props> = ({
 
   const handleSingleExamAlarm = async (exam: ExamItem) => {
     try {
-      const { created } = await createExamAlarms([exam], settings);
+      const { created } = await createExamAlarms([exam], settings, alarms);
       if (created.length > 0) {
         onAlarmsAdded(created);
-        Alert.alert('考前闹钟已设定', `已为《${exam.courseName}》设置 ${created.length} 条提醒闹钟。`);
+        Alert.alert(
+          '考前闹钟已设定',
+          `已为《${exam.courseName}》配置 ${created.length} 条提醒闹钟（已自动去重）。`
+        );
       } else {
         Alert.alert('无法设置', '该考试时间已过或时间待定。');
       }

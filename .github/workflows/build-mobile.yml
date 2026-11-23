@@ -66,6 +66,17 @@ jobs:
           grep -q 'android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove"' android/app/src/main/AndroidManifest.xml
           grep -q "android.enableMinifyInReleaseBuilds=true" android/gradle.properties
           grep -q "EX_DEV_CLIENT_NETWORK_INSPECTOR=false" android/gradle.properties
+          grep -q "GDOU_RELEASE_STORE_FILE" android/app/build.gradle
+          node -e '
+            const fs = require("fs");
+            const gradle = fs.readFileSync("android/app/build.gradle", "utf8");
+            const rel = gradle.match(/buildTypes\s*\{[\s\S]*?release\s*\{([\s\S]*?)\n\s{8}\}/);
+            if (!rel) { console.error("release buildType not found"); process.exit(1); }
+            if (/signingConfig\s+signingConfigs\.debug/.test(rel[1])) {
+              console.error("ERROR: release buildType must NEVER reference signingConfigs.debug!");
+              process.exit(1);
+            }
+          '
 
       - name: Prepare optional release signing keystore from GitHub Secrets
         env:
@@ -143,6 +154,18 @@ jobs:
           grep -q "GdouEphemeralNetworking.install()" ios/*/AppDelegate.swift
           grep -q "RCTHTTPRequestHandler.h" ios/*/*-Bridging-Header.h
           grep -q "GdouEphemeralNetworking.swift" ios/*.xcodeproj/project.pbxproj
+          grep -q "SWIFT_OBJC_BRIDGING_HEADER" ios/*.xcodeproj/project.pbxproj
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const xcodeproj = fs.readdirSync("ios").find((d) => d.endsWith(".xcodeproj"));
+            const pbx = fs.readFileSync(path.join("ios", xcodeproj, "project.pbxproj"), "utf8");
+            const phases = pbx.match(/\/\* Begin PBXSourcesBuildPhase section \*\/[\s\S]*?\/\* End PBXSourcesBuildPhase section \*\//);
+            if (!phases || !phases[0].includes("GdouEphemeralNetworking.swift")) {
+              console.error("ERROR: GdouEphemeralNetworking.swift is NOT compiled in PBXSourcesBuildPhase!");
+              process.exit(1);
+            }
+          '
 
       - name: Install CocoaPods
         working-directory: ios

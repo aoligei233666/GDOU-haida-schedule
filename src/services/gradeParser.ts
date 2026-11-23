@@ -1,4 +1,10 @@
-import { GpaSummary, GradeItem } from '../types/models';
+import {
+  CreditCategorySummary,
+  GpaSummary,
+  GradeItem,
+  ScoreTierBucket,
+  TermGradeBreakdown,
+} from '../types/models';
 
 interface RawZfGrade {
   kcmc?: string;
@@ -154,10 +160,121 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
   return grades;
 }
 
+function deduplicateBestAttempts(grades: GradeItem[]): GradeItem[] {
+  const bestByCourse = new Map<string, GradeItem>();
+  for (const g of grades) {
+    const key = g.courseCode || g.courseName;
+    const prev = bestByCourse.get(key);
+    if (!prev || g.gpa > prev.gpa || (g.numericScore ?? 0) > (prev.numericScore ?? 0)) {
+      bestByCourse.set(key, g);
+    }
+  }
+  return Array.from(bestByCourse.values());
+}
+
+/**
+ * Compute per-semester GPA, weighted average score, and earned/attempted credits breakdown
+ * sorted from latest semester to earliest so students can compare term performance at a glance.
+ */
+export function computeTermBreakdowns(grades: GradeItem[]): TermGradeBreakdown[] {
+  const grouped = new Map<string, GradeItem[]>();
+  for (const g of grades) {
+    const key = g.termKey || `${g.academicYear} 第${g.semester}学期`;
+    const list = grouped.get(key) ?? [];
+    list.push(g);
+    grouped.set(key, list);
+  }
+
+  const breakdowns: TermGradeBreakdown[] = [];
+  for (const [termKey, items] of grouped.entries()) {
+    const effective = deduplicateBestAttempts(items);
+    let creditsEarned = 0;
+    let creditsAttempted = 0;
+    let passedCount = 0;
+    let failedCount = 0;
+    let gpaSum = 0;
+    let gpaDenom = 0;
+    let scoreSum = 0;
+    let scoreDenom = 0;
+
+    for (const g of effective) {
+      creditsAttempted += g.credit;
+      if (g.passed) {
+        creditsEarned += g.credit;
+        passedCount++;
+      } else {
+        failedCount++;
+      }
+      if (g.credit > 0) {
+        gpaSum += g.gpa * g.credit;
+        gpaDenom += g.credit;
+        if (g.numericScore !== null) {
+          scoreSum += g.numericScore * g.credit;
+          scoreDenom += g.credit;
+        }
+      }
+    }
+
+    breakdowns.push({
+      termKey,
+      academicYear: items[0]?.academicYear || '',
+      semester: items[0]?.semester || '',
+      coursesCount: effective.length,
+      passedCount,
+      failedCount,
+      creditsEarned: Math.round(creditsEarned * 100) / 100,
+      creditsAttempted: Math.round(creditsAttempted * 100) / 100,
+      weightedGpa: gpaDenom > 0 ? Math.round((gpaSum / gpaDenom) * 100) / 100 : 0,
+      weightedAvgScore: scoreDenom > 0 ? Math.round((scoreSum / scoreDenom) * 100) / 100 : 0,
+    });
+  }
+
+  breakdowns.sort((a, b) => b.termKey.localeCompare(a.termKey));
+  return breakdowns;
+}
+
+/**
+ * Compute 5-tier score distribution (90+, 80-89, 70-79, 60-69, <60) across deduplicated courses.
+ */
+export function computeScoreDistribution(effectiveGrades: GradeItem[]): ScoreTierBucket[] {
+  const buckets: ScoreTierBucket[] = [
+    { key: 'excellent', label: '优秀', rangeText: '90-100 / GPA≥4.0', count: 0, credits: 0, ratio: 0 },
+    { key: 'good', label: '良好', rangeText: '80-89 / GPA 3.0-3.9', count: 0, credits: 0, ratio: 0 },
+    { key: 'medium', label: '中等', rangeText: '70-79 / GPA 2.0-2.9', count: 0, credits: 0, ratio: 0 },
+    { key: 'pass', label: '及格', rangeText: '60-69 / GPA 1.0-1.9', count: 0, credits: 0, ratio: 0 },
+    { key: 'fail', label: '未通过', rangeText: '<60 / 挂科待修', count: 0, credits: 0, ratio: 0 },
+  ];
+
+  for (const g of effectiveGrades) {
+    let idx = 4;
+    if (!g.passed) {
+      idx = 4;
+    } else if ((g.numericScore !== null && g.numericScore >= 90) || g.gpa >= 4.0) {
+      idx = 0;
+    } else if ((g.numericScore !== null && g.numericScore >= 80) || g.gpa >= 3.0) {
+      idx = 1;
+    } else if ((g.numericScore !== null && g.numericScore >= 70) || g.gpa >= 2.0) {
+      idx = 2;
+    } else {
+      idx = 3;
+    }
+    buckets[idx].count += 1;
+    buckets[idx].credits = Math.round((buckets[idx].credits + g.credit) * 100) / 100;
+  }
+
+  const total = effectiveGrades.length;
+  if (total > 0) {
+    for (const b of buckets) {
+      b.ratio = Math.round((b.count / total) * 1000) / 1000;
+    }
+  }
+  return buckets;
+}
+
 /**
  * Compute comprehensive GPA & Credit summary across all or filtered grades.
  * When a course has multiple attempts (e.g. retake/make-up), keeps the highest grade per course code/name
- * for cumulative credits & GPA calculation while also exposing course counts.
+ * for cumulative credits & GPA calculation while also exposing per-term and tier distributions.
  */
 export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
   if (grades.length === 0) {
@@ -169,22 +286,16 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
       weightedAvgScore: 0,
       totalCourses: 0,
       passedCourses: 0,
+      failedCourses: 0,
+      passRate: 0,
       hasEstimatedItems: false,
       byCategory: [],
+      byTerm: [],
+      scoreDistribution: computeScoreDistribution([]),
     };
   }
 
-  // Deduplicate by courseCode/courseName keeping best attempt for GPA/credit summary
-  const bestByCourse = new Map<string, GradeItem>();
-  for (const g of grades) {
-    const key = g.courseCode || g.courseName;
-    const prev = bestByCourse.get(key);
-    if (!prev || g.gpa > prev.gpa || (g.numericScore ?? 0) > (prev.numericScore ?? 0)) {
-      bestByCourse.set(key, g);
-    }
-  }
-
-  const effective = Array.from(bestByCourse.values());
+  const effective = deduplicateBestAttempts(grades);
   let totalCreditsEarned = 0;
   let totalCreditsAttempted = 0;
   let weightedGpaSum = 0;
@@ -196,25 +307,33 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
   let weightedScoreSum = 0;
   let scoreCreditsDenom = 0;
   let passedCourses = 0;
+  let failedCourses = 0;
   let hasEstimatedItems = false;
 
-  const catMap = new Map<string, { credits: number; count: number }>();
+  const catMap = new Map<string, { credits: number; attemptedCredits: number; count: number }>();
 
   for (const g of effective) {
     if (g.gpaEstimated || g.scoreEstimated) {
       hasEstimatedItems = true;
     }
     totalCreditsAttempted += g.credit;
+
+    const prevCat = catMap.get(g.courseCategory) ?? {
+      credits: 0,
+      attemptedCredits: 0,
+      count: 0,
+    };
+    prevCat.attemptedCredits = Math.round((prevCat.attemptedCredits + g.credit) * 100) / 100;
+    prevCat.count += 1;
+
     if (g.passed) {
       totalCreditsEarned += g.credit;
       passedCourses++;
-
-      const prevCat = catMap.get(g.courseCategory) ?? { credits: 0, count: 0 };
-      catMap.set(g.courseCategory, {
-        credits: Math.round((prevCat.credits + g.credit) * 100) / 100,
-        count: prevCat.count + 1,
-      });
+      prevCat.credits = Math.round((prevCat.credits + g.credit) * 100) / 100;
+    } else {
+      failedCourses++;
     }
+    catMap.set(g.courseCategory, prevCat);
 
     if (g.credit > 0) {
       weightedGpaSum += g.gpa * g.credit;
@@ -232,12 +351,19 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
     }
   }
 
-  const byCategory = Array.from(catMap.entries())
-    .map(([category, v]) => ({ category, credits: v.credits, count: v.count }))
-    .sort((a, b) => b.credits - a.credits);
+  const roundedEarned = Math.round(totalCreditsEarned * 100) / 100;
+  const byCategory: CreditCategorySummary[] = Array.from(catMap.entries())
+    .map(([category, v]) => ({
+      category,
+      credits: v.credits,
+      attemptedCredits: v.attemptedCredits,
+      count: v.count,
+      share: roundedEarned > 0 ? Math.round((v.credits / roundedEarned) * 1000) / 1000 : 0,
+    }))
+    .sort((a, b) => b.credits - a.credits || b.attemptedCredits - a.attemptedCredits);
 
   return {
-    totalCreditsEarned: Math.round(totalCreditsEarned * 100) / 100,
+    totalCreditsEarned: roundedEarned,
     totalCreditsAttempted: Math.round(totalCreditsAttempted * 100) / 100,
     weightedGpa:
       gpaCreditsDenom > 0 ? Math.round((weightedGpaSum / gpaCreditsDenom) * 100) / 100 : 0,
@@ -253,7 +379,12 @@ export function computeGpaSummary(grades: GradeItem[]): GpaSummary {
         : 0,
     totalCourses: effective.length,
     passedCourses,
+    failedCourses,
+    passRate:
+      effective.length > 0 ? Math.round((passedCourses / effective.length) * 1000) / 10 : 0,
     hasEstimatedItems,
     byCategory,
+    byTerm: computeTermBreakdowns(grades),
+    scoreDistribution: computeScoreDistribution(effective),
   };
 }

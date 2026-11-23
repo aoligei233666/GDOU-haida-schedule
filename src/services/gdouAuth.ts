@@ -29,9 +29,73 @@ import {
 import { parseZfExamResponse } from './examParser';
 import { parseZfGradesResponse } from './gradeParser';
 import { parseZfScheduleResponse } from './scheduleParser';
+import { sanitizeEndpointUrl } from './zeroRetentionSanitizer';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 const OVERALL_SYNC_TIMEOUT_MS = 60_000;
+const MAX_EXAM_QUERY_ATTEMPTS = 4;
+
+/**
+ * Detect whether code is running inside the native React Native runtime (Android/iOS),
+ * where our native OkHttp / URLProtocol interceptor is guaranteed to strip `X-Gdou-*`
+ * internal control headers before any bytes hit the wire.
+ */
+export function isNativeMobileRuntime(): boolean {
+  return (
+    typeof navigator !== 'undefined' &&
+    typeof navigator.product === 'string' &&
+    navigator.product === 'ReactNative'
+  );
+}
+
+function stripInternalControlHeaders(headers?: HeadersInit): HeadersInit | undefined {
+  if (!headers) return headers;
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+    const clean = new Headers();
+    headers.forEach((value, key) => {
+      if (!key.toLowerCase().startsWith('x-gdou-')) {
+        clean.append(key, value);
+      }
+    });
+    return clean;
+  }
+  if (Array.isArray(headers)) {
+    return headers.filter(([key]) => !String(key).toLowerCase().startsWith('x-gdou-'));
+  }
+  const cleanObj: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!key.toLowerCase().startsWith('x-gdou-')) {
+      cleanObj[key] = value;
+    }
+  }
+  return cleanObj;
+}
+
+function buildHeadersWithOptionalNativeControl(
+  base: Record<string, string>,
+  controlHeader?: 'X-Gdou-Reset-Cookies-Before' | 'X-Gdou-Clear-Cookies-After'
+): Record<string, string> {
+  if (controlHeader && isNativeMobileRuntime()) {
+    return { ...base, [controlHeader]: '1' };
+  }
+  return base;
+}
+
+async function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  if (signal?.aborted) throw createAbortError('已取消本次同步操作');
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createAbortError('已取消本次同步操作'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 export interface AuthRequestOptions {
   signal?: AbortSignal;
@@ -64,6 +128,7 @@ export interface MfaChallengeState {
   reAuthUserId: string;
   serviceUrl: string;
   defaultReAuthType: '4' | '3'; // 4 = 企业微信验证码, 3 = 短信验证码
+  credentialsPurged: boolean;
   session: PreparedAuthSession;
   previousSteps: string[];
 }
@@ -135,8 +200,12 @@ export async function fetchWithTimeout(
   }, timeoutMs);
 
   try {
+    const safeHeaders = isNativeMobileRuntime()
+      ? init.headers
+      : stripInternalControlHeaders(init.headers);
     return await fetch(url, {
       ...init,
+      headers: safeHeaders,
       signal: controller.signal,
     });
   } catch (err) {
@@ -266,11 +335,13 @@ export async function prepareGdouAuthSession(
     {
       method: 'GET',
       credentials: 'include',
-      headers: {
-        'User-Agent': ua,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'X-Gdou-Reset-Cookies-Before': '1',
-      },
+      headers: buildHeadersWithOptionalNativeControl(
+        {
+          'User-Agent': ua,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        'X-Gdou-Reset-Cookies-Before'
+      ),
     },
     options
   );
@@ -283,7 +354,10 @@ export async function prepareGdouAuthSession(
         {
           method: 'GET',
           credentials: 'include',
-          headers: { 'User-Agent': ua, 'X-Gdou-Clear-Cookies-After': '1' },
+          headers: buildHeadersWithOptionalNativeControl(
+            { 'User-Agent': ua },
+            'X-Gdou-Clear-Cookies-After'
+          ),
         },
         { ...options, timeoutMs: 10_000 }
       );
@@ -584,9 +658,15 @@ async function fetchJwExamJson(
   const endpoints = GDOU_JW_PATHS.examQueries.map((p) => `${jwBaseUrl}${prefix}${p}`);
   const paramVariants = buildExamParamVariants(xnm, xqm);
   let lastError: string | undefined;
+  let attempts = 0;
 
-  for (const endpoint of endpoints) {
+  outer: for (const endpoint of endpoints) {
     for (const bodyParams of paramVariants) {
+      if (attempts >= MAX_EXAM_QUERY_ATTEMPTS) break outer;
+      if (attempts > 0) {
+        await sleepAbortable(200, options.signal);
+      }
+      attempts++;
       try {
         const resp = await fetchWithTimeout(
           endpoint,
@@ -603,11 +683,19 @@ async function fetchJwExamJson(
           },
           options
         );
+        if (resp.status === 401 || resp.status === 403 || resp.status === 429 || resp.status === 901) {
+          lastError = `HTTP ${resp.status}`;
+          break outer;
+        }
         if (!resp.ok) {
           lastError = `HTTP ${resp.status}`;
           continue;
         }
         const text = (await resp.text()).trim();
+        if (isAccountLockedMessage(text)) {
+          lastError = '检测到账号保护限制，已停止考试查询重试';
+          break outer;
+        }
         if (!text.startsWith('{') && !text.startsWith('[')) continue;
         const parsed = JSON.parse(text) as { items?: unknown[]; rows?: unknown[] };
         const count = Array.isArray(parsed.items)
@@ -707,6 +795,7 @@ export async function logoutEphemeralSession(
 
   await Promise.all(
     preLogoutUrls.map(async (url) => {
+      const safeEndpoint = sanitizeEndpointUrl(url);
       attempted++;
       try {
         const resp = await fetchWithTimeout(
@@ -716,21 +805,22 @@ export async function logoutEphemeralSession(
             credentials: 'include',
             headers: { 'User-Agent': ua },
           },
-          { timeoutMs: logoutTimeout, userAgent: ua }
+          { timeoutMs: logoutTimeout, userAgent: ua, signal: options.signal }
         );
         if (isLogoutResponseOk(resp)) {
           succeeded++;
         } else {
-          failedEndpoints.push(`${url} (HTTP ${resp.status})`);
+          failedEndpoints.push(`${safeEndpoint} (HTTP ${resp.status})`);
         }
       } catch (err) {
-        failedEndpoints.push(`${url} (${err instanceof Error ? err.message : 'network error'})`);
+        failedEndpoints.push(`${safeEndpoint} (${err instanceof Error ? err.message : 'network error'})`);
       }
     })
   );
 
   // Terminate CAS TGT and instruct native Android OkHttp / iOS GdouEphemeralURLProtocol to wipe all RAM + WebView cookies
   const casLogoutUrl = `${authOrigin}${GDOU_AUTH_PATHS.logout}`;
+  const safeCasLogout = sanitizeEndpointUrl(casLogoutUrl);
   attempted++;
   let casLoggedOut = false;
   try {
@@ -739,21 +829,21 @@ export async function logoutEphemeralSession(
       {
         method: 'GET',
         credentials: 'include',
-        headers: {
-          'User-Agent': ua,
-          'X-Gdou-Clear-Cookies-After': '1',
-        },
+        headers: buildHeadersWithOptionalNativeControl(
+          { 'User-Agent': ua },
+          'X-Gdou-Clear-Cookies-After'
+        ),
       },
-      { timeoutMs: logoutTimeout, userAgent: ua }
+      { timeoutMs: logoutTimeout, userAgent: ua, signal: options.signal }
     );
     if (isLogoutResponseOk(casResp)) {
       casLoggedOut = true;
       succeeded++;
     } else {
-      failedEndpoints.push(`${casLogoutUrl} (HTTP ${casResp.status})`);
+      failedEndpoints.push(`${safeCasLogout} (HTTP ${casResp.status})`);
     }
   } catch (err) {
-    failedEndpoints.push(`${casLogoutUrl} (${err instanceof Error ? err.message : 'network error'})`);
+    failedEndpoints.push(`${safeCasLogout} (${err instanceof Error ? err.message : 'network error'})`);
   }
 
   return {
@@ -778,12 +868,12 @@ export async function flushNativeEphemeralCookies(
       {
         method: 'GET',
         credentials: 'include',
-        headers: {
-          'User-Agent': ua,
-          'X-Gdou-Clear-Cookies-After': '1',
-        },
+        headers: buildHeadersWithOptionalNativeControl(
+          { 'User-Agent': ua },
+          'X-Gdou-Clear-Cookies-After'
+        ),
       },
-      { timeoutMs: options.timeoutMs ?? 8_000, userAgent: ua }
+      { timeoutMs: options.timeoutMs ?? 8_000, userAgent: ua, signal: options.signal }
     );
     return isLogoutResponseOk(resp);
   } catch {
@@ -906,6 +996,21 @@ export async function submitGdouMfaAndCompleteSync(
       if (err instanceof Error && err.name === 'AbortError') throw err;
     }
 
+    let ephemeralCode = dynamicCode.trim();
+    const mfaBody = encodeFormBody({
+      service: mfa.serviceUrl,
+      reAuthType,
+      isMultifactor: 'true',
+      password: '',
+      dynamicCode: ephemeralCode,
+      uuid: '',
+      answer1: '',
+      answer2: '',
+      otpCode: '',
+      skipTmpReAuth: 'true',
+    });
+    ephemeralCode = '';
+
     const submitResp = await fetchWithTimeout(
       `${origin}${GDOU_AUTH_PATHS.reAuthSubmit}`,
       {
@@ -916,18 +1021,7 @@ export async function submitGdouMfaAndCompleteSync(
           'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
           'X-Requested-With': 'XMLHttpRequest',
         },
-        body: encodeFormBody({
-          service: mfa.serviceUrl,
-          reAuthType,
-          isMultifactor: 'true',
-          password: '',
-          dynamicCode: dynamicCode.trim(),
-          uuid: '',
-          answer1: '',
-          answer2: '',
-          otpCode: '',
-          skipTmpReAuth: 'true',
-        }),
+        body: mfaBody,
       },
       reqOpts
     );
@@ -959,10 +1053,13 @@ export async function submitGdouMfaAndCompleteSync(
       mfa.session.authOrigin,
       mfa.session.isWebVpn,
       detectedPrefix,
-      { userAgent: ua }
+      { userAgent: ua, signal: options.signal }
     );
     shouldLogoutSession = false;
 
+    const credentialsPurged = Boolean(mfa.credentialsPurged) && ephemeralCode === '';
+    const cookiesFlushed = logoutDetails.casLoggedOut;
+    const storageCleaned = cookiesFlushed;
     const sessionLoggedOut =
       logoutDetails.casLoggedOut && logoutDetails.failedEndpoints.length === 0;
     const warnings = [...pulled.warnings];
@@ -971,7 +1068,7 @@ export async function submitGdouMfaAndCompleteSync(
         `部分远端注销请求未确认成功 (${logoutDetails.succeeded}/${logoutDetails.attempted})，请留意官网登录状态`
       );
       log(
-        `8. 本地无痕清理完成，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议手动核对官网退出）`
+        `8. 本地无痕清理已尝试，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议手动核对官网退出）`
       );
     } else {
       log(
@@ -994,8 +1091,10 @@ export async function submitGdouMfaAndCompleteSync(
         coursesCount: pulled.courses.length,
         examsCount: pulled.exams.length,
         gradesCount: pulled.grades.length,
-        credentialsPurged: true,
+        credentialsPurged,
         sessionLoggedOut,
+        storageCleaned,
+        cookiesFlushed,
         logoutDetails,
         warnings: warnings.length > 0 ? warnings : undefined,
         steps,
@@ -1009,7 +1108,7 @@ export async function submitGdouMfaAndCompleteSync(
         mfa.session.authOrigin,
         mfa.session.isWebVpn,
         detectedPrefix,
-        { userAgent: ua }
+        { userAgent: ua, timeoutMs: 5_000 }
       );
     }
   }
@@ -1333,7 +1432,10 @@ export async function executeOneShotGdouSync(
             {
               method: 'GET',
               credentials: 'include',
-              headers: { 'User-Agent': ua, 'X-Gdou-Clear-Cookies-After': '1' },
+              headers: buildHeadersWithOptionalNativeControl(
+                { 'User-Agent': ua },
+                'X-Gdou-Clear-Cookies-After'
+              ),
             },
             { ...reqOpts, timeoutMs: 10_000 }
           );
@@ -1428,6 +1530,7 @@ export async function executeOneShotGdouSync(
       }
       const userIdMatch = loginHtml.match(/"reAuthUserId"\s*:\s*"([^"]+)"/);
       const typeMatch = loginHtml.match(/"reAuthType"\s*:\s*"([34])"/);
+      const mfaCredentialsPurged = areCredentialsPurged(credentials) && rawPassword === '';
       log('3. 账号密码验证通过（密码引用已立即释放）！海大安全策略要求完成多因子验证码校验');
       return {
         status: 'mfa_required',
@@ -1436,6 +1539,7 @@ export async function executeOneShotGdouSync(
           reAuthUserId: userIdMatch ? userIdMatch[1] : username,
           serviceUrl: session.serviceUrl,
           defaultReAuthType: (typeMatch?.[1] as '4' | '3') || '4',
+          credentialsPurged: mfaCredentialsPurged,
           session,
           previousSteps: steps,
         },
@@ -1494,11 +1598,13 @@ export async function executeOneShotGdouSync(
       session.authOrigin,
       session.isWebVpn,
       detectedPrefix,
-      { userAgent: ua }
+      { userAgent: ua, signal: options.signal }
     );
     logoutCompleted = true;
 
     const credentialsPurged = areCredentialsPurged(credentials) && rawPassword === '';
+    const cookiesFlushed = logoutDetails.casLoggedOut;
+    const storageCleaned = cookiesFlushed;
     const sessionLoggedOut =
       logoutDetails.casLoggedOut && logoutDetails.failedEndpoints.length === 0;
     const warnings = [...pulled.warnings];
@@ -1507,7 +1613,7 @@ export async function executeOneShotGdouSync(
         `部分远端注销请求未确认成功 (${logoutDetails.succeeded}/${logoutDetails.attempted})，请留意官网登录状态`
       );
       log(
-        `8. 本地清理完成，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议手动确认退出）`
+        `8. 本地清理已尝试，但远端注销仅确认 ${logoutDetails.succeeded}/${logoutDetails.attempted} 项（建议手动确认退出）`
       );
     } else {
       log(
@@ -1534,6 +1640,8 @@ export async function executeOneShotGdouSync(
           gradesCount: pulled.grades.length,
           credentialsPurged,
           sessionLoggedOut,
+          storageCleaned,
+          cookiesFlushed,
           logoutDetails,
           warnings: warnings.length > 0 ? warnings : undefined,
           steps,
@@ -1550,7 +1658,7 @@ export async function executeOneShotGdouSync(
         session.authOrigin,
         session.isWebVpn,
         detectedPrefix,
-        { userAgent: ua }
+        { userAgent: ua, timeoutMs: 5_000 }
       );
     }
   }
@@ -1613,7 +1721,16 @@ export function buildIncognitoWebViewSyncScript(
             clearTimeout(timer);
           }
         }
-        return await fetch(url, opts || {});
+        return await Promise.race([
+          fetch(url, opts || {}),
+          new Promise(function(_, reject) {
+            setTimeout(function() { reject(new Error('请求超时')); }, ms);
+          })
+        ]);
+      }
+
+      function stripUrlQuery(u) {
+        return String(u || '').split('#')[0].split('?')[0];
       }
 
       function encodeForm(obj) {
@@ -1849,8 +1966,11 @@ export function buildIncognitoWebViewSyncScript(
             { xnm: xnm, xqm: '', 'queryModel.showCount': '100', 'queryModel.currentPage': '1' },
             { xnm: '', xqm: '', 'queryModel.showCount': '100', 'queryModel.currentPage': '1' }
           ];
-          for (var u = 0; u < JW_PATHS.examQueries.length && (!examJson.items || examJson.items.length === 0); u++) {
-            for (var b = 0; b < examVariants.length; b++) {
+          var examAttempts = 0;
+          var examAbortedEarly = false;
+          for (var u = 0; u < JW_PATHS.examQueries.length && (!examJson.items || examJson.items.length === 0) && !examAbortedEarly && examAttempts < 4; u++) {
+            for (var b = 0; b < examVariants.length && examAttempts < 4; b++) {
+              examAttempts++;
               try {
                 var exResp = await timedFetch(root + prefix + JW_PATHS.examQueries[u], {
                   method: 'POST',
@@ -1861,6 +1981,10 @@ export function buildIncognitoWebViewSyncScript(
                   },
                   body: encodeForm(examVariants[b])
                 }, 15000);
+                if (exResp.status === 401 || exResp.status === 403 || exResp.status === 429 || exResp.status === 901) {
+                  examAbortedEarly = true;
+                  break;
+                }
                 if (!exResp.ok) continue;
                 var exText = (await exResp.text()).trim();
                 if (exText.charAt(0) === '{') {
@@ -1918,9 +2042,9 @@ export function buildIncognitoWebViewSyncScript(
             try {
               var lr = await timedFetch(logoutTargets[li], { credentials: 'include' }, 8000);
               if (lr.ok || (lr.status >= 300 && lr.status < 400)) logoutSucceeded++;
-              else failedEndpoints.push(logoutTargets[li] + ' (HTTP ' + lr.status + ')');
+              else failedEndpoints.push(stripUrlQuery(logoutTargets[li]) + ' (HTTP ' + lr.status + ')');
             } catch (e) {
-              failedEndpoints.push(logoutTargets[li]);
+              failedEndpoints.push(stripUrlQuery(logoutTargets[li]));
             }
           }
           logoutAttempted++;
@@ -1930,14 +2054,20 @@ export function buildIncognitoWebViewSyncScript(
               casLoggedOut = true;
               logoutSucceeded++;
             } else {
-              failedEndpoints.push(casLogoutUrl + ' (HTTP ' + casResp.status + ')');
+              failedEndpoints.push(stripUrlQuery(casLogoutUrl) + ' (HTTP ' + casResp.status + ')');
             }
           } catch (e) {
-            failedEndpoints.push(casLogoutUrl);
+            failedEndpoints.push(stripUrlQuery(casLogoutUrl));
           }
 
-          try { sessionStorage.clear(); } catch (e) {}
-          try { localStorage.clear(); } catch (e) {}
+          var storageCleaned = false;
+          try {
+            sessionStorage.clear();
+            localStorage.clear();
+            storageCleaned = sessionStorage.length === 0 && localStorage.length === 0;
+          } catch (e) {
+            storageCleaned = false;
+          }
 
           post({
             type: 'SYNC_COMPLETE',
@@ -1947,6 +2077,7 @@ export function buildIncognitoWebViewSyncScript(
             scheduleRaw: kbJson,
             examRaw: examJson,
             gradeRaw: gradeJson,
+            storageCleaned: storageCleaned,
             logoutDetails: {
               attempted: logoutAttempted,
               succeeded: logoutSucceeded,

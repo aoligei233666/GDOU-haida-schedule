@@ -19,7 +19,9 @@ import { ScheduleScreen } from './src/screens/ScheduleScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import {
   cancelAllScheduledAlarms,
+  cancelScheduledAlarm,
   initializeAlarmEngine,
+  mergeAlarmsIdempotently,
 } from './src/services/alarmService';
 import { SyncResult } from './src/services/gdouAuth';
 import {
@@ -186,23 +188,30 @@ function MainApp() {
     });
 
     const { receipt } = result;
+    const allVerified = Boolean(
+      receipt.credentialsPurged &&
+        receipt.sessionLoggedOut &&
+        receipt.storageCleaned &&
+        receipt.cookiesFlushed
+    );
     const logoutText = receipt.sessionLoggedOut
       ? '教务与统一认证会话已通过 HTTP 校验注销。'
       : `远端注销仅确认 ${receipt.logoutDetails?.succeeded ?? 0}/${
           receipt.logoutDetails?.attempted ?? 0
         } 项（可能因网络超时），建议留意官网登录状态。`;
-    const purgeText = receipt.credentialsPurged
-      ? '本地未保存任何账号密码与 Cookie。'
-      : '请前往「关于设置 -> 零留存检测」复核本地状态。';
+    const purgeText =
+      receipt.credentialsPurged && receipt.storageCleaned && receipt.cookiesFlushed
+        ? '本地未保存任何账号密码，WebStorage 与临时 Cookie 均已校验清理。'
+        : `本地清理状态：凭据释放=${receipt.credentialsPurged ? '已校验' : '未确认'} · 存储清理=${
+            receipt.storageCleaned ? '已校验' : '未确认'
+          } · Cookie冲洗=${receipt.cookiesFlushed ? '已校验' : '未确认'}。`;
     const warningBlock =
       receipt.warnings && receipt.warnings.length > 0
         ? `\n\n注意事项：\n• ${receipt.warnings.slice(0, 3).join('\n• ')}`
         : '';
 
     Alert.alert(
-      receipt.sessionLoggedOut && receipt.credentialsPurged
-        ? '同步完成 · 已核验注销'
-        : '同步完成 · 请留意回执',
+      allVerified ? '同步完成 · 已核验注销' : '同步完成 · 请留意回执',
       `成功拉取：\n• 课程安排：${result.courses.length} 项\n• 考试日程：${result.exams.length} 场\n• 成绩与学分：${result.grades.length} 门\n（${result.termLabel}）\n\n${logoutText}\n${purgeText}${warningBlock}`
     );
   };
@@ -219,10 +228,23 @@ function MainApp() {
   };
 
   const handleAddAlarms = (newAlarms: AlarmRule[]) => {
-    mutateAppData((prev) => ({
-      ...prev,
-      alarms: [...newAlarms, ...prev.alarms],
-    }));
+    const incomingNotifIds = new Set(
+      newAlarms.map((a) => a.notificationId).filter((id): id is string => Boolean(id))
+    );
+    let supersededToCancel: AlarmRule[] = [];
+    mutateAppData((prev) => {
+      const { merged, replaced } = mergeAlarmsIdempotently(prev.alarms, newAlarms);
+      supersededToCancel = replaced.filter(
+        (old) => old.notificationId && !incomingNotifIds.has(old.notificationId)
+      );
+      return {
+        ...prev,
+        alarms: merged,
+      };
+    });
+    for (const old of supersededToCancel) {
+      void cancelScheduledAlarm(old);
+    }
   };
 
   const handleReplaceAlarms = (alarms: AlarmRule[]) => {
@@ -294,6 +316,7 @@ function MainApp() {
           <View style={[styles.tabPane, activeTab !== 'schedule' && styles.tabPaneHidden]}>
             <ScheduleScreen
               courses={appData.courses}
+              alarms={appData.alarms}
               termLabel={appData.termLabel}
               settings={appData.settings}
               onOpenSync={() => setSyncModalOpen(true)}
@@ -307,6 +330,7 @@ function MainApp() {
           <View style={[styles.tabPane, activeTab !== 'exams' && styles.tabPaneHidden]}>
             <ExamsScreen
               exams={appData.exams}
+              alarms={appData.alarms}
               settings={appData.settings}
               onOpenSync={() => setSyncModalOpen(true)}
               onAddManualExam={handleAddManualExam}

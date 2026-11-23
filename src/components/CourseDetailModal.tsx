@@ -23,6 +23,7 @@ interface Props {
   course: CourseItem | null;
   selectedWeek: number;
   settings: AppSettings;
+  existingAlarms?: AlarmRule[];
   onClose: () => void;
   onAlarmCreated: (alarm: AlarmRule) => void;
 }
@@ -33,6 +34,7 @@ export const CourseDetailModal: React.FC<Props> = ({
   course,
   selectedWeek,
   settings,
+  existingAlarms,
   onClose,
   onAlarmCreated,
 }) => {
@@ -50,9 +52,10 @@ export const CourseDetailModal: React.FC<Props> = ({
     setBusy(true);
     try {
       const res = await addSingleCourseToCalendar(course, settings);
+      const total = res.eventsCreated + res.eventsUpdated;
       Alert.alert(
-        '已添加到系统日历',
-        `已将《${course.name}》的全部 ${res.eventsCreated} 次上课安排更新至「海大课表 (GDOU)」日历（已自动去重），并附带课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。`
+        '已同步到系统日历',
+        `已将《${course.name}》的全部 ${total} 次上课安排同步至「${res.calendarTitle}」（新增 ${res.eventsCreated} 条，更新 ${res.eventsUpdated} 条），并附带课前 ${settings.defaultCalendarReminderMinutes} 分钟提醒。`
       );
     } catch (err) {
       Alert.alert('写入日历失败', err instanceof Error ? err.message : String(err));
@@ -67,13 +70,19 @@ export const CourseDetailModal: React.FC<Props> = ({
       const targetWeek = course.weeks.includes(selectedWeek)
         ? selectedWeek
         : course.weeks[0] ?? selectedWeek;
-      const rule = await createClassAlarm(course, targetWeek, leadMinutes, settings);
+      const rule = await createClassAlarm(
+        course,
+        targetWeek,
+        leadMinutes,
+        settings,
+        existingAlarms
+      );
       onAlarmCreated(rule);
       Alert.alert(
         '课前闹钟已设定',
         `将在第 ${targetWeek} 周 ${dayLabel} 上课前 ${leadMinutes} 分钟（${String(
           rule.hour
-        ).padStart(2, '0')}:${String(rule.minute).padStart(2, '0')}）响铃提醒。`
+        ).padStart(2, '0')}:${String(rule.minute).padStart(2, '0')}）响铃提醒（同周同课已自动去重）。`
       );
     } catch (err) {
       Alert.alert('设定闹钟失败', err instanceof Error ? err.message : String(err));

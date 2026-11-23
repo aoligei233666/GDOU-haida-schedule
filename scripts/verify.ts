@@ -1,11 +1,18 @@
 import CryptoJS from 'crypto-js';
 import appJson from '../app.json';
+import pkgLockJson from '../package-lock.json';
 import pkgJson from '../package.json';
 import {
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
 } from '../src/constants/gdouEndpoints';
 import { buildSampleGdouData, createDefaultSettings } from '../src/constants/gdouTimetable';
+import {
+  buildClassAlarmDedupeKey,
+  buildExamAlarmDedupeKey,
+  buildWakeupAlarmDedupeKey,
+  mergeAlarmsIdempotently,
+} from '../src/services/alarmDedupe';
 import {
   areCredentialsPurged,
   encryptGdouPassword,
@@ -18,11 +25,17 @@ import {
   checkGdouCaptcha,
   fetchWithTimeout,
   isAccountLockedMessage,
+  isNativeMobileRuntime,
   logoutEphemeralSession,
   PreparedAuthSession,
   prepareGdouAuthSession,
 } from '../src/services/gdouAuth';
-import { computeGpaSummary, parseZfGradesResponse } from '../src/services/gradeParser';
+import {
+  computeGpaSummary,
+  computeScoreDistribution,
+  computeTermBreakdowns,
+  parseZfGradesResponse,
+} from '../src/services/gradeParser';
 import { buildGdouIcsContent, foldIcsLine } from '../src/services/icsBuilder';
 import {
   getCourseOccurrences,
@@ -33,10 +46,12 @@ import {
   parseZfScheduleResponse,
 } from '../src/services/scheduleParser';
 import {
+  containsSensitiveCredentialValue,
   findForbiddenCredentialKeys,
+  sanitizeEndpointUrl,
   sanitizeForZeroRetention,
 } from '../src/services/zeroRetentionSanitizer';
-import { EphemeralCredentials } from '../src/types/models';
+import { AlarmRule, EphemeralCredentials } from '../src/types/models';
 
 const assert = {
   equal<T>(actual: T, expected: T, msg?: string) {
@@ -104,47 +119,82 @@ async function run() {
   assert.throws(() => encryptGdouPassword('TestPass#2026', 'short'), /pwdEncryptSalt/);
   console.log('   OK: AES-CBC CSPRNG round-trip & missing-salt fail-closed verified.');
 
-  console.log('2) Testing real recursive zero-retention sanitizer & credential purge...');
-  const creds: EphemeralCredentials = { username: '202411701101', password: 'SecretPassword', captcha: '1234' };
+  console.log('2) Testing recursive key + value-level zero-retention sanitizer & credential purge...');
+  const creds: EphemeralCredentials = { username: 'TEST_STUDENT_001', password: 'SecretPassword', captcha: '1234' };
   assert.equal(areCredentialsPurged(creds), false);
   purgeEphemeralCredentials(creds);
   assert.equal(areCredentialsPurged(creds), true);
   const dirtyPayload = {
     courses: [{ name: '海洋科学', password: 'leak', nested: { token: 'abc', castgc: 'tgt', ok: 1 } }],
-    username: '202411701101',
+    username: 'TEST_STUDENT_001',
     password: 'SecretPassword',
     cookie: 'JSESSIONID=abc',
+    receiptNote: 'Failed url https://authserver.gdou.edu.cn/logout?ticket=ST-99999&JSESSIONID=SECRET123',
     meta: { pwdEncryptSalt: 'salt123456789012', execution: 'e1s1', keep: true },
   };
+  assert.ok(containsSensitiveCredentialValue(dirtyPayload.receiptNote));
+  assert.ok(findForbiddenCredentialKeys({ leak: 'Cookie: CASTGC=TGT-12345' }).length > 0);
   const sanitized = sanitizeForZeroRetention(dirtyPayload);
-  assert.deepEqual(findForbiddenCredentialKeys(sanitized), []);
+  assert.ok(sanitized.receiptNote.includes('[REDACTED]'), 'Sensitive string value must be redacted');
+  assert.ok(!sanitized.receiptNote.includes('SECRET123'), 'Raw JSESSIONID value must not survive');
+  assert.ok(!sanitized.receiptNote.includes('ST-99999'), 'Raw ST ticket must not survive');
+  assert.deepEqual(
+    findForbiddenCredentialKeys({
+      courses: sanitized.courses,
+      meta: sanitized.meta,
+    }),
+    []
+  );
+  assert.equal(
+    sanitizeEndpointUrl('https://authserver.gdou.edu.cn/authserver/logout?ticket=ST-abc#top'),
+    'https://authserver.gdou.edu.cn/authserver/logout'
+  );
   assert.equal(sanitized.courses[0].name, '海洋科学');
   assert.equal((sanitized.courses[0].nested as { ok: number }).ok, 1);
   assert.equal((sanitized.meta as { keep: boolean }).keep, true);
-  console.log('   OK: Production recursive sanitizer stripped all top-level & nested credential keys.');
+  console.log('   OK: Production recursive key + value-level sanitizer & URL redaction verified.');
 
-  console.log('3) Testing gdouAuth timeout, fail-closed captcha, verified logout & WebView guards (mocked)...');
+  console.log('3) Testing gdouAuth timeout, X-Gdou header guard, verified logout & WebView guards...');
+  assert.equal(isNativeMobileRuntime(), false, 'Node verification runs outside React Native runtime');
   const originalFetch = globalThis.fetch;
   try {
-    // 3a. Timeout enforcement
-    globalThis.fetch = ((_url: unknown, init?: RequestInit) =>
-      new Promise((_resolve, reject) => {
+    // 3a. Timeout enforcement + verify X-Gdou-* headers are stripped outside RN native runtime
+    const observedHeaders: Record<string, string>[] = [];
+    globalThis.fetch = ((_url: unknown, init?: RequestInit) => {
+      observedHeaders.push((init?.headers as Record<string, string>) || {});
+      return new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => {
           const e = new Error('aborted');
           e.name = 'AbortError';
           reject(e);
         });
-      })) as typeof fetch;
+      });
+    }) as typeof fetch;
 
     let timedOutCaught = false;
     try {
-      await fetchWithTimeout('https://authserver.gdou.edu.cn/test', {}, { timeoutMs: 40 });
+      await fetchWithTimeout(
+        'https://authserver.gdou.edu.cn/test',
+        {
+          headers: {
+            'User-Agent': 'test',
+            'X-Gdou-Reset-Cookies-Before': '1',
+            'X-Gdou-Clear-Cookies-After': '1',
+          },
+        },
+        { timeoutMs: 40 }
+      );
     } catch (err) {
       timedOutCaught = (err instanceof Error ? err.message : '').includes('请求超时');
     }
     assert.ok(timedOutCaught, 'fetchWithTimeout must abort hanging requests');
+    assert.equal(
+      Object.keys(observedHeaders[0] || {}).some((k) => k.toLowerCase().startsWith('x-gdou-')),
+      false,
+      'Internal X-Gdou-* headers must NEVER be sent outside React Native runtime'
+    );
 
-    // 3b. Real verified logout (success case vs failure case)
+    // 3b. Real verified logout (success case vs failure case + query stripping on failedEndpoints)
     globalThis.fetch = (async () => makeMockResponse(200, 'ok')) as typeof fetch;
     const logoutOk = await logoutEphemeralSession(
       'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn',
@@ -159,7 +209,7 @@ async function run() {
 
     globalThis.fetch = (async () => makeMockResponse(503, 'Service Unavailable')) as typeof fetch;
     const logoutFail = await logoutEphemeralSession(
-      'https://jw.gdou.edu.cn',
+      'https://jw.gdou.edu.cn?ticket=ST-secret',
       'https://authserver.gdou.edu.cn',
       false,
       ''
@@ -167,6 +217,10 @@ async function run() {
     assert.equal(logoutFail.casLoggedOut, false);
     assert.equal(logoutFail.succeeded, 0);
     assert.equal(logoutFail.failedEndpoints.length, 2);
+    assert.ok(
+      logoutFail.failedEndpoints.every((ep) => !ep.includes('ST-secret')),
+      'failedEndpoints must strip query parameters'
+    );
 
     // 3c. Fail-closed captcha check on HTTP 503
     const mockSession: PreparedAuthSession = {
@@ -181,11 +235,11 @@ async function run() {
       ephemeralBfp: generateSecureHex(16),
       alreadyLoggedIn: false,
     };
-    const captchaErr = await checkGdouCaptcha(mockSession, '20240001');
+    const captchaErr = await checkGdouCaptcha(mockSession, 'TEST_STUDENT_001');
     assert.equal(captchaErr.checkFailed, true);
     assert.ok(Boolean(captchaErr.errorMessage), 'checkGdouCaptcha must surface HTTP error');
 
-    // 3d. Lockout detector & WebView origin allowlists + bridge token
+    // 3d. Lockout detector & WebView origin allowlists + bridge token + storage cleanup verification
     assert.equal(isAccountLockedMessage('您的账号已被冻结，请稍后再试'), true);
     assert.equal(isAccountLockedMessage('密码错误'), false);
     assert.equal(isAllowedWebViewNavigationUrl('https://authserver.gdou.edu.cn/authserver/login'), true);
@@ -197,11 +251,13 @@ async function run() {
     const injected = buildIncognitoWebViewSyncScript(undefined, token);
     assert.ok(injected.includes(token), 'WebView script must embed bridgeToken');
     assert.ok(injected.includes('sessionStorage.clear()'), 'WebView script must clear sessionStorage');
+    assert.ok(injected.includes('storageCleaned: storageCleaned'), 'WebView script must report verified storageCleaned');
+    assert.ok(injected.includes('Promise.race'), 'WebView timedFetch must have Promise.race timeout fallback');
     assert.ok(injected.includes("xnm: '', xqm: ''"), 'WebView script must include 3rd exam query variant');
   } finally {
     globalThis.fetch = originalFetch;
   }
-  console.log('   OK: Timeout, verified logout, fail-closed captcha, lockout breaker & WebView guards verified.');
+  console.log('   OK: Timeout, X-Gdou guard, verified logout, fail-closed captcha & WebView guards verified.');
 
   console.log('4) Testing 正方 week/section/schedule parser & explicit unparsed warnings...');
   assert.deepEqual(parseWeekExpression('1-4周(单),6-8周(双),11周'), [1, 3, 6, 8, 11]);
@@ -211,7 +267,7 @@ async function run() {
   assert.ok(parseLocalDateStrict('2026-09-07') !== null);
 
   const parsedKb = parseZfScheduleResponse({
-    xsxx: { XH: '20240001', XM: '测试同学', XNMC: '2026-2027', XQMMC: '1' },
+    xsxx: { XH: 'TEST_STUDENT_001', XM: '测试同学', XNMC: '2026-2027', XQMMC: '1' },
     kbList: [
       {
         kcmc: '海洋气象学',
@@ -262,19 +318,36 @@ async function run() {
   assert.equal(firstPerDay.get(2)?.name, '海洋气象学');
   console.log('   OK: Schedule parser, unparsed warnings & occurrence generator verified.');
 
-  console.log('5) Testing 正方 exam & GPA/Credit parser (including empty kssj & estimation flags)...');
+  console.log('5) Testing 正方 exam & multi-term GPA/Credit overview breakdown...');
   const parsedGrades = parseZfGradesResponse({
     items: [
       { kcmc: '高等数学（上）', kch: 'SX110201', xf: '5.0', cj: '90', jd: '4.0', kcxzmc: '公共必修课', xnmmc: '2025-2026', xqmmc: '1' },
       { kcmc: '海洋科学导论', kch: 'HY100101', xf: '3.0', cj: '优秀', kcxzmc: '专业必修课', xnmmc: '2025-2026', xqmmc: '1' },
+      { kcmc: '概率论与数理统计', kch: 'SX200501', xf: '3.0', cj: '82', jd: '3.2', kcxzmc: '公共必修课', xnmmc: '2025-2026', xqmmc: '2' },
+      { kcmc: '海洋物理实验', kch: 'HY200901', xf: '1.0', cj: '55', jd: '0', kcxzmc: '专业选修课', xnmmc: '2025-2026', xqmmc: '2' },
     ],
   });
-  assert.equal(parsedGrades[0].gpaEstimated, false);
-  assert.equal(parsedGrades[1].gpaEstimated, true);
+  const mathGrade = parsedGrades.find((g) => g.courseCode === 'SX110201')!;
+  const oceanGrade = parsedGrades.find((g) => g.courseCode === 'HY100101')!;
+  assert.equal(mathGrade.gpaEstimated, false);
+  assert.equal(oceanGrade.gpaEstimated, true);
   const gpaSummary = computeGpaSummary(parsedGrades);
-  assert.equal(gpaSummary.totalCreditsEarned, 8);
-  assert.equal(gpaSummary.weightedGpa, 4.19);
+  assert.equal(gpaSummary.totalCreditsEarned, 11);
+  assert.equal(gpaSummary.totalCreditsAttempted, 12);
+  assert.equal(gpaSummary.failedCourses, 1);
+  assert.equal(gpaSummary.passRate, 75);
   assert.equal(gpaSummary.hasEstimatedItems, true);
+  assert.equal(gpaSummary.byTerm.length, 2);
+  assert.equal(gpaSummary.byTerm[0].termKey, '2025-2026 第2学期');
+  assert.equal(gpaSummary.byTerm[0].failedCount, 1);
+  assert.equal(gpaSummary.byTerm[1].termKey, '2025-2026 第1学期');
+  assert.equal(gpaSummary.byTerm[1].weightedGpa, 4.19);
+  const termDirect = computeTermBreakdowns(parsedGrades);
+  assert.equal(termDirect.length, 2);
+  const dist = computeScoreDistribution(parsedGrades);
+  assert.equal(dist.find((b) => b.key === 'excellent')?.count, 2);
+  assert.equal(dist.find((b) => b.key === 'good')?.count, 1);
+  assert.equal(dist.find((b) => b.key === 'fail')?.count, 1);
 
   const parsedDt = parseExamDateTime('2026-12-28(09:00-11:00)');
   assert.equal(parsedDt.dateText, '2026-12-28');
@@ -301,9 +374,54 @@ async function run() {
   const cd = getExamCountdown(parsedExams[0], new Date('2026-12-20T10:00:00'));
   assert.equal(cd.daysLeft, 8);
   assert.equal(cd.label, '还有 8 天');
-  console.log('   OK: Exam parser (empty kssj fallback) & GPA estimation flags verified.');
+  console.log('   OK: Exam parser, per-term GPA overview & score distribution verified.');
 
-  console.log('6) Testing RFC 5545 .ics calendar exporter (75-octet folding, UTC DTSTAMP, stable UIDs)...');
+  console.log('6) Testing idempotent alarm deduplication engine...');
+  const alarmA: AlarmRule = {
+    id: 'a1',
+    dedupeKey: buildWakeupAlarmDedupeKey(5, 1),
+    kind: 'morning_wakeup',
+    title: '周一早起',
+    body: '旧闹钟',
+    targetId: 'course-1',
+    triggerIso: '2026-10-05T07:25:00.000Z',
+    weekday: 1,
+    hour: 7,
+    minute: 25,
+    advanceMinutes: 45,
+    enabled: true,
+    notificationId: 'notif-old-1',
+  };
+  const alarmB: AlarmRule = {
+    ...alarmA,
+    id: 'a2',
+    body: '新闹钟',
+    notificationId: 'notif-new-2',
+  };
+  const examAlarm: AlarmRule = {
+    id: 'e1',
+    dedupeKey: buildExamAlarmDedupeKey('exam-1', 'pre'),
+    kind: 'exam',
+    title: '考试提醒',
+    body: '高数',
+    targetId: 'exam-1',
+    triggerIso: '2026-12-28T07:30:00.000Z',
+    weekday: 1,
+    hour: 7,
+    minute: 30,
+    advanceMinutes: 90,
+    enabled: true,
+    notificationId: 'notif-exam-1',
+  };
+  assert.equal(buildClassAlarmDedupeKey('c1', 3), 'class:c1:w3');
+  const mergedRes = mergeAlarmsIdempotently([alarmA, examAlarm], [alarmB]);
+  assert.equal(mergedRes.merged.length, 2, 'Duplicate alarm key must replace existing alarm');
+  assert.equal(mergedRes.replaced.length, 1);
+  assert.equal(mergedRes.replaced[0].notificationId, 'notif-old-1');
+  assert.equal(mergedRes.merged[0].notificationId, 'notif-new-2');
+  console.log('   OK: Alarm dedupe keys & idempotent replacement verified.');
+
+  console.log('7) Testing RFC 5545 .ics calendar exporter (75-octet folding, UTC DTSTAMP, stable UIDs)...');
   const sample = buildSampleGdouData(new Date('2026-11-22T10:00:00'));
   sample.courses[0].teacher = '张三丰教授\r第二行备注';
   sample.courses[0].weekText = '1-4周,6-12周(双),15周';
@@ -322,7 +440,6 @@ async function run() {
     const octets = encoder.encode(line).length;
     assert.ok(octets <= 75, `RFC 5545 violation: line length ${octets} > 75 bytes -> ${line}`);
   }
-  // Verify folding preserves full content when unfolded per RFC 5545
   const unfolded = ics1.replace(/\r\n /g, '');
   assert.ok(unfolded.includes('SUMMARY:海洋科学导论'));
   assert.ok(unfolded.includes('SUMMARY:【期末考试】高等数学（上）'));
@@ -331,8 +448,14 @@ async function run() {
   assert.ok(longFolded.includes('\r\n '), '86-octet description must be folded');
   console.log('   OK: RFC 5545 ICS (all', physicalLines.length, 'lines <= 75 octets) verified.');
 
-  console.log('7) Testing version consistency & Expo config plugin registration...');
+  console.log('8) Testing version consistency (app.json, package.json, package-lock.json) & config plugin...');
   assert.equal(pkgJson.version, appJson.expo.version, 'package.json and app.json versions must match');
+  assert.equal(pkgLockJson.version, appJson.expo.version, 'package-lock.json root version must match app.json');
+  assert.equal(
+    (pkgLockJson.packages as Record<string, { version?: string }>)['']?.version,
+    appJson.expo.version,
+    'package-lock.json packages[""].version must match app.json'
+  );
   assert.ok(
     (appJson.expo.plugins as unknown[]).includes('./plugins/withGdouZeroRetention'),
     'app.json must register ./plugins/withGdouZeroRetention'
@@ -343,14 +466,14 @@ async function run() {
   console.log(`   OK: Single-source version v${appJson.expo.version} & config plugin verified.`);
 
   if (runLive) {
-    console.log('8) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');
+    console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');
     const liveSession = await prepareGdouAuthSession();
     console.log('   LIVE route:', liveSession.isWebVpn ? 'wfw-webvpn' : 'campus-direct');
     console.log('   LIVE salt len:', liveSession.pwdEncryptSalt.length, 'execution:', liveSession.execution);
     assert.ok(liveSession.pwdEncryptSalt.length >= 16, 'Expected 16-byte pwdEncryptSalt');
     assert.ok(liveSession.execution.length > 0, 'Expected execution token');
   } else {
-    console.log('8) Live network handshake skipped (offline mode; pass --live to run).');
+    console.log('9) Live network handshake skipped (offline mode; pass --live to run).');
   }
 
   console.log('\nALL VERIFICATION CHECKS PASSED!');

@@ -75,15 +75,21 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
     mainHandler.post {
       try {
         val cm = CookieManager.getInstance()
-        cm.removeAllCookies(null)
+        cm.removeAllCookies {
+          try {
+            cm.flush()
+          } catch (flushErr: Throwable) {
+            Log.w("GdouHttp", "WebView CookieManager flush callback failed: \${flushErr.message}")
+          }
+        }
         cm.flush()
-      } catch (_: Throwable) {
-        // Ignore on devices without WebView provider initialized yet
+      } catch (err: Throwable) {
+        Log.w("GdouHttp", "WebView CookieManager purge skipped/failed: \${err.message}")
       }
       try {
         WebStorage.getInstance().deleteAllData()
-      } catch (_: Throwable) {
-        // Ignore if WebStorage is unavailable
+      } catch (err: Throwable) {
+        Log.w("GdouHttp", "WebView WebStorage purge skipped/failed: \${err.message}")
       }
     }
   }
@@ -167,14 +173,17 @@ class MainApplication : Application(), ReactApplication {
               Log.i("GdouHttp", "RESET_COOKIES before \${orig.method} \${orig.url.host}\${orig.url.encodedPath}")
             }
           }
-          val cleanedReq = if (resetBefore || clearAfter) {
-            orig.newBuilder()
-              .removeHeader("X-Gdou-Reset-Cookies-Before")
-              .removeHeader("X-Gdou-Clear-Cookies-After")
-              .build()
-          } else {
-            orig
+          // Unconditionally strip ALL internal X-Gdou-* headers regardless of value
+          val reqBuilder = orig.newBuilder()
+          var strippedAny = false
+          for (i in 0 until orig.headers.size) {
+            val hName = orig.headers.name(i)
+            if (hName.startsWith("X-Gdou-", ignoreCase = true)) {
+              reqBuilder.removeHeader(hName)
+              strippedAny = true
+            }
           }
+          val cleanedReq = if (strippedAny) reqBuilder.build() else orig
           try {
             chain.proceed(cleanedReq)
           } finally {
@@ -444,7 +453,12 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       GdouEphemeralCookieStore.shared.clearAll()
     }
 
-    // Never transmit internal control headers to any server
+    // Unconditionally strip ALL internal X-Gdou-* headers (case-insensitive) so none ever leave the device
+    if let allHeaders = mutable.allHTTPHeaderFields {
+      for key in allHeaders.keys where key.lowercased().hasPrefix("x-gdou-") {
+        mutable.setValue(nil, forHTTPHeaderField: key)
+      }
+    }
     mutable.setValue(nil, forHTTPHeaderField: Self.resetHeader)
     mutable.setValue(nil, forHTTPHeaderField: Self.clearHeader)
 
@@ -595,24 +609,31 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       return config
     }
 
-    // Defense-in-depth: strip internal headers even if any request bypasses the protocol class
+    // Defense-in-depth: unconditionally strip unexpected/non-http X-Gdou-* headers before transport
     RCTSetCustomHTTPRequestInterceptor { incomingRequest in
       let maybeReq: URLRequest? = incomingRequest
-      guard let req = maybeReq else { return nil }
-      let hasReset = req.value(forHTTPHeaderField: "X-Gdou-Reset-Cookies-Before") != nil
-      let hasClear = req.value(forHTTPHeaderField: "X-Gdou-Clear-Cookies-After") != nil
-      if !hasReset && !hasClear {
+      guard let req = maybeReq, let allFields = req.allHTTPHeaderFields else { return nil }
+      let gdouKeys = allFields.keys.filter { $0.lowercased().hasPrefix("x-gdou-") }
+      if gdouKeys.isEmpty {
         return nil
       }
-      // Keep headers intact when routing into GdouEphemeralURLProtocol; only sanitize non-http schemes
       let scheme = req.url?.scheme?.lowercased() ?? ""
-      if scheme == "http" || scheme == "https" {
-        return nil
-      }
+      let isHttpProtocol = (scheme == "http" || scheme == "https")
       let mutable = (req as NSURLRequest).mutableCopy() as? NSMutableURLRequest
-      mutable?.setValue(nil, forHTTPHeaderField: "X-Gdou-Reset-Cookies-Before")
-      mutable?.setValue(nil, forHTTPHeaderField: "X-Gdou-Clear-Cookies-After")
-      return mutable.map { $0 as URLRequest }
+      var modified = false
+      for key in gdouKeys {
+        let lower = key.lowercased()
+        let val = req.value(forHTTPHeaderField: key)
+        let allowedProtocolControl =
+          isHttpProtocol &&
+          val == "1" &&
+          (lower == "x-gdou-reset-cookies-before" || lower == "x-gdou-clear-cookies-after")
+        if !allowedProtocolControl {
+          mutable?.setValue(nil, forHTTPHeaderField: key)
+          modified = true
+        }
+      }
+      return modified ? mutable.map { $0 as URLRequest } : nil
     }
   }
 }
@@ -708,8 +729,8 @@ function withGdouGradleProperties(config) {
 function withGdouAppBuildGradle(config) {
   return withAppBuildGradle(config, (mod) => {
     let contents = mod.modResults.contents;
-    const versionName = config.version || '1.2.0';
-    const versionCode = Number(config.android?.versionCode) || 2;
+    const versionName = config.version || '1.3.0';
+    const versionCode = Number(config.android?.versionCode) || 3;
 
     // 1. Sync versionCode & versionName from app.json (single source of truth)
     contents = contents.replace(/versionCode\s+\d+/, `versionCode ${versionCode}`);
@@ -783,8 +804,8 @@ function withGdouProguardRules(config) {
 
 function withGdouIosInfoPlist(config) {
   return withInfoPlist(config, (mod) => {
-    mod.modResults.CFBundleShortVersionString = config.version || '1.2.0';
-    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '2');
+    mod.modResults.CFBundleShortVersionString = config.version || '1.3.0';
+    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '3');
     mod.modResults.NSAppTransportSecurity = {
       NSAllowsArbitraryLoads: false,
       NSAllowsLocalNetworking: true,
