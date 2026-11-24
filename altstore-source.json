@@ -25,16 +25,16 @@
       "versionDate": "2026-11-24",
       "versionDescription": "v1.4.2：\n1. 双通道校外登录根治修复：恢复海大微门户（wfw）两阶段标准鉴权并锁定教务原始 service 票据校验，显式隔离代理 Cookie 路径（/authserver 与 / 不再冲突）及自动预热 urlss 路由，彻底解决极速直连「教务子会话验证未通过 / 901」与官网无痕网页「二次认证后 404」问题，且直连模式无缝支持第 2 步多因子验证；\n2. 非本周排课不计撞课、早起/课前/考前直写系统闹钟、Android/iOS 系统自动识别隐藏无关平台字样均完整保留。",
       "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.2/haida-schedule-v1.4.2-ios-unsigned.ipa",
-      "size": 11960000,
+      "size": 11965309,
       "minOSVersion": "16.4",
       "versions": [
         {
           "version": "1.4.2",
           "buildVersion": "8",
           "date": "2026-11-24",
-          "localizedDescription": "v1.4.2：\n1. 根治双通道校外登录失败：修复极速直连校外教务子会话验证未通过与 HTTP 901、修复官网无痕网页二次认证后 HTTP 404，直连全面支持第 2 步多因子验证码校验，双端原生 Cookie 池按路径去重隔离；\n2. 完整保留非本周不计撞课、系统闹钟直写与系统自动识别适配。",
+          "localizedDescription": "v1.4.2：\n1. 根治双通道校外登录失败：修复极速直连校外教务子会话验证失败 / HTTP 901、修复官网无痕网页二次认证后 HTTP 404，直连全面支持第 2 步多因子验证码校验，双端原生 Cookie 池按路径去重隔离；\n2. 完整保留非本周不计撞课、系统闹钟直写与系统自动识别适配。",
           "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.2/haida-schedule-v1.4.2-ios-unsigned.ipa",
-          "size": 11960000,
+          "size": 11965309,
           "minOSVersion": "16.4"
         },
         {
