@@ -13,6 +13,7 @@ import {
 import { DAY_FULL_LABELS, getActivePeriods } from '../constants/gdouTimetable';
 import {
   createClassAlarm,
+  openNativeSystemClockApp,
   setNativeAndroidSystemClockAlarm,
 } from '../services/alarmService';
 import { addSingleCourseToCalendar } from '../services/calendarService';
@@ -74,13 +75,31 @@ export const CourseDetailModal: React.FC<Props> = ({
   const { startText, endText } = getCourseTimeSpan(course, periods);
   const dayLabel = DAY_FULL_LABELS[course.dayOfWeek - 1] ?? `周${course.dayOfWeek}`;
 
-  const myCurrentWeekConflicts = courses.filter(
+  const myCurrentWeekItems = courses.filter(
     (c) => c.ownerTag !== 'partner' && c.weeks.includes(selectedWeek)
-  ).length;
-  const partnerCurrentWeekConflicts = courses.filter(
+  );
+  const partnerCurrentWeekItems = courses.filter(
     (c) => c.ownerTag === 'partner' && c.weeks.includes(selectedWeek)
-  ).length;
-  const hasRealConflict = myCurrentWeekConflicts >= 2 || partnerCurrentWeekConflicts >= 2;
+  );
+  const hasPairOverlap = (list: CourseItem[]) => {
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        if (
+          list[i].startSection <= list[j].endSection &&
+          list[j].startSection <= list[i].endSection
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  // Non-current-week courses are NEVER conflicts (`撞课`); only >=2 overlapping courses BOTH in selectedWeek count!
+  const hasRealConflict =
+    hasPairOverlap(myCurrentWeekItems) || hasPairOverlap(partnerCurrentWeekItems);
+  const hasBothPartners =
+    courses.some((c) => c.ownerTag !== 'partner') &&
+    courses.some((c) => c.ownerTag === 'partner');
 
   const handleAddToCalendar = async () => {
     setBusy(true);
@@ -118,35 +137,46 @@ export const CourseDetailModal: React.FC<Props> = ({
         existingAlarms
       );
       onAlarmCreated(rule);
+      const hhmm = `${String(rule.hour).padStart(2, '0')}:${String(rule.minute).padStart(2, '0')}`;
       Alert.alert(
-        '课前闹钟已设定',
-        `将在第 ${targetWeek} 周 ${dayLabel} 上课前 ${leadMinutes} 分钟（${String(
-          rule.hour
-        ).padStart(2, '0')}:${String(rule.minute).padStart(2, '0')}）响铃提醒（同周同课已自动去重）。`
+        Platform.OS === 'android' && rule.systemClockWritten
+          ? '已直接写入手机系统闹钟'
+          : '课前闹钟已设定',
+        Platform.OS === 'android' && rule.systemClockWritten
+          ? `已在手机自带「系统时钟」创建/更新 ${dayLabel} ${hhmm} 课前闹钟（提前 ${leadMinutes} 分钟 · ${targetCourse.name}）。`
+          : `将在第 ${targetWeek} 周 ${dayLabel} 上课前 ${leadMinutes} 分钟（${hhmm}）响铃提醒。`,
+        [
+          { text: '完成', style: 'cancel' },
+          {
+            text: '打开系统闹钟',
+            onPress: () => void openNativeSystemClockApp(),
+          },
+        ]
       );
     } catch (err) {
-      Alert.alert('设定闹钟失败', err instanceof Error ? err.message : String(err));
+      Alert.alert('设定系统闹钟失败', err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
   };
 
-  const handleAndroidSystemClock = async () => {
-    const [hStr, mStr] = startText.split(':');
-    const totalMinutes = parseInt(hStr, 10) * 60 + parseInt(mStr, 10) - leadMinutes;
-    const normalized = ((totalMinutes % 1440) + 1440) % 1440;
-    const hour = Math.floor(normalized / 60);
-    const minute = normalized % 60;
-    try {
+  const handleOpenSystemClockEditor = async () => {
+    if (Platform.OS === 'android') {
+      const [hStr, mStr] = startText.split(':');
+      const totalMinutes = parseInt(hStr, 10) * 60 + parseInt(mStr, 10) - leadMinutes;
+      const normalized = ((totalMinutes % 1440) + 1440) % 1440;
+      const hour = Math.floor(normalized / 60);
+      const minute = normalized % 60;
       await setNativeAndroidSystemClockAlarm({
         hour,
         minute,
         message: `${isPartnerCourse ? `[${partnerName}] ` : ''}${course.name} (${course.location})`,
         isoWeekdays: [course.dayOfWeek],
+        skipUi: false,
       });
-    } catch (err) {
-      Alert.alert('唤起系统时钟失败', err instanceof Error ? err.message : String(err));
+      return;
     }
+    await openNativeSystemClockApp();
   };
 
   const handleConfirmDeleteManual = () => {
@@ -178,9 +208,15 @@ export const CourseDetailModal: React.FC<Props> = ({
               <View style={styles.multiTopRow}>
                 <View style={styles.multiTitleRow}>
                   <Ionicons
-                    name={hasRealConflict ? 'warning' : 'layers'}
+                    name={hasRealConflict ? 'warning' : hasBothPartners ? 'heart' : 'calendar-outline'}
                     size={15}
-                    color={hasRealConflict ? COLORS.coral : COLORS.oceanPrimary}
+                    color={
+                      hasRealConflict
+                        ? COLORS.coral
+                        : hasBothPartners
+                          ? '#DB2777'
+                          : COLORS.oceanPrimary
+                    }
                   />
                   <Text
                     style={[
@@ -188,7 +224,11 @@ export const CourseDetailModal: React.FC<Props> = ({
                       hasRealConflict && { color: '#C2410C' },
                     ]}
                   >
-                    该时段共 {courses.length} 门课程 · 点击切换查看（{safeIndex + 1}/{courses.length}）
+                    {hasRealConflict
+                      ? `第 ${selectedWeek} 周该时段有同周重课 · 点击切换（${safeIndex + 1}/${courses.length}）`
+                      : hasBothPartners
+                        ? `我与 ${partnerName} 该时段排课（${safeIndex + 1}/${courses.length}）`
+                        : `该时段不同周次排课共 ${courses.length} 门（本周不撞课 · ${safeIndex + 1}/${courses.length}）`}
                   </Text>
                 </View>
 
@@ -387,26 +427,28 @@ export const CourseDetailModal: React.FC<Props> = ({
             >
               <Ionicons name="alarm" size={18} color={COLORS.white} />
               <Text style={styles.actionBtnText}>
-                设第{' '}
-                {isCurrentWeek
-                  ? selectedWeek
-                  : course.weeks.find((w) => w > selectedWeek) ?? course.weeks[0] ?? selectedWeek}{' '}
-                周课前闹钟
+                {Platform.OS === 'android'
+                  ? `直接设为手机系统闹钟（提前 ${leadMinutes} 分）`
+                  : `设第 ${
+                      isCurrentWeek
+                        ? selectedWeek
+                        : course.weeks.find((w) => w > selectedWeek) ?? course.weeks[0] ?? selectedWeek
+                    } 周课前闹钟`}
               </Text>
             </TouchableOpacity>
 
-            {Platform.OS === 'android' && (
-              <TouchableOpacity
-                style={[styles.actionBtn, styles.sysClockBtn]}
-                onPress={handleAndroidSystemClock}
-                disabled={busy}
-              >
-                <Ionicons name="time" size={18} color={COLORS.oceanDeep} />
-                <Text style={[styles.actionBtnText, { color: COLORS.oceanDeep }]}>
-                  写入 Android 系统时钟闹钟
-                </Text>
-              </TouchableOpacity>
-            )}
+            <TouchableOpacity
+              style={[styles.actionBtn, styles.sysClockBtn]}
+              onPress={handleOpenSystemClockEditor}
+              disabled={busy}
+            >
+              <Ionicons name="time" size={18} color={COLORS.oceanDeep} />
+              <Text style={[styles.actionBtnText, { color: COLORS.oceanDeep }]}>
+                {Platform.OS === 'android'
+                  ? '打开系统闹钟面板手动微调铃声'
+                  : '打开 iOS 系统时钟 App 查看/设定'}
+              </Text>
+            </TouchableOpacity>
 
             <View style={styles.bottomSubRow}>
               {onAddManualCourseInSlot && (

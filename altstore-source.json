@@ -20,14 +20,23 @@
       "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
       "tintColor": "#0284C7",
       "category": "utilities",
-      "version": "1.4.0",
-      "buildVersion": "6",
+      "version": "1.4.1",
+      "buildVersion": "7",
       "versionDate": "2026-11-24",
-      "versionDescription": "v1.4.0：\n1. 同时间多节课点击查看：重叠课程自动聚合角标，点击可在弹窗内切换查看每门课，并支持点击课表网格手动加课；\n2. 非本周课程同屏展示：课表顶栏新增「非本周」一键开关，灰底标签清晰区分本周与非本周排课；\n3. 软件内 GitHub 直接下载与更新：支持在软件内直接从 GitHub 下载 iOS/Android 热更新包免电脑免重签立即生效（含防白屏自动回滚），同时支持应用内进度条直下 IPA/APK 安装包并一键导入 SideStore/TrollStore/Feather；\n4. 全新情侣课表功能：支持双人同屏对比、「♡ 共同没课」空闲标记、同堂/同楼统计，支持微信/QQ口令互传、JSON 文件导入或面对面无痕代拉取。",
-      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-ios-unsigned.ipa",
+      "versionDescription": "v1.4.1：\n1. 登录同步彻底修复：修复校外极速直连报 HTTP 901 与无痕网页二次验证后报 HTTP 404 的路由/票据问题，实现一步直通海大教务；\n2. 非本周排课不计撞课：严格限定仅同一人同周重叠才标记撞课，非本周课程不挤压本周卡片、不桥接合并相邻节次；\n3. 定闹钟直改系统闹钟：早起/课前/考前定闹钟直接联动手机系统闹钟（Android 原生直写合并星期，iOS 支持时效提醒与一键跳转系统时钟）；\n4. 自动检测手机操作系统：自动识别 Android / iOS 平台并裁剪无关平台软件源与字样。",
+      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.1/haida-schedule-v1.4.1-ios-unsigned.ipa",
       "size": 11950704,
       "minOSVersion": "16.4",
       "versions": [
+        {
+          "version": "1.4.1",
+          "buildVersion": "7",
+          "date": "2026-11-24",
+          "localizedDescription": "v1.4.1：\n1. 修复校外极速直连报 HTTP 901 与官网无痕网页二次认证后报 HTTP 404 的登录故障，支持校外一步直通教务；\n2. 修复非本周排课误判撞课问题：非本周课程绝不标记撞课、不挤压本周卡片；\n3. 升级系统闹钟联动引擎，并支持 Android / iOS 系统自动检测与设置页精准适配。",
+          "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.1/haida-schedule-v1.4.1-ios-unsigned.ipa",
+          "size": 11950704,
+          "minOSVersion": "16.4"
+        },
         {
           "version": "1.4.0",
           "buildVersion": "6",

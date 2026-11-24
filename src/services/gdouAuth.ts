@@ -4,11 +4,13 @@ import {
   DEFAULT_DESKTOP_UA,
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
+  GDOU_AUTH_WFW_BASE,
   GDOU_JW_DIRECT_ORIGIN,
   GDOU_JW_PATHS,
   GDOU_JW_PREFIXES,
   GDOU_JW_SSO_SERVICE,
   GDOU_JW_WFW_BASE,
+  GDOU_JW_WFW_SSO_SERVICE,
   GDOU_WFW_ORIGIN,
 } from '../constants/gdouEndpoints';
 import { deriveCurrentTermParams, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
@@ -346,11 +348,11 @@ export async function prepareGdouAuthSession(
   const { isWebVpn, html: netHtml } = await probeGdouNetworkRoute(options);
   const jwBaseUrl = isWebVpn ? GDOU_JW_WFW_BASE : GDOU_JW_DIRECT_ORIGIN;
 
-  // Off-campus WebVPN requires authenticating WFWSESSID via CAS service=https://wfw.gdou.edu.cn/
+  // Off-campus WebVPN authenticates directly on wfw.gdou.edu.cn with GDOU_JW_WFW_SSO_SERVICE in 1 single login
   const serviceUrl = isWebVpn
-    ? `${GDOU_WFW_ORIGIN}/`
+    ? GDOU_JW_WFW_SSO_SERVICE
     : extractServiceUrl(netHtml) || GDOU_JW_SSO_SERVICE;
-  const authOrigin = GDOU_AUTH_ORIGIN;
+  const authOrigin = isWebVpn ? GDOU_WFW_ORIGIN : GDOU_AUTH_ORIGIN;
   const authLoginUrl = `${authOrigin}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(serviceUrl)}`;
 
   let authResp = await fetchWithTimeout(
@@ -1328,9 +1330,10 @@ export async function completeWfwSubAuthAndSync(
     rawPassword = '';
     log('5b. 教务子会话密码已本地加密并释放内存引用，正在激活校外教务通道...');
 
+    const authPostBase = isNativeMobileRuntime() ? GDOU_AUTH_WFW_BASE : GDOU_WFW_ORIGIN;
     const wfwAuthPostUrl =
-      `${GDOU_WFW_ORIGIN}${GDOU_AUTH_PATHS.login}?service=` +
-      encodeURIComponent(GDOU_JW_SSO_SERVICE);
+      `${authPostBase}${GDOU_AUTH_PATHS.login}?service=` +
+      encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE);
 
     const wfwPostResp = await fetchWithTimeout(
       wfwAuthPostUrl,
@@ -1474,7 +1477,9 @@ async function completeCasToJwHandoff(
   const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
 
   if (session.isWebVpn) {
-    if (needWfwActivation) {
+    const isLegacyTwoStepWfw = session.serviceUrl === `${GDOU_WFW_ORIGIN}/`;
+
+    if (isLegacyTwoStepWfw && needWfwActivation) {
       const wfwTicketUrl = `${session.authOrigin}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
         `${GDOU_WFW_ORIGIN}/`
       )}`;
@@ -1493,6 +1498,42 @@ async function completeCasToJwHandoff(
         );
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') throw err;
+      }
+    }
+
+    if (!isLegacyTwoStepWfw) {
+      // 1-step off-campus wfw CAS -> JWXT ticket handoff (used right after MFA reAuthSubmit.do)
+      // Uses GDOU_AUTH_WFW_BASE on native runtimes so wfw always routes to authserver even if urlss=jw
+      const wfwCasBase = isNativeMobileRuntime() ? GDOU_AUTH_WFW_BASE : session.authOrigin;
+      const jwTicketUrl = `${wfwCasBase}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+        GDOU_JW_WFW_SSO_SERVICE
+      )}`;
+      const ticketResp = await fetchWithTimeout(
+        jwTicketUrl,
+        {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            'User-Agent': ua,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        },
+        options
+      );
+      const ticketHtml = await ticketResp.text();
+      const tSalt = extractHiddenInput(ticketHtml, 'pwdEncryptSalt');
+      const tExe = extractHiddenInput(ticketHtml, 'execution');
+      const tLt = extractHiddenInput(ticketHtml, 'lt');
+      if (!tSalt || !tExe) {
+        return { status: 'ready' };
+      }
+      if (!ephemeralForWfw?.username || !ephemeralForWfw?.password) {
+        return {
+          status: 'wfw_subauth_needed',
+          salt2: tSalt,
+          execution2: tExe,
+          lt2: tLt,
+        };
       }
     }
 
@@ -1515,7 +1556,41 @@ async function completeCasToJwHandoff(
     const lt2 = extractHiddenInput(jwEntryHtml, 'lt');
 
     if (!salt2 || !exe2) {
-      // Already inside JWXT portal without needing a second proxied login
+      if (
+        jwEntryResp.ok &&
+        (jwEntryHtml.includes('index_initMenu') ||
+          jwEntryHtml.includes('教学管理信息服务平台') ||
+          jwEntryHtml.includes('xskbcx') ||
+          jwEntryHtml.includes('xnm'))
+      ) {
+        return { status: 'ready' };
+      }
+      // Recover if bare /authserver/login previously hit 404 due to urlss=jw
+      const recoverBase = isNativeMobileRuntime() ? GDOU_AUTH_WFW_BASE : GDOU_WFW_ORIGIN;
+      const recoverResp = await fetchWithTimeout(
+        `${recoverBase}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE)}`,
+        {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            'User-Agent': ua,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        },
+        options
+      );
+      const recoverHtml = await recoverResp.text();
+      const rSalt = extractHiddenInput(recoverHtml, 'pwdEncryptSalt');
+      const rExe = extractHiddenInput(recoverHtml, 'execution');
+      const rLt = extractHiddenInput(recoverHtml, 'lt');
+      if (rSalt && rExe && (!ephemeralForWfw?.username || !ephemeralForWfw?.password)) {
+        return {
+          status: 'wfw_subauth_needed',
+          salt2: rSalt,
+          execution2: rExe,
+          lt2: rLt,
+        };
+      }
       return { status: 'ready' };
     }
 
@@ -1528,9 +1603,10 @@ async function completeCasToJwHandoff(
       };
     }
 
+    const authPostBase = isNativeMobileRuntime() ? GDOU_AUTH_WFW_BASE : GDOU_WFW_ORIGIN;
     try {
       await fetchWithTimeout(
-        `${GDOU_WFW_ORIGIN}${GDOU_AUTH_PATHS.bfpInfo}?bfp=${session.ephemeralBfp}`,
+        `${authPostBase}${GDOU_AUTH_PATHS.bfpInfo}?bfp=${session.ephemeralBfp}`,
         {
           method: 'GET',
           credentials: 'include',
@@ -1544,8 +1620,8 @@ async function completeCasToJwHandoff(
 
     const encryptedPwd2 = encryptGdouPassword(ephemeralForWfw.password, salt2);
     const wfwAuthPostUrl =
-      `${GDOU_WFW_ORIGIN}${GDOU_AUTH_PATHS.login}?service=` +
-      encodeURIComponent(GDOU_JW_SSO_SERVICE);
+      `${authPostBase}${GDOU_AUTH_PATHS.login}?service=` +
+      encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE);
 
     const wfwPostResp = await fetchWithTimeout(
       wfwAuthPostUrl,
@@ -1661,7 +1737,34 @@ async function pullAllJwData(
   );
   log(`5. 已锁定目标学期：${termLabel} (xnm=${xnm}, xqm=${xqm})`);
 
-  let rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm, options);
+  let rawSchedule: unknown;
+  try {
+    rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm, options);
+  } catch (firstErr) {
+    if (firstErr instanceof Error && firstErr.name === 'AbortError') throw firstErr;
+    // Automatic 1-shot CAS->JWXT ticket recovery if JWXT returned HTTP 901 before cookie settled
+    const retryCasBase =
+      session.isWebVpn && isNativeMobileRuntime() ? GDOU_AUTH_WFW_BASE : session.authOrigin;
+    const retrySvc = session.isWebVpn ? GDOU_JW_WFW_SSO_SERVICE : GDOU_JW_SSO_SERVICE;
+    await fetchWithTimeout(
+      `${retryCasBase}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(retrySvc)}`,
+      {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'User-Agent': options.userAgent ?? DEFAULT_DESKTOP_UA,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      },
+      options
+    );
+    const redetected = await detectJwPrefixAndTerm(session.jwBaseUrl, termOverride, options);
+    prefix = redetected.prefix;
+    xnm = redetected.xnm;
+    xqm = redetected.xqm;
+    termLabel = redetected.termLabel;
+    rawSchedule = await fetchJwScheduleJson(session.jwBaseUrl, prefix, xnm, xqm, options);
+  }
   let parsedSchedule = parseZfScheduleResponse(rawSchedule);
 
   // If current default term hasn't published courses yet and user didn't force a term, auto-fallback to previous term
@@ -1949,11 +2052,17 @@ export async function executeOneShotGdouSync(
     }
 
     log('3. 海大统一身份认证通过，正在激活教务系统会话...');
+    const alreadyLandedOnJw =
+      loginFinalUrl.includes('jw.gdou.edu.cn') &&
+      !loginHtml.includes('pwdEncryptSalt') &&
+      !loginHtml.includes('reAuthParams');
     const needWfwActivation = session.isWebVpn && !loginFinalUrl.includes('wfw.gdou.edu.cn');
     const handoffSecret = session.isWebVpn ? { username, password: rawPassword } : undefined;
     rawPassword = '';
     try {
-      await completeCasToJwHandoff(session, needWfwActivation, handoffSecret, reqOpts);
+      if (!alreadyLandedOnJw) {
+        await completeCasToJwHandoff(session, needWfwActivation, handoffSecret, reqOpts);
+      }
     } finally {
       if (handoffSecret) {
         handoffSecret.username = '';
@@ -2079,6 +2188,10 @@ export function buildIncognitoWebViewPreloadScript(): string {
           out = out.replace(/^http:\\/\\//i, 'https://');
         }
         if (host === 'wfw.gdou.edu.cn') {
+          var wrongSso = out.match(/^(?:https?:\\/\\/wfw\\.gdou\\.edu\\.cn)?(?:\\/https?:\\/\\/authserver\\.gdou\\.edu\\.cn)?\\/sso\\/jziotlogin([?#].*)?$/i);
+          if (wrongSso) {
+            return 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin' + (wrongSso[1] || '');
+          }
           var m = out.match(/^(?:https?:\\/\\/wfw\\.gdou\\.edu\\.cn)?\\/https?:\\/\\/(?:jw|authserver)\\.gdou\\.edu\\.cn(\\/authserver\\/.*)$/i);
           if (m && m[1]) {
             out = m[1];
@@ -2163,7 +2276,8 @@ export function buildIncognitoWebViewSyncScript(
     jwDirect: GDOU_JW_DIRECT_ORIGIN,
     jwWfw: GDOU_JW_WFW_BASE,
     jwSsoService: GDOU_JW_SSO_SERVICE,
-    expectedService: expectedServiceUrl || `${GDOU_WFW_ORIGIN}/`,
+    jwWfwSsoService: GDOU_JW_WFW_SSO_SERVICE,
+    expectedService: expectedServiceUrl || GDOU_JW_WFW_SSO_SERVICE,
     authLogin: GDOU_AUTH_PATHS.login,
     authLogout: GDOU_AUTH_PATHS.logout,
   });
@@ -2387,8 +2501,10 @@ export function buildIncognitoWebViewSyncScript(
           setTimeout(fixAuthLinks, 400);
         } catch (e) {}
 
-        // Show clear Step 2 in-page guidance banner so users know Step 1 succeeded (not a login reset)
+        // Show clear in-page guidance banner on wfw auth/MFA pages
         try {
+          var isAfterStep1 = false;
+          try { isAfterStep1 = sessionStorage.getItem('__gdou_wfw_authed__') === '1'; } catch (e) {}
           if (!document.getElementById('__gdou_wfw_step2_banner__') && document.body) {
             var banner = document.createElement('div');
             banner.id = '__gdou_wfw_step2_banner__';
@@ -2396,8 +2512,10 @@ export function buildIncognitoWebViewSyncScript(
               'margin:10px 16px 6px;padding:10px 12px;border-radius:10px;background:#ECFDF5;border:1px solid #6EE7B7;color:#065F46;font-size:13px;line-height:1.5;font-weight:600;box-sizing:border-box;';
             banner.textContent =
               href.indexOf('reAuthLoginView') !== -1 || html.indexOf('reAuthParams') !== -1
-                ? '第 2 步：请完成校外教务通道多因子验证，验证通过后将自动拉取课表与成绩。'
-                : '第 1 步校外微门户已认证通过！因海大校外通道独立鉴权，请再登录一次以进入教务系统（支持账号密码或手机验证码），通过后自动同步。';
+                ? '请完成海大多因子二次安全验证（短信 / 企业微信），验证通过后将自动拉取课表与成绩。'
+                : isAfterStep1
+                  ? '第 1 步校外微门户已认证通过！请再登录一次以进入教务系统，通过后自动同步。'
+                  : '已接入海大校外教务直通通道（支持账号密码或手机验证码登录），验证通过后自动同步课表与成绩。';
             document.body.insertBefore(banner, document.body.firstChild);
           }
         } catch (e) {}
@@ -2406,8 +2524,8 @@ export function buildIncognitoWebViewSyncScript(
           type: 'PROGRESS',
           message:
             href.indexOf('reAuthLoginView') !== -1 || html.indexOf('reAuthParams') !== -1
-              ? '第 2 步：请完成校外教务多因子安全验证'
-              : '第 2 步：校外微门户已通过，请再登录一次进入教务系统即可自动同步',
+              ? '请完成海大多因子二次安全验证（短信 / 企业微信）'
+              : '请完成海大统一身份认证（验证通过后自动同步）',
         });
         return;
       }
@@ -2497,11 +2615,9 @@ export function buildIncognitoWebViewSyncScript(
               }
             } catch (e) {}
             window.__GDOU_SYNC_RUNNING__ = false;
-            post({ type: 'PROGRESS', message: '第 1 步已通过，正在进入第 2 步教务登录页...' });
-            // Use /authserver/login directly on wfw.gdou.edu.cn so Path=/authserver cookies (JSESSIONID & route) always attach
-            window.location.replace(
-              ORIGINS.wfw + ORIGINS.authLogin + '?service=' + encodeURIComponent(ORIGINS.jwSsoService)
-            );
+            post({ type: 'PROGRESS', message: '正在进入校外教务认证通道...' });
+            // Navigate directly to ORIGINS.jwWfw (never bare /authserver/login after touching jwWfw, which causes HTTP 404 when urlss=jw!)
+            window.location.replace(ORIGINS.jwWfw);
             return;
           }
 
@@ -2663,7 +2779,7 @@ export function buildIncognitoWebViewSyncScript(
           // Real HTTP-verified logout + web storage cleanup
           var logoutTargets = [root + prefix + '/logout'];
           if (isWebVpn) logoutTargets.push(ORIGINS.wfw + '/logout');
-          var casLogoutUrl = ORIGINS.auth + ORIGINS.authLogout;
+          var casLogoutUrl = (isWebVpn ? ORIGINS.wfw : ORIGINS.auth) + ORIGINS.authLogout;
           var logoutAttempted = 0;
           var logoutSucceeded = 0;
           var failedEndpoints = [];

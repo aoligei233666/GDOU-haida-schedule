@@ -67,12 +67,60 @@ function sortClusterItems(a: AnnotatedCourse, b: AnnotatedCourse): number {
   return a.course.id.localeCompare(b.course.id);
 }
 
+function hasPairwiseSectionOverlap(items: AnnotatedCourse[]): boolean {
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      if (
+        items[i].course.startSection <= items[j].course.endSection &&
+        items[j].course.startSection <= items[i].course.endSection
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+interface RawIntervalGroup {
+  startSection: number;
+  endSection: number;
+  items: AnnotatedCourse[];
+}
+
+function groupConnectedIntervals(sortedItems: AnnotatedCourse[]): RawIntervalGroup[] {
+  if (sortedItems.length === 0) return [];
+  const groups: RawIntervalGroup[] = [];
+  let curItems: AnnotatedCourse[] = [sortedItems[0]];
+  let curStart = sortedItems[0].course.startSection;
+  let curEnd = sortedItems[0].course.endSection;
+
+  for (let i = 1; i < sortedItems.length; i++) {
+    const next = sortedItems[i];
+    if (next.course.startSection <= curEnd) {
+      curItems.push(next);
+      curStart = Math.min(curStart, next.course.startSection);
+      curEnd = Math.max(curEnd, next.course.endSection);
+    } else {
+      groups.push({ startSection: curStart, endSection: curEnd, items: curItems });
+      curItems = [next];
+      curStart = next.course.startSection;
+      curEnd = next.course.endSection;
+    }
+  }
+  groups.push({ startSection: curStart, endSection: curEnd, items: curItems });
+  return groups;
+}
+
 /**
- * Groups visible timetable courses on each weekday into connected interval-overlap clusters.
+ * Groups visible timetable courses on each weekday into slot clusters.
  * Guarantees:
- * 1. Overlapping classes at the same time never silently cover each other — all are attached to `cluster.items`.
- * 2. Current-week classes (`isCurrentWeek=true`) always take display priority over non-current-week classes.
- * 3. Supports personal ('mine'), partner ('partner'), and dual ('couple') timetable views.
+ * 1. Non-current-week courses NEVER count as conflicts (`撞课`) and NEVER bridge or merge
+ *    separate current-week courses (e.g. a non-current-week 1-4节 lab will never merge
+ *    current-week 1-2节 and 3-4节 lectures into a fake conflict).
+ * 2. Current-week classes (`isCurrentWeek=true`) always keep their exact section height and
+ *    primary display priority; overlapping non-current-week courses attach silently for tap-to-view.
+ * 3. `hasSameWeekConflict` is ONLY true when >= 2 courses of the same person BOTH occur in `selectedWeek`
+ *    and directly overlap in sections.
  */
 export function buildTimetableClusters(options: {
   myCourses: CourseItem[];
@@ -119,9 +167,46 @@ export function buildTimetableClusters(options: {
 
   const clusters: TimetableSlotCluster[] = [];
 
+  const finalizeCluster = (day: number, groupStart: number, groupEnd: number, rawItems: AnnotatedCourse[]) => {
+    const sorted = [...rawItems].sort(sortClusterItems);
+    const primary = sorted[0];
+    const currentWeekItems = sorted.filter((i) => i.isCurrentWeek);
+    const myCurrentItems = currentWeekItems.filter((i) => i.owner === 'mine');
+    const partnerCurrentItems = currentWeekItems.filter((i) => i.owner === 'partner');
+
+    // STRICT: Only >= 2 same-owner courses BOTH active in selectedWeek AND overlapping in sections count as a conflict!
+    const hasSameWeekConflict =
+      hasPairwiseSectionOverlap(myCurrentItems) ||
+      hasPairwiseSectionOverlap(partnerCurrentItems);
+    const hasBothPartnersInWeek = myCurrentItems.length >= 1 && partnerCurrentItems.length >= 1;
+
+    let isSameCourseTogether = false;
+    if (hasBothPartnersInWeek) {
+      const myNames = new Set(myCurrentItems.map((i) => i.course.name.trim()));
+      isSameCourseTogether = partnerCurrentItems.some((i) => myNames.has(i.course.name.trim()));
+    }
+
+    clusters.push({
+      id: `cluster-d${day}-s${groupStart}-${groupEnd}-${primary.owner}-${primary.course.id}`,
+      dayOfWeek: day,
+      startSection: groupStart,
+      endSection: groupEnd,
+      items: sorted,
+      primary,
+      currentWeekCount: currentWeekItems.length,
+      nonCurrentWeekCount: sorted.length - currentWeekItems.length,
+      hasSameWeekConflict,
+      hasBothPartnersInWeek,
+      isSameCourseTogether,
+    });
+  };
+
   for (let day = 1; day <= 7; day++) {
-    const dayItems = candidates
-      .filter((item) => item.course.dayOfWeek === day)
+    const dayItems = candidates.filter((item) => item.course.dayOfWeek === day);
+    if (dayItems.length === 0) continue;
+
+    const currentDayItems = dayItems
+      .filter((item) => item.isCurrentWeek)
       .sort(
         (a, b) =>
           a.course.startSection - b.course.startSection ||
@@ -129,62 +214,43 @@ export function buildTimetableClusters(options: {
           sortClusterItems(a, b)
       );
 
-    if (dayItems.length === 0) continue;
+    const nonCurrentDayItems = dayItems
+      .filter((item) => !item.isCurrentWeek)
+      .sort(
+        (a, b) =>
+          a.course.startSection - b.course.startSection ||
+          b.course.endSection - a.course.endSection ||
+          sortClusterItems(a, b)
+      );
 
-    let group: AnnotatedCourse[] = [dayItems[0]];
-    let groupStart = dayItems[0].course.startSection;
-    let groupEnd = dayItems[0].course.endSection;
+    // 1. Cluster current-week courses strictly among themselves (never bridged by non-current-week courses)
+    const currentGroups = groupConnectedIntervals(currentDayItems);
 
-    const flushGroup = () => {
-      const sorted = [...group].sort(sortClusterItems);
-      const primary = sorted[0];
-      const currentWeekItems = sorted.filter((i) => i.isCurrentWeek);
-      const myCurrentCount = currentWeekItems.filter((i) => i.owner === 'mine').length;
-      const partnerCurrentCount = currentWeekItems.filter((i) => i.owner === 'partner').length;
-      const hasSameWeekConflict = myCurrentCount >= 2 || partnerCurrentCount >= 2;
-      const hasBothPartnersInWeek = myCurrentCount >= 1 && partnerCurrentCount >= 1;
-
-      let isSameCourseTogether = false;
-      if (hasBothPartnersInWeek) {
-        const myNames = new Set(
-          currentWeekItems
-            .filter((i) => i.owner === 'mine')
-            .map((i) => i.course.name.trim())
-        );
-        isSameCourseTogether = currentWeekItems.some(
-          (i) => i.owner === 'partner' && myNames.has(i.course.name.trim())
-        );
-      }
-
-      clusters.push({
-        id: `cluster-d${day}-s${groupStart}-${groupEnd}-${primary.owner}-${primary.course.id}`,
-        dayOfWeek: day,
-        startSection: groupStart,
-        endSection: groupEnd,
-        items: sorted,
-        primary,
-        currentWeekCount: currentWeekItems.length,
-        nonCurrentWeekCount: sorted.length - currentWeekItems.length,
-        hasSameWeekConflict,
-        hasBothPartnersInWeek,
-        isSameCourseTogether,
-      });
-    };
-
-    for (let i = 1; i < dayItems.length; i++) {
-      const next = dayItems[i];
-      if (next.course.startSection <= groupEnd) {
-        group.push(next);
-        groupStart = Math.min(groupStart, next.course.startSection);
-        groupEnd = Math.max(groupEnd, next.course.endSection);
+    // 2. Attach overlapping non-current-week courses to existing current-week clusters (preserving current-week bounds);
+    //    keep standalone non-current-week courses only where no current-week course occupies the slot.
+    const standaloneNonCurrent: AnnotatedCourse[] = [];
+    for (const nonCur of nonCurrentDayItems) {
+      const overlappingCurrentGroups = currentGroups.filter(
+        (g) => nonCur.course.startSection <= g.endSection && nonCur.course.endSection >= g.startSection
+      );
+      if (overlappingCurrentGroups.length > 0) {
+        for (const targetGroup of overlappingCurrentGroups) {
+          targetGroup.items.push(nonCur);
+        }
       } else {
-        flushGroup();
-        group = [next];
-        groupStart = next.course.startSection;
-        groupEnd = next.course.endSection;
+        standaloneNonCurrent.push(nonCur);
       }
     }
-    flushGroup();
+
+    const nonCurrentGroups = groupConnectedIntervals(standaloneNonCurrent);
+
+    const allDayGroups = [...currentGroups, ...nonCurrentGroups].sort(
+      (a, b) => a.startSection - b.startSection || b.endSection - a.endSection
+    );
+
+    for (const g of allDayGroups) {
+      finalizeCluster(day, g.startSection, g.endSection, g.items);
+    }
   }
 
   return clusters;

@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,7 +17,10 @@ import {
   DAY_LABELS,
   getActivePeriods,
 } from '../constants/gdouTimetable';
-import { createWeeklyMorningWakeupAlarms } from '../services/alarmService';
+import {
+  createWeeklyMorningWakeupAlarms,
+  openNativeSystemClockApp,
+} from '../services/alarmService';
 import { syncAllCoursesToCalendar } from '../services/calendarService';
 import {
   computeTermWeek,
@@ -247,7 +251,7 @@ export const ScheduleScreen: React.FC<Props> = ({
     }
     setBusyAction('alarm');
     try {
-      const { created, replacedCount, skippedPast, failed, exactAlarmHint } =
+      const { created, systemClockGroupsCount, replacedCount, skippedPast, failed, exactAlarmHint } =
         await createWeeklyMorningWakeupAlarms(
           courses,
           selectedWeek,
@@ -258,19 +262,27 @@ export const ScheduleScreen: React.FC<Props> = ({
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
-      const dedupeNote = replacedCount > 0 ? `（已自动覆盖更新 ${replacedCount} 条旧闹钟，无重复响铃）` : '';
+      const dedupeNote = replacedCount > 0 ? `（已自动更新 ${replacedCount} 条旧记录）` : '';
       const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
-      Alert.alert(
-        '早起闹钟生成完成',
-        created.length > 0
-          ? `已为第 ${selectedWeek} 周配置 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${
-              skippedPast > 0 ? `，已自动跳过 ${skippedPast} 个过去时段` : ''
-            }${failNote}。${hintNote}`
-          : `第 ${selectedWeek} 周的所有课程时间均已过去，请切换到未来周次后生成。`
-      );
+      const sysMsg =
+        Platform.OS === 'android' && systemClockGroupsCount > 0
+          ? `已直接写入手机系统闹钟 ${systemClockGroupsCount} 组（同唤醒时间点已自动合并星期，首节课提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${failNote}。`
+          : created.length > 0
+            ? `已为第 ${selectedWeek} 周配置 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${
+                skippedPast > 0 ? `，已跳过 ${skippedPast} 个过去时段` : ''
+              }${failNote}。${hintNote}`
+            : `第 ${selectedWeek} 周的所有课程时间均已过去，请切换到未来周次后生成。`;
+
+      Alert.alert('系统早起闹钟设置完成', sysMsg, [
+        { text: '好的', style: 'cancel' },
+        {
+          text: '打开系统闹钟查看',
+          onPress: () => void openNativeSystemClockApp(),
+        },
+      ]);
     } catch (err) {
-      Alert.alert('生成闹钟失败', err instanceof Error ? err.message : String(err));
+      Alert.alert('设置系统闹钟失败', err instanceof Error ? err.message : String(err));
     } finally {
       setBusyAction(null);
     }
@@ -303,20 +315,32 @@ export const ScheduleScreen: React.FC<Props> = ({
       Boolean(partnerTopItem) &&
       !cluster.isSameCourseTogether;
 
-    const secondaryItem = items.length > 1 ? items[1] : null;
+    const secondCurrentWeekItem = cluster.hasSameWeekConflict
+      ? items.find((i, idx) => idx > 0 && i.isCurrentWeek) ?? null
+      : null;
 
-    // Corner badge text & color for multi-course slots
+    // Corner badge text & color:
+    // IMPORTANT: Non-current-week courses are NEVER conflicts (`撞课`) and must not look like alerts!
     let cornerBadgeText: string | null = null;
     let cornerBadgeBg = COLORS.oceanPrimary;
+    let cornerBadgeTextColor = COLORS.white;
     if (cluster.isSameCourseTogether && viewMode === 'couple') {
-      cornerBadgeText = totalInSlot > 2 ? `同堂·${totalInSlot}` : '💞同堂';
+      cornerBadgeText = cluster.currentWeekCount > 2 ? `同堂·${cluster.currentWeekCount}` : '💞同堂';
       cornerBadgeBg = '#E11D48';
     } else if (cluster.hasSameWeekConflict) {
-      cornerBadgeText = `撞课${totalInSlot}`;
+      cornerBadgeText = `撞课${cluster.currentWeekCount}`;
       cornerBadgeBg = COLORS.coral;
-    } else if (totalInSlot >= 2) {
-      cornerBadgeText = `${totalInSlot}节▾`;
-      cornerBadgeBg = viewMode === 'couple' && cluster.hasBothPartnersInWeek ? '#DB2777' : '#0369A1';
+    } else if (viewMode === 'couple' && cluster.hasBothPartnersInWeek && totalInSlot > 2) {
+      cornerBadgeText = `${cluster.currentWeekCount}节▾`;
+      cornerBadgeBg = '#DB2777';
+    } else if (primary.isCurrentWeek && cluster.nonCurrentWeekCount > 0) {
+      // Subtle muted pill indicating another week's course also uses this slot (zero conflict styling)
+      cornerBadgeText = '含他周';
+      cornerBadgeBg = 'rgba(100, 116, 139, 0.16)';
+      cornerBadgeTextColor = '#475569';
+    } else if (!primary.isCurrentWeek && totalInSlot >= 2) {
+      cornerBadgeText = `他周${totalInSlot}门`;
+      cornerBadgeBg = '#94A3B8';
     }
 
     return (
@@ -327,7 +351,7 @@ export const ScheduleScreen: React.FC<Props> = ({
         style={[
           styles.courseCard,
           !primary.isCurrentWeek && styles.courseCardNonCurrent,
-          totalInSlot >= 2 && styles.courseCardStacked,
+          cluster.hasSameWeekConflict && styles.courseCardStacked,
           {
             top,
             left,
@@ -338,10 +362,12 @@ export const ScheduleScreen: React.FC<Props> = ({
           },
         ]}
       >
-        {/* Top-right multi-course / conflict / couple badge */}
+        {/* Top-right multi-course / couple / other-week badge */}
         {cornerBadgeText && (
           <View style={[styles.multiCornerBadge, { backgroundColor: cornerBadgeBg }]}>
-            <Text style={styles.multiCornerBadgeText}>{cornerBadgeText}</Text>
+            <Text style={[styles.multiCornerBadgeText, { color: cornerBadgeTextColor }]}>
+              {cornerBadgeText}
+            </Text>
           </View>
         )}
 
@@ -402,9 +428,9 @@ export const ScheduleScreen: React.FC<Props> = ({
               style={[
                 styles.cardName,
                 { color: theme.text },
-                cornerBadgeText ? { paddingRight: 22 } : null,
+                cornerBadgeText ? { paddingRight: 26 } : null,
               ]}
-              numberOfLines={secondaryItem ? 2 : 3}
+              numberOfLines={secondCurrentWeekItem ? 2 : 3}
             >
               {primary.course.name}
             </Text>
@@ -413,24 +439,23 @@ export const ScheduleScreen: React.FC<Props> = ({
               @{primary.course.location}
             </Text>
 
-            {!primary.isCurrentWeek && !secondaryItem && (
+            {!primary.isCurrentWeek && !secondCurrentWeekItem && (
               <Text style={styles.nonWeekRangeText} numberOfLines={1}>
                 {primary.course.weekText}
               </Text>
             )}
 
-            {primary.isCurrentWeek && !secondaryItem && spanCount >= 2 && (
+            {primary.isCurrentWeek && !secondCurrentWeekItem && spanCount >= 2 && (
               <Text style={[styles.cardTeacher, { color: theme.subtext }]} numberOfLines={1}>
                 {primary.course.teacher}
               </Text>
             )}
 
-            {/* Preview strip for 2nd overlapping course so user immediately sees it */}
-            {secondaryItem && spanCount >= 2 && (
+            {/* Preview strip ONLY when >= 2 courses are BOTH taught in the current selectedWeek */}
+            {secondCurrentWeekItem && spanCount >= 2 && (
               <View style={styles.secondCourseStrip}>
                 <Text style={styles.secondCourseStripText} numberOfLines={1}>
-                  +{secondaryItem.isCurrentWeek ? '' : '[非]'}
-                  {secondaryItem.course.name}
+                  +{secondCurrentWeekItem.course.name}
                 </Text>
               </View>
             )}
@@ -601,7 +626,7 @@ export const ScheduleScreen: React.FC<Props> = ({
           >
             <Ionicons name="alarm-outline" size={14} color={COLORS.white} />
             <Text style={styles.quickPillText}>
-              {busyAction === 'alarm' ? '生成中...' : '一键本周早起闹钟'}
+              {busyAction === 'alarm' ? '写入中...' : '一键本周系统早起闹钟'}
             </Text>
           </TouchableOpacity>
         </View>

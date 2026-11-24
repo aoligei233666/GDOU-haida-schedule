@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import {
   createExamAlarms,
+  openNativeSystemClockApp,
   setNativeAndroidSystemClockAlarm,
 } from '../services/alarmService';
 import { syncExamsToCalendar } from '../services/calendarService';
@@ -90,22 +91,30 @@ export const ExamsScreen: React.FC<Props> = ({
     }
     setBusy(true);
     try {
-      const { created, replacedCount, skipped, failed, exactAlarmHint } =
+      const { created, systemClockGroupsCount, replacedCount, skipped, failed, exactAlarmHint } =
         await createExamAlarms(exams, settings, alarms);
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
-      const dedupeNote = replacedCount > 0 ? `（已覆盖更新 ${replacedCount} 条旧闹钟，无重复响铃）` : '';
+      const dedupeNote = replacedCount > 0 ? `（已覆盖更新 ${replacedCount} 条旧记录）` : '';
       const failNote = failed > 0 ? `，另有 ${failed} 条创建失败` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
-      Alert.alert(
-        '考试闹钟已配置',
-        created.length > 0
-          ? `已配置 ${created.length} 条考前闹钟（含前晚 20:00 提醒 + 考前 ${settings.examAdvanceMinutes} 分钟出发闹钟）${dedupeNote}${
-              skipped > 0 ? `，已跳过 ${skipped} 场已结束或时间待定考试` : ''
-            }${failNote}。${hintNote}`
-          : '暂无可设置的未来考试提醒。'
-      );
+      const msg =
+        Platform.OS === 'android' && systemClockGroupsCount > 0
+          ? `已直接写入手机系统闹钟 ${systemClockGroupsCount} 场考前出发闹钟（考前 ${settings.examAdvanceMinutes} 分钟），并同步设置前晚 20:00 备考提醒${dedupeNote}${failNote}。`
+          : created.length > 0
+            ? `已配置 ${created.length} 条考前闹钟（含前晚 20:00 提醒 + 考前 ${settings.examAdvanceMinutes} 分钟出发闹钟）${dedupeNote}${
+                skipped > 0 ? `，已跳过 ${skipped} 场已结束或时间待定考试` : ''
+              }${failNote}。${hintNote}`
+            : '暂无可设置的未来考试提醒。';
+
+      Alert.alert('考试系统闹钟已配置', msg, [
+        { text: '好的', style: 'cancel' },
+        {
+          text: '打开系统闹钟查看',
+          onPress: () => void openNativeSystemClockApp(),
+        },
+      ]);
     } catch (err) {
       Alert.alert('设定考试闹钟失败', err instanceof Error ? err.message : String(err));
     } finally {
@@ -131,12 +140,20 @@ export const ExamsScreen: React.FC<Props> = ({
 
   const handleSingleExamAlarm = async (exam: ExamItem) => {
     try {
-      const { created } = await createExamAlarms([exam], settings, alarms);
-      if (created.length > 0) {
-        onAlarmsAdded(created);
+      const { created, systemClockGroupsCount } = await createExamAlarms([exam], settings, alarms);
+      if (created.length > 0 || systemClockGroupsCount > 0) {
+        if (created.length > 0) onAlarmsAdded(created);
         Alert.alert(
-          '考前闹钟已设定',
-          `已为《${exam.courseName}》配置 ${created.length} 条提醒闹钟（已自动去重）。`
+          Platform.OS === 'android' && systemClockGroupsCount > 0
+            ? '已直接写入手机系统闹钟'
+            : '考前闹钟已设定',
+          Platform.OS === 'android' && systemClockGroupsCount > 0
+            ? `已为《${exam.courseName}》在手机系统时钟创建考前 ${settings.examAdvanceMinutes} 分钟闹钟，并配置前晚提醒。`
+            : `已为《${exam.courseName}》配置 ${created.length} 条提醒闹钟（已自动去重）。`,
+          [
+            { text: '完成', style: 'cancel' },
+            { text: '打开系统闹钟', onPress: () => void openNativeSystemClockApp() },
+          ]
         );
       } else {
         Alert.alert('无法设置', '该考试时间已过或时间待定。');
@@ -154,6 +171,7 @@ export const ExamsScreen: React.FC<Props> = ({
       hour: trigger.getHours(),
       minute: trigger.getMinutes(),
       message: `考试：${exam.courseName} (${exam.location}${exam.seatNumber ? ` 座位${exam.seatNumber}` : ''})`,
+      skipUi: false,
     });
   };
 
@@ -228,7 +246,9 @@ export const ExamsScreen: React.FC<Props> = ({
             disabled={busy}
           >
             <Ionicons name="alarm-outline" size={15} color={COLORS.white} />
-            <Text style={styles.batchBtnText}>全部设考前闹钟</Text>
+            <Text style={styles.batchBtnText}>
+              {Platform.OS === 'android' ? '全部写入系统闹钟' : '全部设考前闹钟'}
+            </Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -328,15 +348,17 @@ export const ExamsScreen: React.FC<Props> = ({
                     onPress={() => handleSingleExamAlarm(exam)}
                   >
                     <Ionicons name="alarm-outline" size={14} color={COLORS.coral} />
-                    <Text style={[styles.smallActionText, { color: COLORS.coral }]}>订闹钟</Text>
+                    <Text style={[styles.smallActionText, { color: COLORS.coral }]}>
+                      {Platform.OS === 'android' ? '设系统闹钟' : '订闹钟'}
+                    </Text>
                   </TouchableOpacity>
                   {Platform.OS === 'android' && exam.startIso && (
                     <TouchableOpacity
                       style={styles.smallActionBtn}
                       onPress={() => handleAndroidExamClock(exam)}
                     >
-                      <Ionicons name="time-outline" size={14} color={COLORS.oceanDeep} />
-                      <Text style={[styles.smallActionText, { color: COLORS.oceanDeep }]}>系统时钟</Text>
+                      <Ionicons name="options-outline" size={14} color={COLORS.oceanDeep} />
+                      <Text style={[styles.smallActionText, { color: COLORS.oceanDeep }]}>微调铃声</Text>
                     </TouchableOpacity>
                   )}
                   {exam.isManual && (

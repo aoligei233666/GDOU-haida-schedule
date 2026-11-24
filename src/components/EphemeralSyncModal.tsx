@@ -19,7 +19,9 @@ import {
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
   GDOU_JW_SSO_SERVICE,
+  GDOU_JW_WFW_SSO_SERVICE,
   GDOU_WFW_ORIGIN,
+  healWfwWrongSsoUrl,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
   normalizeWfwAuthUrl,
@@ -845,18 +847,23 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     onClose();
   };
 
-  const expectedWebViewServiceUrl = useMemo(() => {
-    const useCampusDirect =
+  const useCampusWebView = useMemo(
+    () =>
       webViewRoutePref === 'campus' ||
-      (webViewRoutePref === 'auto' && probedWebViewIsVpn === false);
-    return useCampusDirect ? GDOU_JW_SSO_SERVICE : `${GDOU_WFW_ORIGIN}/`;
-  }, [webViewRoutePref, probedWebViewIsVpn]);
+      (webViewRoutePref === 'auto' && probedWebViewIsVpn === false),
+    [webViewRoutePref, probedWebViewIsVpn]
+  );
+
+  const expectedWebViewServiceUrl = useMemo(() => {
+    return useCampusWebView ? GDOU_JW_SSO_SERVICE : GDOU_JW_WFW_SSO_SERVICE;
+  }, [useCampusWebView]);
 
   const effectiveWebViewUrl = useMemo(() => {
-    return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+    const authBase = useCampusWebView ? GDOU_AUTH_ORIGIN : GDOU_WFW_ORIGIN;
+    return `${authBase}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
       expectedWebViewServiceUrl
     )}`;
-  }, [expectedWebViewServiceUrl]);
+  }, [useCampusWebView, expectedWebViewServiceUrl]);
 
   // Keep source object strictly memoized per session so React/Fabric NEVER mutates `source` mid-login
   const initialWebViewSource = useMemo(
@@ -1432,13 +1439,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   }
 
                   // 1) Seamlessly upgrade GDOU server cleartext redirects (e.g. http://authserver.gdou.edu.cn/authserver/reAuthCheck/...) to HTTPS
-                  // 2) Normalize wfw /https://(authserver|jw).gdou.edu.cn/authserver/... -> /authserver/... so Path=/authserver cookies always attach
+                  // 2) Heal wrong off-campus wfw SSO paths (/https://authserver.gdou.edu.cn/sso/jziotlogin -> jw/sso/jziotlogin) so post-MFA never hits 404
+                  // 3) Normalize wfw /https://(authserver|jw).gdou.edu.cn/authserver/... -> /authserver/... so Path=/authserver cookies attach in WebView
                   const upgradedHttps = upgradeGdouHttpToHttps(req.url);
-                  const normalizedWfw = normalizeWfwAuthUrl(upgradedHttps ?? req.url);
-                  if (upgradedHttps || normalizedWfw) {
-                    const rawTarget = normalizedWfw ?? upgradedHttps!;
-                    const fallbackService = rawTarget.includes('wfw.gdou.edu.cn/authserver/')
-                      ? GDOU_JW_SSO_SERVICE
+                  const afterUpgrade = upgradedHttps ?? req.url;
+                  const healedWfwSso = healWfwWrongSsoUrl(afterUpgrade);
+                  const normalizedWfw = normalizeWfwAuthUrl(healedWfwSso ?? afterUpgrade);
+                  if (upgradedHttps || healedWfwSso || normalizedWfw) {
+                    const rawTarget = normalizedWfw ?? healedWfwSso ?? upgradedHttps!;
+                    const fallbackService = rawTarget.includes('wfw.gdou.edu.cn')
+                      ? GDOU_JW_WFW_SSO_SERVICE
                       : expectedWebViewServiceUrl;
                     const targetUrl = ensureAuthLoginServiceParam(rawTarget, fallbackService);
                     const nowTs = Date.now();
@@ -1449,11 +1459,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                       lastRedirectRewriteRef.current = { url: targetUrl, ts: nowTs };
                       setErrorText(null);
                       if (targetUrl.includes('reAuthLoginView')) {
-                        setWebViewStatus(
-                          targetUrl.includes('wfw.gdou.edu.cn')
-                            ? '第 2 步：请完成校外教务多因子安全验证'
-                            : '第 1 步：请完成海大多因子安全验证（短信 / 企业微信）'
-                        );
+                        setWebViewStatus('请完成海大多因子二次安全验证（短信 / 企业微信）');
                       }
                       // Let WKNavigationActionPolicyCancel settle first; navigate via JS location.replace without mutating `source` prop
                       scheduleWebViewLocationReplace(targetUrl);

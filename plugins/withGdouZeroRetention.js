@@ -27,6 +27,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.os.Handler
 import android.os.Looper
+import android.provider.AlarmClock
 import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebStorage
@@ -50,9 +51,12 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -126,17 +130,157 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
   override fun loadForRequest(url: HttpUrl): List<Cookie> {
     val now = System.currentTimeMillis()
     val result = ArrayList<Cookie>()
+    val innerUrl = extractWfwInnerUrl(url)
     val iterator = store.entries.iterator()
     while (iterator.hasNext()) {
       val entry = iterator.next()
       val cookie = entry.value
       if (cookie.expiresAt <= now) {
         iterator.remove()
-      } else if (cookie.matches(url)) {
+      } else if (cookie.matches(url) || (innerUrl != null && cookie.matches(innerUrl))) {
         result.add(cookie)
       }
     }
+    result.sortByDescending { it.path.length }
     return result
+  }
+
+  private fun extractWfwInnerUrl(url: HttpUrl): HttpUrl? {
+    if (!url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)) return null
+    val encPath = url.encodedPath
+    val prefixes = listOf(
+      "/https://authserver.gdou.edu.cn",
+      "/http://authserver.gdou.edu.cn",
+      "/https://jw.gdou.edu.cn",
+      "/http://jw.gdou.edu.cn"
+    )
+    for (p in prefixes) {
+      if (encPath.startsWith(p, ignoreCase = true)) {
+        val rest = encPath.substring(p.length).ifEmpty { "/" }
+        val normalized = if (rest.startsWith("/")) rest else "/\$rest"
+        return try {
+          url.newBuilder().encodedPath(normalized).build()
+        } catch (_: Throwable) {
+          null
+        }
+      }
+    }
+    return null
+  }
+}
+
+/**
+ * Direct Android System Clock Alarm writer (\`AlarmClock.ACTION_SET_ALARM\` & \`ACTION_SHOW_ALARMS\`).
+ * Uses genuine \`putIntegerArrayListExtra(EXTRA_DAYS, ArrayList<Int>)\` and \`EXTRA_SKIP_UI\`
+ * on the main thread without \`startActivityForResult\` single-promise collisions.
+ */
+private object GdouSystemAlarmBridge {
+  private val mainHandler = Handler(Looper.getMainLooper())
+
+  fun handleRequest(context: Context, path: String, rawBody: String): String {
+    if (path.equals("/show-alarms", ignoreCase = true)) {
+      val latch = CountDownLatch(1)
+      var errMsg: String? = null
+      mainHandler.post {
+        try {
+          val intent = Intent(AlarmClock.ACTION_SHOW_ALARMS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+          context.startActivity(intent)
+        } catch (err: Throwable) {
+          errMsg = err.message ?: err.javaClass.simpleName
+        } finally {
+          latch.countDown()
+        }
+      }
+      latch.await(2500L, TimeUnit.MILLISECONDS)
+      return JSONObject()
+        .put("ok", errMsg == null)
+        .put("error", errMsg ?: "")
+        .toString()
+    }
+
+    return try {
+      val payload = JSONObject(rawBody.ifBlank { "{}" })
+      val arr = payload.optJSONArray("alarms") ?: JSONArray()
+      if (arr.length() == 0) {
+        return JSONObject().put("ok", false).put("count", 0).put("error", "Empty alarms payload").toString()
+      }
+
+      val intents = ArrayList<Intent>(arr.length())
+      for (i in 0 until arr.length()) {
+        val item = arr.optJSONObject(i) ?: continue
+        val hour = item.optInt("hour", -1)
+        val minute = item.optInt("minute", -1)
+        if (hour !in 0..23 || minute !in 0..59) continue
+        val message = item.optString("message", "海大课表闹钟")
+        val skipUi = item.optBoolean("skipUi", true)
+        val vibrate = item.optBoolean("vibrate", true)
+
+        val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          putExtra(AlarmClock.EXTRA_HOUR, hour)
+          putExtra(AlarmClock.EXTRA_MINUTES, minute)
+          putExtra(AlarmClock.EXTRA_MESSAGE, message)
+          putExtra(AlarmClock.EXTRA_SKIP_UI, skipUi)
+          putExtra(AlarmClock.EXTRA_VIBRATE, vibrate)
+        }
+
+        val daysJson = item.optJSONArray("days")
+        if (daysJson != null && daysJson.length() > 0) {
+          val dayList = ArrayList<Int>(daysJson.length())
+          for (dIdx in 0 until daysJson.length()) {
+            val dayVal = daysJson.optInt(dIdx, -1)
+            if (dayVal in 1..7) {
+              dayList.add(dayVal)
+            }
+          }
+          if (dayList.isNotEmpty()) {
+            intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, dayList)
+          }
+        }
+        intents.add(intent)
+      }
+
+      if (intents.isEmpty()) {
+        return JSONObject().put("ok", false).put("count", 0).put("error", "No valid alarm time").toString()
+      }
+
+      val firstLatch = CountDownLatch(1)
+      var firstErr: String? = null
+      mainHandler.post {
+        try {
+          context.startActivity(intents[0])
+        } catch (err: Throwable) {
+          firstErr = err.message ?: err.javaClass.simpleName
+        } finally {
+          firstLatch.countDown()
+        }
+      }
+      firstLatch.await(2500L, TimeUnit.MILLISECONDS)
+      if (firstErr != null) {
+        return JSONObject().put("ok", false).put("count", 0).put("error", firstErr).toString()
+      }
+
+      for (idx in 1 until intents.size) {
+        val nextIntent = intents[idx]
+        mainHandler.postDelayed({
+          try {
+            context.startActivity(nextIntent)
+          } catch (err: Throwable) {
+            Log.w("GdouAlarm", "Batch system alarm #\$idx failed: \${err.message}")
+          }
+        }, idx * 420L)
+      }
+
+      JSONObject().put("ok", true).put("count", intents.size).toString()
+    } catch (err: Throwable) {
+      JSONObject()
+        .put("ok", false)
+        .put("count", 0)
+        .put("error", err.message ?: err.javaClass.simpleName)
+        .toString()
+    }
   }
 }
 
@@ -264,6 +408,25 @@ class MainApplication : Application(), ReactApplication {
               .body("{\\"ok\\":true}".toResponseBody(null))
               .build()
           }
+          if (orig.url.host.equals("gdou-alarm-internal.local", ignoreCase = true)) {
+            val buf = Buffer()
+            try {
+              orig.body?.writeTo(buf)
+            } catch (_: Throwable) {}
+            val respJson = GdouSystemAlarmBridge.handleRequest(
+              applicationContext,
+              orig.url.encodedPath,
+              buf.readUtf8()
+            )
+            return@addInterceptor Response.Builder()
+              .request(orig)
+              .protocol(Protocol.HTTP_1_1)
+              .code(200)
+              .message("OK")
+              .header("Content-Type", "application/json")
+              .body(respJson.toResponseBody(null))
+              .build()
+          }
           val resetBefore = orig.header("X-Gdou-Reset-Cookies-Before") == "1"
           val clearAfter = orig.header("X-Gdou-Clear-Cookies-After") == "1"
           if (resetBefore) {
@@ -331,7 +494,7 @@ class MainApplication : Application(), ReactApplication {
             }
           }
 
-          // Upgrade cleartext http://*.gdou.edu.cn redirects to https://, normalize wfw /authserver/ paths, and fix relative wfw/jw redirects
+          // Upgrade cleartext http://*.gdou.edu.cn redirects to https:// and heal off-campus wfw redirects
           val loc = resp.header("Location")
           var rewrittenLoc: String? = null
           if (loc != null) {
@@ -345,22 +508,30 @@ class MainApplication : Application(), ReactApplication {
             } else {
               loc
             }
-            val wfwAuthPrefixRe = Regex(
-              "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn)?/https?://(?:authserver|jw)\\\\.gdou\\\\.edu\\\\.cn(/authserver/.*)$",
+            val isOnWfw = effectiveReq.url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
+            val wrongWfwSsoRe = Regex(
+              "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn)?(?:/https?://authserver\\\\.gdou\\\\.edu\\\\.cn)?/sso/jziotlogin([?#].*)?\$",
               RegexOption.IGNORE_CASE
             )
-            val wfwAuthMatch = wfwAuthPrefixRe.matchEntire(upgradedCandidate)
+            val bareJwLocRe = Regex(
+              "^https?://jw\\\\.gdou\\\\.edu\\\\.cn(/.*)?\$",
+              RegexOption.IGNORE_CASE
+            )
+            val wrongSsoMatch = if (isOnWfw) wrongWfwSsoRe.matchEntire(upgradedCandidate) else null
+            val bareJwMatch = if (isOnWfw) bareJwLocRe.matchEntire(upgradedCandidate) else null
             rewrittenLoc = when {
-              wfwAuthMatch != null ->
-                "https://wfw.gdou.edu.cn\${wfwAuthMatch.groupValues[1]}"
-              isGdouHttpLoc ->
-                upgradedCandidate
+              wrongSsoMatch != null ->
+                "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin\${wrongSsoMatch.groupValues[1]}"
+              bareJwMatch != null ->
+                "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\${bareJwMatch.groupValues[1]}"
               loc.startsWith("/") &&
                 !loc.startsWith("/https://") &&
                 !loc.startsWith("/http://") &&
                 !loc.startsWith("/authserver") &&
                 reqUrl.contains("wfw.gdou.edu.cn/https://jw.gdou.edu.cn") ->
                 "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\$loc"
+              isGdouHttpLoc ->
+                upgradedCandidate
               else -> null
             }
             if (rewrittenLoc != null) {
@@ -586,6 +757,7 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
   func cookieHeader(for url: URL) -> String? {
     let host = (url.host ?? "").lowercased()
     let path = url.path.isEmpty ? "/" : url.path
+    let innerPath = Self.extractWfwInnerPath(host: host, path: path)
     let isHttps = url.scheme?.lowercased() == "https"
     let now = Date()
 
@@ -604,7 +776,9 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
       if !Self.domainMatches(cookieDomain: cookie.domain.lowercased(), requestHost: host) {
         continue
       }
-      if !Self.pathMatches(cookiePath: cookie.path, requestPath: path) {
+      let matchesOuter = Self.pathMatches(cookiePath: cookie.path, requestPath: path)
+      let matchesInner = innerPath.map { Self.pathMatches(cookiePath: cookie.path, requestPath: $0) } ?? false
+      if !matchesOuter && !matchesInner {
         continue
       }
       matched.append(cookie)
@@ -618,6 +792,26 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
     matched.sort { $0.path.count > $1.path.count }
     let headerMap = HTTPCookie.requestHeaderFields(with: matched)
     return headerMap["Cookie"]
+  }
+
+  private static func extractWfwInnerPath(host: String, path: String) -> String? {
+    guard host == "wfw.gdou.edu.cn" else { return nil }
+    let lower = path.lowercased()
+    let prefixes = [
+      "/https://authserver.gdou.edu.cn",
+      "/http://authserver.gdou.edu.cn",
+      "/https://jw.gdou.edu.cn",
+      "/http://jw.gdou.edu.cn",
+    ]
+    for prefix in prefixes {
+      if lower.hasPrefix(prefix) {
+        let restIdx = path.index(path.startIndex, offsetBy: prefix.count)
+        let rest = String(path[restIdx...])
+        if rest.isEmpty { return "/" }
+        return rest.hasPrefix("/") ? rest : ("/" + rest)
+      }
+    }
+    return nil
   }
 
   private static func domainMatches(cookieDomain: String, requestHost: String) -> Bool {
@@ -684,24 +878,31 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     return upgradeGdouHttpUrl(parsed)
   }
 
-  private static func normalizeWfwAuthRedirectUrl(_ raw: String) -> URL? {
+  private static func healWfwRedirectUrl(_ raw: String, isOnWfw: Bool) -> URL? {
+    guard isOnWfw else { return nil }
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    let prefixes = [
-      "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver/",
-      "https://wfw.gdou.edu.cn/http://authserver.gdou.edu.cn/authserver/",
-      "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/authserver/",
-      "https://wfw.gdou.edu.cn/http://jw.gdou.edu.cn/authserver/",
-      "/https://authserver.gdou.edu.cn/authserver/",
-      "/http://authserver.gdou.edu.cn/authserver/",
-      "/https://jw.gdou.edu.cn/authserver/",
-      "/http://jw.gdou.edu.cn/authserver/",
-    ]
     let lower = trimmed.lowercased()
-    for prefix in prefixes {
+
+    let wrongSsoPrefixes = [
+      "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/sso/jziotlogin",
+      "https://wfw.gdou.edu.cn/http://authserver.gdou.edu.cn/sso/jziotlogin",
+      "https://wfw.gdou.edu.cn/sso/jziotlogin",
+      "/https://authserver.gdou.edu.cn/sso/jziotlogin",
+      "/sso/jziotlogin",
+    ]
+    for prefix in wrongSsoPrefixes {
       if lower.hasPrefix(prefix) {
         let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
         let suffix = String(trimmed[suffixStart...])
-        return URL(string: "https://wfw.gdou.edu.cn/authserver/" + suffix)
+        return URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin" + suffix)
+      }
+    }
+
+    for jwPrefix in ["https://jw.gdou.edu.cn", "http://jw.gdou.edu.cn"] {
+      if lower.hasPrefix(jwPrefix) {
+        let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: jwPrefix.count)
+        let suffix = String(trimmed[suffixStart...])
+        return URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" + suffix)
       }
     }
     return nil
@@ -760,6 +961,20 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       }
       return
     }
+    if initialUrl.host?.lowercased() == "gdou-alarm-internal.local" {
+      let payload = Data("{\\"ok\\":false,\\"platform\\":\\"ios\\"}".utf8)
+      if let resp = HTTPURLResponse(
+        url: initialUrl,
+        statusCode: 200,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "application/json"]
+      ) {
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: payload)
+        client?.urlProtocolDidFinishLoading(self)
+      }
+      return
+    }
     let mutable = ((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest) ?? NSMutableURLRequest(url: initialUrl)
     URLProtocol.setProperty(true, forKey: Self.handledKey, in: mutable)
 
@@ -790,13 +1005,14 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       }
     }
 
-    // Upgrade cleartext http://*.gdou.edu.cn/ to https:// and normalize wfw /authserver/ paths
+    // Upgrade cleartext http://*.gdou.edu.cn/ to https:// and heal wrong wfw SSO paths
     if let curUrl = mutable.url {
       if let upgraded = Self.upgradeGdouHttpUrl(curUrl) {
         mutable.url = upgraded
       }
-      if let normalized = Self.normalizeWfwAuthRedirectUrl(mutable.url?.absoluteString ?? "") {
-        mutable.url = normalized
+      let curIsWfw = (mutable.url?.host ?? "").lowercased() == "wfw.gdou.edu.cn"
+      if let healed = Self.healWfwRedirectUrl(mutable.url?.absoluteString ?? "", isOnWfw: curIsWfw) {
+        mutable.url = healed
       }
     }
 
@@ -862,7 +1078,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
 
     // Match Android OkHttp redirect fixes:
     // 1) Upgrade cleartext http://*.gdou.edu.cn -> https://
-    // 2) Normalize wfw /https://(authserver|jw).gdou.edu.cn/authserver/... -> /authserver/...
+    // 2) Heal wrong wfw SSO / bare jw redirects so session stays inside wfw
     // 3) Rewrite relative paths under wfw.gdou.edu.cn/https://jw.gdou.edu.cn
     let rawLoc = response.value(forHTTPHeaderField: "Location")
     let sourceUrlStr =
@@ -870,12 +1086,12 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       task.currentRequest?.url?.absoluteString ??
       task.originalRequest?.url?.absoluteString ??
       ""
+    let isOnWfw = sourceUrlStr.lowercased().contains("wfw.gdou.edu.cn")
 
     if let loc = rawLoc {
-      if let normalizedWfw = Self.normalizeWfwAuthRedirectUrl(loc) {
-        nextMutable.url = normalizedWfw
-      } else if let upgraded = Self.upgradeGdouHttpUrl(from: loc) {
-        nextMutable.url = upgraded
+      let upgradedLocStr = Self.upgradeGdouHttpUrl(from: loc)?.absoluteString ?? loc
+      if let healedWfw = Self.healWfwRedirectUrl(upgradedLocStr, isOnWfw: isOnWfw) {
+        nextMutable.url = healedWfw
       } else if loc.hasPrefix("/"),
                 !loc.hasPrefix("/https://"),
                 !loc.hasPrefix("/http://"),
@@ -883,6 +1099,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
                 sourceUrlStr.contains("wfw.gdou.edu.cn/https://jw.gdou.edu.cn"),
                 let rewritten = URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" + loc) {
         nextMutable.url = rewritten
+      } else if let upgraded = Self.upgradeGdouHttpUrl(from: loc) {
+        nextMutable.url = upgraded
       }
     }
 
@@ -891,8 +1109,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       if let upgradedResolved = Self.upgradeGdouHttpUrl(resolvedUrl) {
         nextMutable.url = upgradedResolved
       }
-      if let normalizedResolved = Self.normalizeWfwAuthRedirectUrl(nextMutable.url?.absoluteString ?? "") {
-        nextMutable.url = normalizedResolved
+      if let healedResolved = Self.healWfwRedirectUrl(nextMutable.url?.absoluteString ?? "", isOnWfw: isOnWfw) {
+        nextMutable.url = healedResolved
       }
     }
 
@@ -1062,7 +1280,7 @@ function withGdouAndroidManifest(config) {
       app.$['android:usesCleartextTraffic'] = 'false';
     }
 
-    // 3. Ensure <queries> declares android.intent.action.SET_ALARM for Android 11+ system clock alarm
+    // 3. Ensure <queries> declares SET_ALARM and SHOW_ALARMS for Android 11+ system clock alarm
     if (!Array.isArray(manifest.queries)) {
       manifest.queries = [{}];
     }
@@ -1070,14 +1288,20 @@ function withGdouAndroidManifest(config) {
     if (!Array.isArray(queriesNode.intent)) {
       queriesNode.intent = [];
     }
-    const hasSetAlarmQuery = queriesNode.intent.some((intent) =>
-      Array.isArray(intent.action) &&
-      intent.action.some((a) => a?.$?.['android:name'] === 'android.intent.action.SET_ALARM')
-    );
-    if (!hasSetAlarmQuery) {
-      queriesNode.intent.push({
-        action: [{ $: { 'android:name': 'android.intent.action.SET_ALARM' } }],
-      });
+    for (const alarmAction of [
+      'android.intent.action.SET_ALARM',
+      'android.intent.action.SHOW_ALARMS',
+    ]) {
+      const hasAction = queriesNode.intent.some(
+        (intent) =>
+          Array.isArray(intent.action) &&
+          intent.action.some((a) => a?.$?.['android:name'] === alarmAction)
+      );
+      if (!hasAction) {
+        queriesNode.intent.push({
+          action: [{ $: { 'android:name': alarmAction } }],
+        });
+      }
     }
 
     return mod;

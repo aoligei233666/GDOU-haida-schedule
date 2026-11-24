@@ -4,6 +4,8 @@ import pkgLockJson from '../package-lock.json';
 import pkgJson from '../package.json';
 import {
   ensureAuthLoginServiceParam,
+  GDOU_JW_WFW_SSO_SERVICE,
+  healWfwWrongSsoUrl,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
   normalizeWfwAuthUrl,
@@ -73,6 +75,7 @@ import {
   checkForAppUpdate,
   compareSemver,
   CURRENT_VERSION_HIGHLIGHTS,
+  getPlatformVersionHighlights,
   GITHUB_RELEASES_PAGE_URL,
   isTrustedGithubReleaseUrl,
   selectPlatformOtaAssets,
@@ -303,6 +306,22 @@ async function run() {
     );
     assert.equal(normalizeWfwAuthUrl('https://wfw.gdou.edu.cn/authserver/login'), null);
     assert.equal(
+      healWfwWrongSsoUrl(
+        'https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/sso/jziotlogin?ticket=ST-98765'
+      ),
+      'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-98765'
+    );
+    assert.equal(
+      healWfwWrongSsoUrl('https://wfw.gdou.edu.cn/sso/jziotlogin?ticket=ST-111'),
+      'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-111'
+    );
+    assert.equal(
+      healWfwWrongSsoUrl(
+        'https://wfw.gdou.edu.cn/authserver/login?service=https%3A%2F%2Fjw.gdou.edu.cn%2Fsso%2Fjziotlogin'
+      ),
+      `https://wfw.gdou.edu.cn/authserver/login?service=${encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE)}`
+    );
+    assert.equal(
       ensureAuthLoginServiceParam(
         'https://authserver.gdou.edu.cn/authserver/login',
         'https://wfw.gdou.edu.cn/'
@@ -336,6 +355,69 @@ async function run() {
     assert.ok(injected.includes('storageCleaned: storageCleaned'), 'WebView script must report verified storageCleaned');
     assert.ok(injected.includes('Promise.race'), 'WebView timedFetch must have Promise.race timeout fallback');
     assert.ok(injected.includes("xnm: '', xqm: ''"), 'WebView script must include 3rd exam query variant');
+    assert.ok(
+      injected.includes(GDOU_JW_WFW_SSO_SERVICE),
+      'WebView script must embed GDOU_JW_WFW_SSO_SERVICE to prevent post-MFA 404'
+    );
+
+    // 3e-0. 1-step off-campus wfw MFA -> JWXT ticket handoff (no 2nd password, no HTTP 901!)
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('reAuthSubmit.do')) {
+        return makeMockResponse(200, JSON.stringify({ code: 'reAuth_success', msg: '认证成功' }), url);
+      }
+      if (url.includes(encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE))) {
+        return makeMockResponse(
+          200,
+          '<html><body>教学管理信息服务平台 index_initMenu</body></html>',
+          'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/xtgl/index_initMenu.html'
+        );
+      }
+      if (url.includes('xskbcx_cxXskbcxIndex.html')) {
+        return makeMockResponse(
+          200,
+          '<select id="xnm"><option value="2026" selected>2026</option></select><select id="xqm"><option value="3" selected>1</option></select>',
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxXsgrkb.html')) {
+        return makeMockResponse(
+          200,
+          JSON.stringify({
+            kbList: [{ kcmc: '一步直通测试课', xqj: '1', jcs: '1-2', zcd: '1-16周', xqh_id: '1', xqmc: '湖光校区' }],
+          }),
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxRjc.html')) {
+        return makeMockResponse(200, JSON.stringify([]), url);
+      }
+      if (url.includes('kscx_cxXsksxx') || url.includes('cjcx_cx')) {
+        return makeMockResponse(200, JSON.stringify({ items: [] }), url);
+      }
+      return makeMockResponse(200, 'ok', url);
+    }) as typeof fetch;
+
+    const oneStepWfwMfa: MfaChallengeState = {
+      required: true,
+      reAuthUserId: 'TEST_STUDENT_001',
+      serviceUrl: GDOU_JW_WFW_SSO_SERVICE,
+      defaultReAuthType: '3',
+      credentialsPurged: true,
+      session: {
+        ...mockSession,
+        authOrigin: 'https://wfw.gdou.edu.cn',
+        jwBaseUrl: 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn',
+        isWebVpn: true,
+        serviceUrl: GDOU_JW_WFW_SSO_SERVICE,
+      },
+      previousSteps: ['1. init', '2. enc', '3. mfa'],
+    };
+    const oneStepRes = await submitGdouMfaAndCompleteSync(oneStepWfwMfa, '654321', '3');
+    assert.equal(oneStepRes.status, 'completed', '1-step wfw MFA must complete directly without 901');
+    if (oneStepRes.status === 'completed') {
+      assert.equal(oneStepRes.result.courses[0]?.name, '一步直通测试课');
+    }
 
     // 3e. Off-campus wfw MFA -> Step 2 sub-session auth keeps WFWSESSID alive with ZERO retained password
     let logoutCalledDuringMfaHandoff = false;
@@ -849,6 +931,93 @@ async function run() {
   const wed910Week2 = week2WithNonCurrent.find((c) => c.dayOfWeek === 3 && c.startSection === 9);
   assert.equal(wed910Week2?.primary.isCurrentWeek, true);
   assert.equal(wed910Week2?.primary.course.name, '数据结构实验');
+
+  // Non-current-week courses MUST NEVER bridge separate current-week courses or trigger `hasSameWeekConflict`!
+  const nonBridgeCourses = [
+    {
+      ...sampleForCluster.courses[0],
+      id: 'nb-cur-12',
+      name: '高等数学A',
+      dayOfWeek: 4,
+      startSection: 1,
+      endSection: 2,
+      weeks: [1],
+      weekText: '1-16周(单)',
+    },
+    {
+      ...sampleForCluster.courses[0],
+      id: 'nb-cur-34',
+      name: '大学英语',
+      dayOfWeek: 4,
+      startSection: 3,
+      endSection: 4,
+      weeks: [1],
+      weekText: '1-16周(单)',
+    },
+    {
+      ...sampleForCluster.courses[0],
+      id: 'nb-noncur-14',
+      name: '综合海洋大实验',
+      dayOfWeek: 4,
+      startSection: 1,
+      endSection: 4,
+      weeks: [2],
+      weekText: '2-16周(双)',
+    },
+  ];
+  const nonBridgeClusters = buildTimetableClusters({
+    myCourses: nonBridgeCourses,
+    selectedWeek: 1,
+    showNonCurrentWeek: true,
+    viewMode: 'mine',
+  });
+  const thuClusters = nonBridgeClusters.filter((c) => c.dayOfWeek === 4);
+  assert.equal(
+    thuClusters.length,
+    2,
+    'Non-current-week 1-4节 course must NEVER merge separate current-week 1-2节 and 3-4节 courses'
+  );
+  assert.ok(
+    thuClusters.every((c) => c.hasSameWeekConflict === false),
+    'Non-current-week courses must NEVER be marked as conflicts (撞课)'
+  );
+
+  // Split-week segments of identical course/room/teacher/slot merge cleanly in parseZfScheduleResponse
+  const mergedSegmentsKb = parseZfScheduleResponse({
+    kbList: [
+      { kcmc: '航海学', kch: 'HH101', xm: '陈船长', cdmc: '航海楼201', xqj: '5', jc: '1-2节', zcd: '1-4周' },
+      { kcmc: '航海学', kch: 'HH101', xm: '陈船长', cdmc: '航海楼201', xqj: '5', jc: '1-2节', zcd: '6-8周' },
+    ],
+  });
+  assert.equal(mergedSegmentsKb.courses.length, 1, 'Split week segments of identical course must merge');
+  assert.deepEqual(mergedSegmentsKb.courses[0]?.weeks, [1, 2, 3, 4, 6, 7, 8]);
+
+  // Verify Native System Clock bridge & OS auto-detection guards
+  assert.ok(
+    pluginSrc.includes('GdouSystemAlarmBridge') &&
+      pluginSrc.includes('AlarmClock.ACTION_SET_ALARM') &&
+      pluginSrc.includes('putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS') &&
+      pluginSrc.includes('extractWfwInnerUrl') &&
+      pluginSrc.includes('extractWfwInnerPath'),
+    'Native plugin must include GdouSystemAlarmBridge & inner wfw cookie path matching'
+  );
+  const settingsScreenSrc = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'src', 'screens', 'SettingsScreen.tsx'),
+    'utf8'
+  );
+  assert.ok(
+    settingsScreenSrc.includes("Platform.OS === 'ios' && (\n              <View style={styles.iosSourceBox}>") ||
+      settingsScreenSrc.includes("Platform.OS === 'ios' && ("),
+    'SettingsScreen must hide iosSourceBox on Android'
+  );
+  const androidHighlights = getPlatformVersionHighlights('android').join('\n');
+  assert.ok(
+    !androidHighlights.includes('SideStore') &&
+      !androidHighlights.includes('Feather') &&
+      !androidHighlights.includes('IPA') &&
+      !androidHighlights.includes('iOS 软件源'),
+    'Android version highlights must not contain iOS software source / IPA wording'
+  );
 
   // Same-week real conflict detection (2 courses both active in Week 1 on Mon 1-2)
   const conflictCourses = [

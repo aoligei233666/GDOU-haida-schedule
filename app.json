@@ -2,7 +2,7 @@
   "expo": {
     "name": "海大课表",
     "slug": "gdou-schedule-app",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -13,7 +13,7 @@
     },
     "ios": {
       "bundleIdentifier": "cn.edu.gdou.schedule",
-      "buildNumber": "6",
+      "buildNumber": "7",
       "supportsTablet": true,
       "infoPlist": {
         "CFBundleDisplayName": "海大课表",
@@ -24,7 +24,9 @@
           "sidestore",
           "altstore",
           "apple-magnifier",
-          "livecontainer"
+          "livecontainer",
+          "clock-alarm",
+          "shortcuts"
         ],
         "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",
         "NSCalendarsFullAccessUsageDescription": "用于创建并同步“海大课表”专属系统日历及考试提醒"
@@ -32,7 +34,7 @@
     },
     "android": {
       "package": "cn.edu.gdou.schedule",
-      "versionCode": 6,
+      "versionCode": 7,
       "adaptiveIcon": {
         "backgroundColor": "#003B90",
         "foregroundImage": "./assets/android-icon-foreground.png",

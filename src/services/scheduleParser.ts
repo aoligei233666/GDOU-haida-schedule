@@ -300,9 +300,35 @@ export function parseZfScheduleResponse(raw: unknown): {
     const effStart = sectionRange?.startSection ?? 0;
     const effEnd = sectionRange?.endSection ?? 0;
 
-    const dedupKey = `${name}|${effDay}|${effStart}-${effEnd}|${weekText}|${location}`;
+    const dedupKey = `${name}|${effDay}|${effStart}-${effEnd}|${weekText}|${location}|${teacher}`;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
+
+    // Merge disjoint week segments of the exact same course/slot/room/teacher into one CourseItem
+    // so multi-segment courses (e.g. "1-4周" + "6-16周") never split into fake self-overlaps
+    if (!parseWarning && effDay >= 1 && effStart >= 1 && weeks.length > 0) {
+      const mergeTarget = courses.find(
+        (existing) =>
+          !existing.parseWarning &&
+          existing.name === name &&
+          existing.code === code &&
+          existing.dayOfWeek === effDay &&
+          existing.startSection === effStart &&
+          existing.endSection === effEnd &&
+          existing.location === location &&
+          existing.teacher === teacher
+      );
+      if (mergeTarget) {
+        const mergedWeeks = Array.from(new Set([...mergeTarget.weeks, ...weeks])).sort(
+          (a, b) => a - b
+        );
+        mergeTarget.weeks = mergedWeeks;
+        if (weekText && !mergeTarget.weekText.includes(weekText)) {
+          mergeTarget.weekText = `${mergeTarget.weekText},${weekText}`;
+        }
+        continue;
+      }
+    }
 
     courses.push({
       id: `c-${code || stableColorIndex(name)}-${effDay}-${effStart}-${effEnd}-${idx}`,

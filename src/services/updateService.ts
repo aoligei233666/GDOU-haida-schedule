@@ -28,14 +28,37 @@ export function buildLiveContainerDirectInstallUrl(ipaUrl: string): string {
 }
 
 /**
- * Concise summary of current v1.4.0 improvements & features shown directly in Settings -> Update Card.
+ * Concise summary of current v1.4.1 improvements & bug fixes shown directly in Settings -> Update Card.
  */
 export const CURRENT_VERSION_HIGHLIGHTS: string[] = [
-  '同时间多节课点击查看：重叠课程自动聚合角标，点击可在弹窗内切换查看每门课，支持点击网格手动加课',
-  '非本周课程同屏展示：课表顶栏新增「非本周」一键开关，灰底标签清晰区分本周与非本周排课',
-  '软件内 GitHub 直连下载与热更新：支持应用内直接下载 iOS/Android 热更包免电脑免重签生效（含防白屏自动回滚），以及进度条直下 IPA/APK 安装包',
-  '情侣课表功能：支持双人同屏对比、「♡ 共同没课」标记、同堂/同楼统计，支持口令互传、JSON 文件与面对面无痕代拉取',
+  '登录同步彻底修复：修复校外极速直连报 HTTP 901 与无痕网页二次验证后报 HTTP 404 的问题，支持一步直通教务',
+  '非本周排课不计撞课：严格限定仅同周重叠才标撞课，非本周课程不挤压本周卡片、不桥接合并相邻节次',
+  '定闹钟直写系统闹钟：早起/课前/考前闹钟直接写入修改手机自带系统时钟（同唤醒时间点自动合并星期）',
+  '自动识别手机系统：自动检测 Android 与 iOS 平台并适配更新通道，Android 端彻底隐藏 iOS 软件源模块',
+  '情侣课表与 GitHub 软件内直连热更：支持双人同屏、共同空闲统计及应用内直接下载更新包',
 ];
+
+export function getPlatformVersionHighlights(platformOs: string): string[] {
+  if (platformOs === 'android') {
+    return [
+      '登录同步修复：彻底解决极速直连 HTTP 901 与无痕网页二次认证后 404 问题，一步直通海大教务',
+      '非本周不计撞课：非本周课程绝不标记撞课、不挤压本周卡片，点击仍可切换查看各周排课',
+      '直写手机系统闹钟：早起/课前/考前定闹钟直接修改 Android 系统时钟，相同时间自动合并星期',
+      '系统自动识别（当前 Android）：支持软件内从 GitHub 直下热更包或 APK 安装，已自动精简隐藏无关平台字样',
+      '情侣课表与多课查看：支持双人同屏、「♡ 共同没课」标记、口令互传与手动加课',
+    ];
+  }
+  if (platformOs === 'ios') {
+    return [
+      '登录同步修复：彻底解决极速直连 HTTP 901 与无痕网页二次认证后 404 问题，一步直通海大教务',
+      '非本周不计撞课：非本周课程绝不标记撞课、不挤压本周卡片，点击仍可切换查看各周排课',
+      '系统闹钟与时效提醒联动：支持时效性响铃提醒并支持一键跳转苹果系统时钟查看/设定',
+      '系统自动识别（当前 iOS）：支持软件内从 GitHub 免电脑免重签热更新，或直下 IPA 导入签名工具',
+      '情侣课表与多课查看：支持双人同屏、「♡ 共同没课」标记、口令互传与手动加课',
+    ];
+  }
+  return CURRENT_VERSION_HIGHLIGHTS;
+}
 
 const UPDATE_CHECK_TIMEOUT_MS = 12_000;
 

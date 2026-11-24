@@ -38,9 +38,9 @@ import {
   buildSideStoreDirectInstallUrl,
   buildTrollStoreDirectInstallUrl,
   checkForAppUpdate,
-  CURRENT_VERSION_HIGHLIGHTS,
   FEATHER_ADD_SOURCE_URL,
   formatBytesCompact,
+  getPlatformVersionHighlights,
   GITHUB_RELEASES_PAGE_URL,
   IOS_ALTSTORE_SOURCE_URL,
   isTrustedGithubReleaseUrl,
@@ -416,9 +416,12 @@ export const SettingsScreen: React.FC<Props> = ({
               <Text style={styles.cardTitle}>检查更新与软件内直接下载（GitHub）</Text>
             </View>
             <Text style={styles.cardDesc}>
-              当前版本：v{APP_VERSION}
+              当前版本：v{APP_VERSION} · 已自动识别系统：{Platform.OS === 'ios' ? 'iOS' : 'Android'}
               {activeOta ? `（⚡ 热更新已生效 · 底座 v${activeOta.baseNativeVersion}）` : ''}
-              {'\n'}支持在软件内直接从 GitHub 下载并完成更新（iOS 支持免电脑免重签热更新 + 直下 IPA 导入安装）。
+              {'\n'}
+              {Platform.OS === 'ios'
+                ? '支持在软件内直接从 GitHub 下载免电脑免重签热更新包，或直下 IPA 导入签名工具安装。'
+                : '支持在软件内直接从 GitHub 下载极速热更新包，或直接下载 APK 自动调起系统安装。'}
             </Text>
 
             {activeOta && (
@@ -439,7 +442,7 @@ export const SettingsScreen: React.FC<Props> = ({
               <Text style={styles.currentChangelogTitle}>
                 ✨ v{APP_VERSION} 本次更新与改进简述
               </Text>
-              {CURRENT_VERSION_HIGHLIGHTS.map((line, i) => (
+              {getPlatformVersionHighlights(Platform.OS).map((line, i) => (
                 <Text key={i} style={styles.changelogBullet}>
                   • {line}
                 </Text>
@@ -658,41 +661,43 @@ export const SettingsScreen: React.FC<Props> = ({
               </View>
             )}
 
-            {/* iOS On-Device Source (Feather / ESign / SideStore) */}
-            <View style={styles.iosSourceBox}>
-              <Text style={styles.iosSourceTitle}>
-                iOS 手机端免电脑软件源（SideStore / Feather / 轻松签）
-              </Text>
-              <Text style={styles.iosSourceDesc}>
-                除软件内直接热更新外，也可在手机签名工具订阅本源，底座大版本升级时免电脑拉取重签：
-              </Text>
-              <Text style={styles.iosSourceUrl} selectable>
-                {IOS_ALTSTORE_SOURCE_URL}
-              </Text>
-              <View style={styles.iosSourceBtnRow}>
-                <TouchableOpacity
-                  style={styles.iosSourceBtn}
-                  onPress={() => void handleOpenCustomScheme(SIDESTORE_ADD_SOURCE_URL, 'SideStore')}
-                >
-                  <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
-                  <Text style={styles.iosSourceBtnText}>SideStore 加源</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.iosSourceBtn}
-                  onPress={() => void handleOpenFeatherSource()}
-                >
-                  <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
-                  <Text style={styles.iosSourceBtnText}>Feather 加源</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.iosSourceBtn}
-                  onPress={() => void handleShareIosSource()}
-                >
-                  <Ionicons name="copy-outline" size={14} color={COLORS.oceanPrimary} />
-                  <Text style={styles.iosSourceBtnText}>复制源</Text>
-                </TouchableOpacity>
+            {/* iOS On-Device Source (Feather / ESign / SideStore) — strictly rendered ONLY on iOS */}
+            {Platform.OS === 'ios' && (
+              <View style={styles.iosSourceBox}>
+                <Text style={styles.iosSourceTitle}>
+                  iOS 手机端免电脑软件源（SideStore / Feather / 轻松签）
+                </Text>
+                <Text style={styles.iosSourceDesc}>
+                  除软件内直接热更新外，也可在手机签名工具订阅本源，底座大版本升级时免电脑拉取重签：
+                </Text>
+                <Text style={styles.iosSourceUrl} selectable>
+                  {IOS_ALTSTORE_SOURCE_URL}
+                </Text>
+                <View style={styles.iosSourceBtnRow}>
+                  <TouchableOpacity
+                    style={styles.iosSourceBtn}
+                    onPress={() => void handleOpenCustomScheme(SIDESTORE_ADD_SOURCE_URL, 'SideStore')}
+                  >
+                    <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
+                    <Text style={styles.iosSourceBtnText}>SideStore 加源</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.iosSourceBtn}
+                    onPress={() => void handleOpenFeatherSource()}
+                  >
+                    <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
+                    <Text style={styles.iosSourceBtnText}>Feather 加源</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.iosSourceBtn}
+                    onPress={() => void handleShareIosSource()}
+                  >
+                    <Ionicons name="copy-outline" size={14} color={COLORS.oceanPrimary} />
+                    <Text style={styles.iosSourceBtnText}>复制源</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
-            </View>
+            )}
           </View>
         )}
 

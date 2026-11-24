@@ -17,6 +17,7 @@ import {
   createWeeklyMorningWakeupAlarms,
   formatHourMinute,
   mergeAlarmsIdempotently,
+  openNativeSystemClockApp,
   setNativeAndroidSystemClockAlarm,
   toggleAlarmEnabled,
 } from '../services/alarmService';
@@ -64,7 +65,7 @@ export const AlarmsScreen: React.FC<Props> = ({
     }
     setBusy('wakeup');
     try {
-      const { created, replacedCount, skippedPast, failed, exactAlarmHint } =
+      const { created, systemClockGroupsCount, replacedCount, skippedPast, failed, exactAlarmHint } =
         await createWeeklyMorningWakeupAlarms(
           courses,
           targetWeek,
@@ -76,19 +77,27 @@ export const AlarmsScreen: React.FC<Props> = ({
         const { merged } = mergeAlarmsIdempotently(alarms, created);
         onAlarmsUpdated(merged);
       }
-      const dedupeNote = replacedCount > 0 ? `（已覆盖更新 ${replacedCount} 条旧闹钟，无重复响铃）` : '';
+      const dedupeNote = replacedCount > 0 ? `（已更新 ${replacedCount} 条旧记录）` : '';
       const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
-      Alert.alert(
-        '早起闹钟生成结果',
-        created.length > 0
-          ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${dedupeNote}${
-              skippedPast > 0 ? `，已跳过 ${skippedPast} 个过期时段` : ''
-            }${failNote}。${hintNote}`
-          : `第 ${targetWeek} 周所有首课时间均已过去，请切换到下一周再生成。`
-      );
+      const bodyMsg =
+        Platform.OS === 'android' && systemClockGroupsCount > 0
+          ? `已直接写入手机「系统闹钟」${systemClockGroupsCount} 组（同唤醒时间点已自动合并星期，首节课提前 ${wakeupMinutes} 分钟）${dedupeNote}${failNote}。`
+          : created.length > 0
+            ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${dedupeNote}${
+                skippedPast > 0 ? `，已跳过 ${skippedPast} 个过期时段` : ''
+              }${failNote}。${hintNote}`
+            : `第 ${targetWeek} 周所有首课时间均已过去，请切换到下一周再生成。`;
+
+      Alert.alert('系统早起闹钟已更新', bodyMsg, [
+        { text: '完成', style: 'cancel' },
+        {
+          text: '打开系统闹钟查看',
+          onPress: () => void openNativeSystemClockApp(),
+        },
+      ]);
     } catch (err) {
-      Alert.alert('生成失败', err instanceof Error ? err.message : String(err));
+      Alert.alert('写入系统闹钟失败', err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(null);
     }
@@ -213,14 +222,20 @@ export const AlarmsScreen: React.FC<Props> = ({
   };
 
   const handleWriteAndroidClock = async (alarm: AlarmRule) => {
+    if (Platform.OS === 'ios') {
+      await openNativeSystemClockApp();
+      return;
+    }
     try {
       await setNativeAndroidSystemClockAlarm({
         hour: alarm.hour,
         minute: alarm.minute,
+        isoWeekdays: [alarm.weekday],
         message: alarm.title.replace(/^[^\u4e00-\u9fa5A-Za-z0-9]+/, ''),
+        skipUi: false,
       });
     } catch (err) {
-      Alert.alert('唤起系统时钟失败', err instanceof Error ? err.message : String(err));
+      Alert.alert('打开系统闹钟失败', err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -229,7 +244,9 @@ export const AlarmsScreen: React.FC<Props> = ({
       <View style={styles.header}>
         <Text style={styles.headerTitle}>闹钟与日历中心</Text>
         <Text style={styles.headerSub}>
-          跨平台（iOS EventKit / Android 日历与时钟）一键联动
+          {Platform.OS === 'ios'
+            ? '当前系统：iOS · 系统日历 EventKit 与时效闹钟一键联动'
+            : '当前系统：Android · 手机系统闹钟直写与系统日历一键联动'}
         </Text>
       </View>
 
@@ -238,7 +255,7 @@ export const AlarmsScreen: React.FC<Props> = ({
         <View style={styles.card}>
           <View style={styles.cardHeader}>
             <Ionicons name="calendar" size={20} color={COLORS.oceanPrimary} />
-            <Text style={styles.cardTitle}>系统日历同步（iOS / Android）</Text>
+            <Text style={styles.cardTitle}>系统日历同步</Text>
           </View>
           <Text style={styles.cardDesc}>
             自动创建独立的「海大课表 (GDOU)」日历，一次性写入整学期所有周次课程与考试座位提醒，不弄乱您的个人日程。
@@ -323,21 +340,37 @@ export const AlarmsScreen: React.FC<Props> = ({
             ))}
           </View>
 
-          <TouchableOpacity
-            style={[styles.primaryBtn, { backgroundColor: COLORS.coral, marginTop: 12 }]}
-            onPress={handleGenerateWakeup}
-            disabled={busy !== null}
-          >
-            <Ionicons name="sunny-outline" size={18} color={COLORS.white} />
-            <Text style={styles.primaryBtnText}>
-              {busy === 'wakeup' ? '正在生成...' : `生成第 ${targetWeek} 周每日起床闹钟`}
-            </Text>
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
+            <TouchableOpacity
+              style={[styles.primaryBtn, { backgroundColor: COLORS.coral, flex: 1 }]}
+              onPress={handleGenerateWakeup}
+              disabled={busy !== null}
+            >
+              <Ionicons name="sunny-outline" size={18} color={COLORS.white} />
+              <Text style={styles.primaryBtnText}>
+                {busy === 'wakeup'
+                  ? '正在写入...'
+                  : Platform.OS === 'android'
+                    ? `直接写入第 ${targetWeek} 周系统起床闹钟`
+                    : `生成第 ${targetWeek} 周每日起床闹钟`}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.outlineBtn,
+                { flex: 0, paddingHorizontal: 12, height: 44, borderColor: COLORS.coralLight },
+              ]}
+              onPress={() => void openNativeSystemClockApp()}
+            >
+              <Ionicons name="time-outline" size={16} color={COLORS.coral} />
+              <Text style={[styles.outlineBtnText, { color: COLORS.coral }]}>系统闹钟</Text>
+            </TouchableOpacity>
+          </View>
 
           <Text style={styles.platformNote}>
             {Platform.OS === 'android'
-              ? '提示：Android 端支持高优先级通知渠道闹钟，且每条闹钟均可一键写入手机系统时钟 App。'
-              : '提示：iOS 端使用系统高优先级时效性提醒通知（Time-Sensitive），并建议配合上方「一键导入系统日历」实现双重防漏提醒。'}
+              ? '提示：点击上方按钮将直接修改写入手机自带「系统闹钟」（相同唤醒时间自动合并星期，锁屏/后台杀进程/勿扰均准时响铃）。'
+              : '提示：iOS 端自动注册系统高优先级时效提醒（Time-Sensitive），点击右侧「系统闹钟」可一键跳转苹果自带时钟 App。'}
           </Text>
         </View>
 
@@ -391,15 +424,15 @@ export const AlarmsScreen: React.FC<Props> = ({
                 </View>
 
                 <View style={styles.alarmFooter}>
-                  {Platform.OS === 'android' && (
-                    <TouchableOpacity
-                      style={styles.miniAction}
-                      onPress={() => handleWriteAndroidClock(alarm)}
-                    >
-                      <Ionicons name="time-outline" size={14} color={COLORS.oceanPrimary} />
-                      <Text style={styles.miniActionText}>写入手机系统时钟</Text>
-                    </TouchableOpacity>
-                  )}
+                  <TouchableOpacity
+                    style={styles.miniAction}
+                    onPress={() => handleWriteAndroidClock(alarm)}
+                  >
+                    <Ionicons name="time-outline" size={14} color={COLORS.oceanPrimary} />
+                    <Text style={styles.miniActionText}>
+                      {Platform.OS === 'android' ? '在系统闹钟中编辑/修改' : '打开系统时钟'}
+                    </Text>
+                  </TouchableOpacity>
                   <TouchableOpacity
                     style={[styles.miniAction, { marginLeft: 'auto' }]}
                     onPress={() => handleDeleteAlarm(alarm)}
