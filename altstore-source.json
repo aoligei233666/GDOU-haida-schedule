@@ -25,7 +25,7 @@
       "versionDate": "2026-11-24",
       "versionDescription": "v1.4.0：\n1. 同时间多节课点击查看：重叠课程自动聚合角标，点击可在弹窗内切换查看每门课，并支持点击课表网格手动加课；\n2. 非本周课程同屏展示：课表顶栏新增「非本周」一键开关，灰底标签清晰区分本周与非本周排课；\n3. 软件内 GitHub 直接下载与更新：支持在软件内直接从 GitHub 下载 iOS/Android 热更新包免电脑免重签立即生效（含防白屏自动回滚），同时支持应用内进度条直下 IPA/APK 安装包并一键导入 SideStore/TrollStore/Feather；\n4. 全新情侣课表功能：支持双人同屏对比、「♡ 共同没课」空闲标记、同堂/同楼统计，支持微信/QQ口令互传、JSON 文件导入或面对面无痕代拉取。",
       "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-ios-unsigned.ipa",
-      "size": 11920000,
+      "size": 11950704,
       "minOSVersion": "16.4",
       "versions": [
         {
@@ -34,7 +34,7 @@
           "date": "2026-11-24",
           "localizedDescription": "v1.4.0：\n1. 同时间多节课点击查看：重叠课程自动聚合角标，点击弹窗切换查看同槽位多门课程，支持手动加课；\n2. 非本周课程同屏查看：顶栏新增「非本周」一键显示/隐藏开关；\n3. 软件内 GitHub 直接下载更新：支持 iOS 免电脑免重签软件内热更新（带 SHA-256 校验与防白屏回滚）及应用内进度条直下 IPA/APK；\n4. 新增情侣课表：双人同屏课表、「♡ 共同没课」空闲时段、同堂/同楼统计，支持口令互传、JSON 文件与面对面无痕代拉取。",
           "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.0/haida-schedule-v1.4.0-ios-unsigned.ipa",
-          "size": 11920000,
+          "size": 11950704,
           "minOSVersion": "16.4"
         },
         {
