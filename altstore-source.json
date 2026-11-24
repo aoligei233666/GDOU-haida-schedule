@@ -25,7 +25,7 @@
       "versionDate": "2026-11-25",
       "versionDescription": "v1.4.3：\n1. 修复 iOS 系统闹钟无法成功设置：接入 iOS 26 原生 AlarmKit 系统级闹钟（新增 NSAlarmKitUsageDescription 与原生 Swift 桥接，锁屏全屏响铃并穿透静音/专注模式，支持早起/课前/考前直写与单条开关/删除），低于 iOS 26 自动降级为每周循环系统铃声提醒，并修复 iOS 18/26 跳转无响应及本周已过星期被跳过的问题；\n2. 修复「含他周」角标挤压课程块文字：取消绝对定位浮层与右侧挤压留白，「含他周」改为底部细条、撞课/同堂改为流式顶标，课程名始终保持 100% 宽度完整显示。",
       "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.3/haida-schedule-v1.4.3-ios-unsigned.ipa",
-      "size": 11965309,
+      "size": 12004084,
       "minOSVersion": "16.4",
       "versions": [
         {
@@ -34,7 +34,7 @@
           "date": "2026-11-25",
           "localizedDescription": "v1.4.3：\n1. 修复 iOS 系统闹钟设置失败：原生接入 iOS 26 AlarmKit 系统级闹钟（锁屏全屏响铃并穿透静音/专注模式，支持单条独立开关与删除）及低版本每周循环铃声提醒兜底，新增系统权限一键引导；\n2. 修复「含他周」挤压课块文字：移除绝对定位角标与右侧挤压留白，课程名称占满全宽不再挤成竖条。",
           "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.3/haida-schedule-v1.4.3-ios-unsigned.ipa",
-          "size": 11965309,
+          "size": 12004084,
           "minOSVersion": "16.4"
         },
         {
