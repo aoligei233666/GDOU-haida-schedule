@@ -28,8 +28,11 @@
   - **iOS 原生层**：`GdouEphemeralNetworking.swift` 基于 `URLSessionConfiguration.ephemeral` + 自定义 `GdouEphemeralURLProtocol` 实现纯内存 Cookie 隔离、无条件控制头剥离、`route` Cookie 固定、HTTPS 升级及 `WKWebsiteDataStore`/`HTTPCookieStorage.shared` 清理；
   - **真实四项可审计回执**：`credentialsPurged`、`sessionLoggedOut`、`storageCleaned`、`cookiesFlushed` 全部基于真实 HTTP / WebStorage / 引用校验生成，严禁硬编码；持久化层提供键级 + 值级敏感凭据脱敏与审计。
 
-### 2. 课表查询
+### 2. 课表查询与情侣双人课表
 - **周课表网格视图**（周一至周日，第 1–12 节）与 **今日课表速览**，切 Tab 自动保留滚动与周次状态；
+- **同时间多节课聚合与点击切换**：同一时间段存在重叠课程（如单双周交替、撞课或双人重叠）时自动展示聚合角标，点击可在底部弹窗内一键切换查看同槽位所有课程详情，并支持点击任意网格槽位手动添加自定义课程；
+- **非本周课程同屏查看**：课表顶栏内置「非本周」一键开关，灰底标签清晰区分本周与非本周排课；
+- **情侣课表功能**：支持「我的 / 情侣同屏 / 只看TA」一键切换，自动标记工作日 **「♡ 共同没课」** 空闲大节、统计 **同堂上课 / 顺路同楼** 次数；零服务器架构支持 **微信/QQ口令互传（`GDOU-COUPLE-V1:`）**、**`.json` 课表文件导入导出** 以及 **面对面无痕代拉取 TA 课表（密码用完即删）**；
 - 完整解析正方教务单双周与不连续周次表达式（如 `1-16周(单)`、`1-4周,6-12周(双),15周`）；对缺少星期/节次/周次的异常条目显式告警而非静默猜测；
 - 内置 **广东海洋大学各校区官方作息时间表**（湖光校区 08:10 官方标准版 / 08:00 常规版、阳江 / 海滨校区 08:20 版），同步课表时自动尝试从正方教务 `/kbcx/xskbcx_cxRjc.html` 拉取实时节次时间并对齐对应学期开学首周，同时支持在设置页直接查看与自定义编辑第 1–12 节起止时间。
 
@@ -51,8 +54,10 @@
 - 基于确定性 `dedupeKey` 实现闹钟幂等更新：重复点击生成本周起床闹钟、单节课前提醒或考前双闹钟时，自动取消旧系统通知并覆盖更新，彻底避免重复响铃；
 - **Android** 支持通过 `android.intent.action.SET_ALARM` 直接写入系统原生时钟，并提供 Android 12+ 精确闹钟权限快捷检查入口。
 
-### 7. 应用内检查更新（GitHub Releases）
-- 在「关于设置」页内置 **检查更新与下载** 入口，直连 `https://github.com/aoligei233666/GDOU-haida-schedule/releases/`（GitHub Releases API）比对版本号，自动匹配 Android `.apk` / iOS `.ipa` 安装包并提供直达下载链接。
+### 7. 软件内 GitHub 直连下载与 iOS 免重签热更新
+- 在「关于设置」页内置 **检查更新与软件内直接下载** 卡片，直连 GitHub Releases（并在校园网共享 IP 触发 GitHub API 限流时自动回退镜像源通道），简洁展示版本改进与功能摘要；
+- **软件内免电脑热更新（iOS / Android）**：支持在应用内直接下载 GitHub Releases 发布的平台热更包（`*-ios-ota.jsbundle` / `*-android-ota.jsbundle`），经原生 SHA-256 校验后立即生效（iOS 无需连接电脑、无需 Sideloadly 重新签名），双端原生 `GdouOtaBundle` 内置 2 次未确认启动防白屏自动回滚与底座升级自动清理机制；
+- **软件内安装包直下与一键导入**：支持进度条直接在应用内下载完整 `.apk`（自动调起 Android 系统安装器）与 `.ipa`（自动唤起 iOS 原生分享面板导入 SideStore / AltStore / Feather / 轻松签 / TrollStore 或保存到“文件”）。
 
 ---
 

@@ -57,6 +57,7 @@ jobs:
       - name: Verify Android zero-retention native code & hardened manifest survived prebuild
         run: |
           grep -q "GdouEphemeralCookieJar" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
+          grep -q "GdouOtaBundle" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q "X-Gdou-Clear-Cookies-After" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q 'android:allowBackup="false"' android/app/src/main/AndroidManifest.xml
           grep -q 'android:usesCleartextTraffic="false"' android/app/src/main/AndroidManifest.xml
@@ -106,17 +107,22 @@ jobs:
           ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86_64 --no-daemon
           mkdir -p ../dist
           if [ "$APK_SIGNED" = "true" ]; then
-            cp app/build/outputs/apk/release/app-release.apk "../dist/haida-schedule-v${APP_VERSION}-android.apk"
+            BUILT_APK="app/build/outputs/apk/release/app-release.apk"
+            cp "$BUILT_APK" "../dist/haida-schedule-v${APP_VERSION}-android.apk"
           else
-            cp app/build/outputs/apk/release/app-release-unsigned.apk "../dist/haida-schedule-v${APP_VERSION}-android-unsigned.apk"
+            BUILT_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+            cp "$BUILT_APK" "../dist/haida-schedule-v${APP_VERSION}-android-unsigned.apk"
           fi
+          unzip -p "$BUILT_APK" assets/index.android.bundle > "../dist/haida-schedule-v${APP_VERSION}-android-ota.jsbundle"
           ls -lh ../dist
 
-      - name: Upload Android APK artifact
+      - name: Upload Android APK & OTA bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: haida-schedule-android-apk
-          path: dist/haida-schedule-v*-android*.apk
+          path: |
+            dist/haida-schedule-v*-android*.apk
+            dist/haida-schedule-v*-android-ota.jsbundle
           if-no-files-found: error
 
   build-ios-ipa:
@@ -159,12 +165,14 @@ jobs:
             exit 1
           fi
           grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
+          grep -q "GdouOtaBundle" "$SWIFT_FILE"
           grep -q "ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider" "$SWIFT_FILE"
           grep -q "readBodyStream" "$SWIFT_FILE"
           grep -q "if didRedirect {" "$SWIFT_FILE"
           grep -q "URLSessionConfiguration.ephemeral" "$SWIFT_FILE"
           grep -q "X-Gdou-Clear-Cookies-After" "$SWIFT_FILE"
           grep -q "GdouEphemeralNetworking.install()" ios/*/AppDelegate.swift
+          grep -q "GdouOtaBundle.resolveBundleURL()" ios/*/AppDelegate.swift
           grep -q "RCTHTTPRequestHandler.h" ios/*/*-Bridging-Header.h
           grep -q "GdouEphemeralNetworking.swift" ios/*.xcodeproj/project.pbxproj
           grep -q "SWIFT_OBJC_BRIDGING_HEADER" ios/*.xcodeproj/project.pbxproj
@@ -234,11 +242,16 @@ jobs:
           zip -qry "$OUT_NAME" Payload
           mkdir -p ../dist
           cp "$OUT_NAME" "../dist/$OUT_NAME"
-          ls -lh "../dist/$OUT_NAME"
+          if [ -f "$APP_PATH/main.jsbundle" ]; then
+            cp "$APP_PATH/main.jsbundle" "../dist/haida-schedule-v${APP_VERSION}-ios-ota.jsbundle"
+          fi
+          ls -lh ../dist
 
-      - name: Upload iOS IPA artifact
+      - name: Upload iOS IPA & OTA bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: haida-schedule-ios-unsigned-ipa
-          path: dist/haida-schedule-v*-ios-unsigned.ipa
+          path: |
+            dist/haida-schedule-v*-ios-unsigned.ipa
+            dist/haida-schedule-v*-ios-ota.jsbundle
           if-no-files-found: error

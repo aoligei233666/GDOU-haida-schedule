@@ -59,11 +59,25 @@ import {
   parseZfScheduleResponse,
 } from '../src/services/scheduleParser';
 import {
+  buildCoupleShareJsonFileContent,
+  buildSamplePartnerSchedule,
+  COUPLE_SHARE_PREFIX,
+  decodeCoupleSharePayload,
+  encodeCoupleShareCode,
+} from '../src/services/coupleShareCodec';
+import {
+  buildTimetableClusters,
+  computeCoupleScheduleInsights,
+} from '../src/services/timetableCluster';
+import {
   checkForAppUpdate,
   compareSemver,
+  CURRENT_VERSION_HIGHLIGHTS,
   GITHUB_RELEASES_PAGE_URL,
   isTrustedGithubReleaseUrl,
+  selectPlatformOtaAssets,
   selectPlatformReleaseAsset,
+  summarizeReleaseHighlights,
 } from '../src/services/updateService';
 import {
   containsSensitiveCredentialValue,
@@ -782,6 +796,10 @@ async function run() {
     pluginSrc.includes('wfw.gdou.edu.cn'),
     'Native cookie stores must pin route cookie on wfw.gdou.edu.cn as well as authserver'
   );
+  assert.ok(
+    pluginSrc.includes('GdouOtaBundle') && pluginSrc.includes('resolveBundleURL'),
+    'Native plugin must include GdouOtaBundle for iOS & Android in-app GitHub hot-updates'
+  );
   const modalSrc = nodeFs.readFileSync(
     nodePath.join(process.cwd(), 'src', 'components', 'EphemeralSyncModal.tsx'),
     'utf8'
@@ -794,7 +812,175 @@ async function run() {
     modalSrc.includes('injectedJavaScriptBeforeContentLoaded={preloadedWebViewJs}'),
     'EphemeralSyncModal must pass document-start preload script to WebView'
   );
-  console.log(`   OK: Calendar legacy guard, updater, iOS ExpoFetch/WebView guards, single-source version v${appJson.expo.version} & config plugin verified.`);
+
+  console.log('8b) Testing v1.4.0 multi-course overlap clustering, non-current-week view, Couple Schedule & OTA updater...');
+  assert.ok(CURRENT_VERSION_HIGHLIGHTS.length >= 4, 'Current version must expose concise highlights');
+  const sampleForCluster = buildSampleGdouData(new Date('2026-11-22T10:00:00'));
+  // Wed 9-10 has BOTH sample-5 (even weeks) and sample-8 (odd weeks)!
+  const week1CurrentOnly = buildTimetableClusters({
+    myCourses: sampleForCluster.courses,
+    selectedWeek: 1,
+    showNonCurrentWeek: false,
+    viewMode: 'mine',
+  });
+  const wed910Week1Only = week1CurrentOnly.find((c) => c.dayOfWeek === 3 && c.startSection === 9);
+  assert.ok(Boolean(wed910Week1Only), 'Odd-week course must appear in Week 1');
+  assert.equal(wed910Week1Only?.items.length, 1, 'Non-current-week course hidden when showNonCurrentWeek=false');
+
+  const week1WithNonCurrent = buildTimetableClusters({
+    myCourses: sampleForCluster.courses,
+    selectedWeek: 1,
+    showNonCurrentWeek: true,
+    viewMode: 'mine',
+  });
+  const wed910Combined = week1WithNonCurrent.find((c) => c.dayOfWeek === 3 && c.startSection === 9);
+  assert.equal(wed910Combined?.items.length, 2, 'Both odd & even week courses must cluster in same slot when showNonCurrentWeek=true');
+  assert.equal(wed910Combined?.primary.isCurrentWeek, true, 'Current-week course MUST take primary priority over non-current-week');
+  assert.equal(wed910Combined?.primary.course.name, '海洋遥感与测绘实验');
+  assert.equal(wed910Combined?.hasSameWeekConflict, false);
+
+  // Even week (Week 2): even-week course (数据结构实验) must flip to primary!
+  const week2WithNonCurrent = buildTimetableClusters({
+    myCourses: sampleForCluster.courses,
+    selectedWeek: 2,
+    showNonCurrentWeek: true,
+    viewMode: 'mine',
+  });
+  const wed910Week2 = week2WithNonCurrent.find((c) => c.dayOfWeek === 3 && c.startSection === 9);
+  assert.equal(wed910Week2?.primary.isCurrentWeek, true);
+  assert.equal(wed910Week2?.primary.course.name, '数据结构实验');
+
+  // Same-week real conflict detection (2 courses both active in Week 1 on Mon 1-2)
+  const conflictCourses = [
+    ...sampleForCluster.courses,
+    {
+      ...sampleForCluster.courses[0],
+      id: 'conflict-extra',
+      name: '重修线性代数',
+    },
+  ];
+  const conflictClusters = buildTimetableClusters({
+    myCourses: conflictCourses,
+    selectedWeek: 1,
+    showNonCurrentWeek: false,
+    viewMode: 'mine',
+  });
+  const monConflict = conflictClusters.find((c) => c.dayOfWeek === 1 && c.startSection === 1);
+  assert.equal(monConflict?.items.length, 2);
+  assert.equal(monConflict?.hasSameWeekConflict, true);
+
+  // Couple Schedule share code round-trip, chat-message extraction, zero-credential check & insights
+  const samplePartner = buildSamplePartnerSchedule(sampleForCluster.termLabel, settings.termStartDate);
+  const shareCode = encodeCoupleShareCode({
+    partnerName: '小海',
+    termLabel: sampleForCluster.termLabel,
+    termStartDate: settings.termStartDate,
+    courses: samplePartner.courses,
+  });
+  assert.ok(shareCode.startsWith(COUPLE_SHARE_PREFIX));
+  const decodedFromWeChatMsg = decodeCoupleSharePayload(
+    `【海大课表】快复制这条消息绑定情侣课表吧：\n${shareCode}\n谢谢！`
+  );
+  assert.equal(decodedFromWeChatMsg.partnerName, '小海');
+  assert.equal(decodedFromWeChatMsg.courses.length, samplePartner.courses.length);
+  assert.ok(decodedFromWeChatMsg.courses.every((c) => c.ownerTag === 'partner'));
+  assert.deepEqual(findForbiddenCredentialKeys(decodedFromWeChatMsg), []);
+
+  const coupleJsonFile = buildCoupleShareJsonFileContent({
+    partnerName: '小海',
+    termLabel: sampleForCluster.termLabel,
+    termStartDate: settings.termStartDate,
+    courses: samplePartner.courses,
+  });
+  const decodedFromJson = decodeCoupleSharePayload(coupleJsonFile, '宝宝');
+  assert.equal(decodedFromJson.partnerName, '宝宝');
+  assert.equal(decodedFromJson.courses.length, samplePartner.courses.length);
+
+  const coupleClusters = buildTimetableClusters({
+    myCourses: sampleForCluster.courses,
+    partnerCourses: samplePartner.courses,
+    selectedWeek: 1,
+    showNonCurrentWeek: true,
+    viewMode: 'couple',
+  });
+  const monTogether = coupleClusters.find((c) => c.dayOfWeek === 1 && c.startSection === 1);
+  assert.equal(monTogether?.isSameCourseTogether, true, 'Mon 1-2 shared 海洋科学导论 must be marked together');
+  const tueOverlap = coupleClusters.find((c) => c.dayOfWeek === 2 && c.startSection === 3);
+  assert.equal(tueOverlap?.hasBothPartnersInWeek, true);
+  assert.equal(tueOverlap?.items.length, 2);
+
+  const insights = computeCoupleScheduleInsights({
+    myCourses: sampleForCluster.courses,
+    partnerCourses: samplePartner.courses,
+    partnerName: '小海',
+    selectedWeek: 1,
+    currentWeek: 1,
+    periods: CAMPUS_PRESETS.huguang_0810.periods,
+    now: new Date('2026-09-02T12:30:00'),
+  });
+  assert.ok(insights.togetherSessionsCount >= 1);
+  assert.ok(insights.sameBuildingSessionsCount >= 1);
+  assert.ok(insights.sharedFreeBlocks.length > 0);
+
+  // OTA asset selector, concise release summary parser & 403/429 campus fallback
+  const otaPicked = selectPlatformOtaAssets(
+    [
+      {
+        name: 'haida-schedule-v1.5.0-ios-ota.jsbundle',
+        browser_download_url: 'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.0/haida-schedule-v1.5.0-ios-ota.jsbundle',
+        size: 1450000,
+      },
+      {
+        name: 'haida-schedule-v1.5.0-ota-manifest.json',
+        browser_download_url: 'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.0/haida-schedule-v1.5.0-ota-manifest.json',
+        size: 512,
+      },
+    ],
+    'ios'
+  );
+  assert.equal(otaPicked.bundleAsset?.name, 'haida-schedule-v1.5.0-ios-ota.jsbundle');
+  assert.equal(otaPicked.manifestAsset?.name, 'haida-schedule-v1.5.0-ota-manifest.json');
+
+  const highlights = summarizeReleaseHighlights(
+    '## 海大课表 v1.5.0\n### 1. 新增情侣课表\n- **双人同屏**：支持共同空闲标记\n- 修复课表重叠遮挡\n## 安装指南\n- 先下载爱思助手'
+  );
+  assert.ok(highlights.some((h) => h.includes('新增情侣课表')));
+  assert.ok(highlights.some((h) => h.includes('双人同屏')));
+  assert.ok(!highlights.some((h) => h.includes('爱思助手')), 'Must stop before install tutorial');
+
+  const origFetchForRateLimit = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('api.github.com')) {
+        return makeMockResponse(403, 'rate limit exceeded', url);
+      }
+      return makeMockResponse(
+        200,
+        JSON.stringify({
+          apps: [
+            {
+              version: '1.5.0',
+              versionDate: '2026-11-25',
+              versionDescription: '- 支持软件内直接热更新\n- 新增情侣课表',
+              downloadURL:
+                'https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.0/haida-schedule-v1.5.0-ios-unsigned.ipa',
+              size: 12000000,
+            },
+          ],
+        }),
+        url
+      );
+    }) as typeof fetch;
+    const fbUpd = await checkForAppUpdate('1.4.0', 'ios');
+    assert.equal(fbUpd.hasUpdate, true);
+    assert.equal(fbUpd.latestVersion, '1.5.0');
+    assert.equal(fbUpd.otaAssetName, 'haida-schedule-v1.5.0-ios-ota.jsbundle');
+  } finally {
+    globalThis.fetch = origFetchForRateLimit;
+  }
+
+  console.log(`   OK: Calendar legacy guard, updater, v1.4.0 overlap/couple/OTA checks, single-source version v${appJson.expo.version} & config plugin verified.`);
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

@@ -58,12 +58,18 @@ interface Props {
   visible: boolean;
   onClose: () => void;
   onSyncSuccess: (result: SyncResult) => void;
+  customHeaderTitle?: string;
 }
 
 type AuthMode = 'direct' | 'webview';
 type WebViewRoutePref = 'auto' | 'wfw' | 'campus';
 
-export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSuccess }) => {
+export const EphemeralSyncModal: React.FC<Props> = ({
+  visible,
+  onClose,
+  onSyncSuccess,
+  customHeaderTitle,
+}) => {
   const [mode, setMode] = useState<AuthMode>('direct');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -895,7 +901,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({ visible, onClose, onSyncSu
         <View style={[styles.header, mode === 'webview' && styles.headerCompact]}>
           <View style={{ flex: 1 }}>
             <Text style={[styles.headerTitle, mode === 'webview' && { fontSize: 16 }]}>
-              无痕同步海大教务
+              {customHeaderTitle || '无痕同步海大教务'}
             </Text>
             {mode === 'direct' && (
               <Text style={styles.headerSub}>课表 · 考试 · 绩点 · 学分 一键拉取</Text>

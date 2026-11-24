@@ -27,7 +27,9 @@ import {
   initializeAlarmEngine,
   mergeAlarmsIdempotently,
 } from './src/services/alarmService';
+import { buildSamplePartnerSchedule } from './src/services/coupleShareCodec';
 import { SyncResult } from './src/services/gdouAuth';
+import { confirmActiveOtaBootIfNeeded } from './src/services/otaUpdateService';
 import {
   clearAllLocalData,
   createInitialAppData,
@@ -35,7 +37,14 @@ import {
   savePersistedData,
 } from './src/services/storageService';
 import { COLORS } from './src/theme/colors';
-import { AlarmRule, AppSettings, ExamItem, PersistedAppData } from './src/types/models';
+import {
+  AlarmRule,
+  AppSettings,
+  CoupleScheduleProfile,
+  CourseItem,
+  ExamItem,
+  PersistedAppData,
+} from './src/types/models';
 
 type TabKey = 'schedule' | 'exams' | 'grades' | 'alarms' | 'settings';
 
@@ -106,6 +115,10 @@ function MainApp() {
     settings: false,
   });
   const [syncModalOpen, setSyncModalOpen] = useState(false);
+  const [syncTargetMode, setSyncTargetMode] = useState<{
+    target: 'self' | 'partner';
+    partnerNickname: string;
+  }>({ target: 'self', partnerNickname: 'TA' });
   const [appData, setAppData] = useState<PersistedAppData>(() => createInitialAppData());
 
   // Tracks user-initiated mutations so useEffect persists outside React's state updater
@@ -130,6 +143,7 @@ function MainApp() {
       } finally {
         if (mounted) {
           setReady(true);
+          confirmActiveOtaBootIfNeeded();
         }
       }
     })();
@@ -175,8 +189,48 @@ function MainApp() {
     setVisitedTabs((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
   };
 
+  const handleOpenSelfSync = () => {
+    setSyncTargetMode({ target: 'self', partnerNickname: 'TA' });
+    setSyncModalOpen(true);
+  };
+
+  const handleOpenPartnerSync = (partnerNickname: string) => {
+    setSyncTargetMode({
+      target: 'partner',
+      partnerNickname: partnerNickname.trim() || 'TA',
+    });
+    setSyncModalOpen(true);
+  };
+
   const handleSyncSuccess = (result: SyncResult) => {
+    // Partner-only ephemeral sync: saves ONLY partner's courses into `coupleSchedule`
+    if (syncTargetMode.target === 'partner') {
+      const nickname = syncTargetMode.partnerNickname || 'TA';
+      const alignedStart =
+        getDefaultTermStartDateForTerm(result.academicYear, result.semesterCode) ||
+        appData.settings.termStartDate;
+
+      mutateAppData((prev) => ({
+        ...prev,
+        coupleSchedule: {
+          partnerName: nickname,
+          termLabel: result.termLabel,
+          termStartDate: alignedStart,
+          courses: result.courses.map((c) => ({ ...c, ownerTag: 'partner' })),
+          updatedAtIso: result.receipt.syncedAtIso,
+        },
+        lastSyncReceipt: result.receipt,
+      }));
+
+      Alert.alert(
+        '💕 TA 的课表无痕拉取成功',
+        `已绑定「${nickname}」的 ${result.courses.length} 项课程排课（不影响你自己的课表与成绩）。\n对方教务会话已核验注销，本地未留存任何账号密码！`
+      );
+      return;
+    }
+
     mutateAppData((prev) => {
+      const manualCourses = prev.courses.filter((c) => c.isManual);
       const manualExams = prev.exams.filter((e) => e.isManual);
       const nextSettings: AppSettings = { ...prev.settings };
 
@@ -210,7 +264,7 @@ function MainApp() {
 
       return {
         ...prev,
-        courses: result.courses,
+        courses: [...result.courses, ...manualCourses],
         exams: [...result.exams, ...manualExams],
         grades: result.grades.length > 0 ? result.grades : prev.grades,
         termLabel: result.termLabel,
@@ -253,12 +307,38 @@ function MainApp() {
 
   const handleLoadSample = () => {
     const sample = buildSampleGdouData();
+    const samplePartner = buildSamplePartnerSchedule(
+      sample.termLabel,
+      appData.settings.termStartDate
+    );
     mutateAppData((prev) => ({
       ...prev,
       courses: sample.courses,
       exams: sample.exams,
       grades: sample.grades,
+      coupleSchedule: prev.coupleSchedule ?? samplePartner,
       termLabel: sample.termLabel,
+    }));
+  };
+
+  const handleSaveCoupleSchedule = (profile: CoupleScheduleProfile | null) => {
+    mutateAppData((prev) => ({
+      ...prev,
+      coupleSchedule: profile,
+    }));
+  };
+
+  const handleAddManualCourse = (course: CourseItem) => {
+    mutateAppData((prev) => ({
+      ...prev,
+      courses: [...prev.courses, course],
+    }));
+  };
+
+  const handleDeleteManualCourse = (courseId: string) => {
+    mutateAppData((prev) => ({
+      ...prev,
+      courses: prev.courses.filter((c) => c.id !== courseId),
     }));
   };
 
@@ -321,7 +401,7 @@ function MainApp() {
       const fresh = createInitialAppData();
       savedVersionRef.current = dirtyVersionRef.current;
       setAppData(fresh);
-      Alert.alert('已清空', '本地课表、考试、成绩和闹钟数据已全部清除。');
+      Alert.alert('已清空', '本地课表、情侣课表、考试、成绩和闹钟数据已全部清除。');
     } catch (err) {
       Alert.alert(
         '清空失败',
@@ -351,12 +431,18 @@ function MainApp() {
           <View style={[styles.tabPane, activeTab !== 'schedule' && styles.tabPaneHidden]}>
             <ScheduleScreen
               courses={appData.courses}
+              coupleSchedule={appData.coupleSchedule}
               alarms={appData.alarms}
               termLabel={appData.termLabel}
               settings={appData.settings}
-              onOpenSync={() => setSyncModalOpen(true)}
+              onOpenSync={handleOpenSelfSync}
+              onOpenPartnerSync={handleOpenPartnerSync}
               onLoadSampleData={handleLoadSample}
               onAlarmsAdded={handleAddAlarms}
+              onUpdateSettings={handleUpdateSettings}
+              onSaveCoupleSchedule={handleSaveCoupleSchedule}
+              onAddManualCourse={handleAddManualCourse}
+              onDeleteManualCourse={handleDeleteManualCourse}
             />
           </View>
         )}
@@ -367,7 +453,7 @@ function MainApp() {
               exams={appData.exams}
               alarms={appData.alarms}
               settings={appData.settings}
-              onOpenSync={() => setSyncModalOpen(true)}
+              onOpenSync={handleOpenSelfSync}
               onAddManualExam={handleAddManualExam}
               onDeleteExam={handleDeleteExam}
               onAlarmsAdded={handleAddAlarms}
@@ -379,7 +465,7 @@ function MainApp() {
           <View style={[styles.tabPane, activeTab !== 'grades' && styles.tabPaneHidden]}>
             <GradesScreen
               grades={appData.grades}
-              onOpenSync={() => setSyncModalOpen(true)}
+              onOpenSync={handleOpenSelfSync}
             />
           </View>
         )}
@@ -404,7 +490,7 @@ function MainApp() {
               lastSyncReceipt={appData.lastSyncReceipt}
               onUpdateSettings={handleUpdateSettings}
               onClearAllData={handleClearAll}
-              onOpenSync={() => setSyncModalOpen(true)}
+              onOpenSync={handleOpenSelfSync}
             />
           </View>
         )}
@@ -437,6 +523,11 @@ function MainApp() {
 
       <EphemeralSyncModal
         visible={syncModalOpen}
+        customHeaderTitle={
+          syncTargetMode.target === 'partner'
+            ? `💕 无痕拉取「${syncTargetMode.partnerNickname}」的课表`
+            : undefined
+        }
         onClose={() => setSyncModalOpen(false)}
         onSyncSuccess={handleSyncSuccess}
       />

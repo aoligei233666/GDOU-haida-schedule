@@ -22,6 +22,8 @@ const REMOVED_ANDROID_PERMISSIONS = new Set([
 const MAIN_APPLICATION_KT = `package cn.edu.gdou.schedule
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import android.content.res.Configuration
 import android.os.Handler
 import android.os.Looper
@@ -45,6 +47,11 @@ import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -133,6 +140,81 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
   }
 }
 
+/**
+ * Safe GitHub OTA JS bundle resolver for Android with 2-strike boot crash auto-rollback
+ * and automatic cleanup when the user upgrades the native APK.
+ */
+private object GdouOtaBundle {
+  private const val OTA_DIR = "gdou-ota"
+  private const val STATE_FILE = "active-ota.json"
+  private const val MAX_UNCONFIRMED_BOOTS = 2
+
+  fun resolveBundleFilePath(context: Context): String? {
+    try {
+      val otaDir = File(context.filesDir, OTA_DIR)
+      val stateFile = File(otaDir, STATE_FILE)
+      if (!stateFile.exists()) return null
+
+      val json = JSONObject(stateFile.readText(Charsets.UTF_8))
+      val baseNativeVersion = json.optString("baseNativeVersion", "")
+      val baseNativeBuild = json.optString("baseNativeBuild", "")
+
+      if (baseNativeVersion.isNotEmpty() && baseNativeVersion != BuildConfig.VERSION_NAME) {
+        otaDir.deleteRecursively()
+        return null
+      }
+      if (baseNativeBuild.isNotEmpty() && baseNativeBuild != BuildConfig.VERSION_CODE.toString()) {
+        otaDir.deleteRecursively()
+        return null
+      }
+
+      val bundleName = json.optString("bundleFileName", "")
+      if (bundleName.isEmpty() || bundleName.contains("..") || bundleName.contains("/") || bundleName.contains("\\\\")) {
+        stateFile.delete()
+        return null
+      }
+
+      val bundleFile = File(otaDir, bundleName)
+      if (!bundleFile.exists() || bundleFile.length() < 32768L) {
+        otaDir.deleteRecursively()
+        return null
+      }
+
+      val confirmed = json.optBoolean("confirmed", false)
+      val attempts = json.optInt("bootAttempts", 0)
+      if (!confirmed) {
+        if (attempts >= MAX_UNCONFIRMED_BOOTS) {
+          Log.w("GdouOta", "Unconfirmed boot limit reached (\$attempts), rolling back to built-in bundle")
+          otaDir.deleteRecursively()
+          return null
+        }
+        json.put("bootAttempts", attempts + 1)
+        stateFile.writeText(json.toString(2), Charsets.UTF_8)
+      }
+
+      Log.i("GdouOta", "Loading GitHub OTA bundle v\${json.optString("otaVersion")} from \${bundleFile.name}")
+      return bundleFile.absolutePath
+    } catch (err: Throwable) {
+      Log.w("GdouOta", "Failed to resolve OTA bundle, falling back: \${err.message}")
+      return null
+    }
+  }
+
+  fun restartApp(context: Context) {
+    try {
+      val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+      val component = launchIntent?.component
+      if (component != null) {
+        val restartIntent = Intent.makeRestartActivityTask(component)
+        context.startActivity(restartIntent)
+        Runtime.getRuntime().exit(0)
+      }
+    } catch (err: Throwable) {
+      Log.w("GdouOta", "Restart failed: \${err.message}")
+    }
+  }
+}
+
 class MainApplication : Application(), ReactApplication {
 
   private val ephemeralCookieJar = GdouEphemeralCookieJar()
@@ -140,7 +222,8 @@ class MainApplication : Application(), ReactApplication {
   override val reactHost: ReactHost by lazy {
     ExpoReactHostFactory.getDefaultReactHost(
       context = applicationContext,
-      packageList = PackageList(this).packages
+      packageList = PackageList(this).packages,
+      jsBundleFilePath = GdouOtaBundle.resolveBundleFilePath(applicationContext)
     )
   }
 
@@ -168,6 +251,19 @@ class MainApplication : Application(), ReactApplication {
         .cookieJar(ephemeralCookieJar)
         .addInterceptor { chain ->
           val orig = chain.request()
+          if (orig.url.host.equals("gdou-ota-internal.local", ignoreCase = true)) {
+            Handler(Looper.getMainLooper()).postDelayed({
+              GdouOtaBundle.restartApp(applicationContext)
+            }, 180L)
+            return@addInterceptor Response.Builder()
+              .request(orig)
+              .protocol(Protocol.HTTP_1_1)
+              .code(200)
+              .message("OK")
+              .header("Content-Type", "application/json")
+              .body("{\\"ok\\":true}".toResponseBody(null))
+              .build()
+          }
           val resetBefore = orig.header("X-Gdou-Reset-Cookies-Before") == "1"
           val clearAfter = orig.header("X-Gdou-Clear-Cookies-After") == "1"
           if (resetBefore) {
@@ -308,7 +404,114 @@ class MainApplication : Application(), ReactApplication {
 const IOS_EPHEMERAL_NETWORKING_SWIFT = `internal import Expo
 import Foundation
 import React
+import UIKit
 import WebKit
+
+/// GitHub in-app OTA JS bundle loader for sideloaded iOS builds (Sideloadly / AltStore / SideStore / Feather)
+/// with 2-strike unconfirmed boot crash auto-rollback and automatic cleanup on native IPA upgrade.
+enum GdouOtaBundle {
+  private static let otaDirName = "gdou-ota"
+  private static let stateFileName = "active-ota.json"
+  private static let maxUnconfirmedBoots = 2
+
+  @MainActor
+  private static weak var registeredFactory: ExpoReactNativeFactory?
+
+  @MainActor
+  static func registerFactory(_ factory: ExpoReactNativeFactory) {
+    registeredFactory = factory
+  }
+
+  static func resolveBundleURL() -> URL? {
+    let fm = FileManager.default
+    guard let docsDir = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
+      return nil
+    }
+    let otaDir = docsDir.appendingPathComponent(otaDirName, isDirectory: true)
+    let stateURL = otaDir.appendingPathComponent(stateFileName, isDirectory: false)
+    guard fm.fileExists(atPath: stateURL.path),
+          let rawData = try? Data(contentsOf: stateURL),
+          var json = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any] else {
+      return nil
+    }
+
+    let currentNativeVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? ""
+    let currentNativeBuild = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? ""
+    let baseNativeVersion = (json["baseNativeVersion"] as? String) ?? ""
+    let baseNativeBuild = (json["baseNativeBuild"] as? String) ?? ""
+
+    if !baseNativeVersion.isEmpty && baseNativeVersion != currentNativeVersion {
+      try? fm.removeItem(at: otaDir)
+      return nil
+    }
+    if !baseNativeBuild.isEmpty && baseNativeBuild != currentNativeBuild {
+      try? fm.removeItem(at: otaDir)
+      return nil
+    }
+
+    guard let relFile = json["bundleFileName"] as? String,
+          !relFile.isEmpty,
+          !relFile.contains(".."),
+          !relFile.contains("/") else {
+      try? fm.removeItem(at: stateURL)
+      return nil
+    }
+
+    let bundleURL = otaDir.appendingPathComponent(relFile, isDirectory: false)
+    guard let attrs = try? fm.attributesOfItem(atPath: bundleURL.path),
+          let fileSize = attrs[.size] as? NSNumber,
+          fileSize.intValue > 32768 else {
+      try? fm.removeItem(at: otaDir)
+      return nil
+    }
+
+    let confirmed = (json["confirmed"] as? Bool) ?? false
+    let attempts = (json["bootAttempts"] as? Int) ?? 0
+    if !confirmed {
+      if attempts >= maxUnconfirmedBoots {
+        NSLog("[GdouOta] Unconfirmed boot limit reached (%d), rolling back to built-in bundle", attempts)
+        try? fm.removeItem(at: otaDir)
+        return nil
+      }
+      json["bootAttempts"] = attempts + 1
+      if let updated = try? JSONSerialization.data(withJSONObject: json) {
+        try? updated.write(to: stateURL, options: .atomic)
+      }
+    }
+
+    // Link built-in assets directory inside otaDir so Ionicons & bundled images resolve natively
+    let otaAssetsURL = otaDir.appendingPathComponent("assets", isDirectory: true)
+    if !fm.fileExists(atPath: otaAssetsURL.path),
+       let mainAssetsURL = Bundle.main.resourceURL?.appendingPathComponent("assets", isDirectory: true),
+       fm.fileExists(atPath: mainAssetsURL.path) {
+      try? fm.createSymbolicLink(at: otaAssetsURL, withDestinationURL: mainAssetsURL)
+    }
+
+    NSLog("[GdouOta] Loading GitHub OTA JS bundle v%@ from %@", (json["otaVersion"] as? String) ?? "?", bundleURL.lastPathComponent)
+    return bundleURL
+  }
+
+  @MainActor
+  static func reloadIntoActiveBundle() {
+    let targetURL = resolveBundleURL() ?? Bundle.main.url(forResource: "main", withExtension: "jsbundle")
+    guard let bundleURL = targetURL, let factory = registeredFactory else {
+      return
+    }
+    let newRootView = factory.recreateRootView(
+      withBundleURL: bundleURL,
+      moduleName: "main",
+      initialProps: nil,
+      launchOptions: nil
+    )
+    for scene in UIApplication.shared.connectedScenes {
+      if let ws = scene as? UIWindowScene {
+        for win in ws.windows where win.rootViewController != nil {
+          win.rootViewController?.view = newRootView
+        }
+      }
+    }
+  }
+}
 
 /// Pure volatile RAM-only cookie store for iOS zero-retention GDOU authentication.
 /// Mirrors Android's GdouEphemeralCookieJar:
@@ -536,6 +739,25 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
   override func startLoading() {
     guard let initialUrl = request.url else {
       client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+      return
+    }
+    if initialUrl.host?.lowercased() == "gdou-ota-internal.local" {
+      let payload = Data("{\\"ok\\":true}".utf8)
+      if let resp = HTTPURLResponse(
+        url: initialUrl,
+        statusCode: 200,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "application/json"]
+      ) {
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: payload)
+        client?.urlProtocolDidFinishLoading(self)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        MainActor.assumeIsolated {
+          GdouOtaBundle.reloadIntoActiveBundle()
+        }
+      }
       return
     }
     let mutable = ((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest) ?? NSMutableURLRequest(url: initialUrl)
@@ -1001,6 +1223,31 @@ function withGdouIosAppDelegate(config) {
         );
       }
     }
+
+    const dist = (process.env.EXPO_PUBLIC_APP_DISTRIBUTION || 'sideload').toLowerCase();
+    const isAppleOfficialStore = dist === 'testflight' || dist === 'appstore';
+    if (!isAppleOfficialStore) {
+      if (
+        contents.includes('reactNativeFactory = factory') &&
+        !contents.includes('GdouOtaBundle.registerFactory(factory)')
+      ) {
+        contents = contents.replace(
+          'reactNativeFactory = factory',
+          'reactNativeFactory = factory\n    GdouOtaBundle.registerFactory(factory)'
+        );
+      }
+      const defaultBundleExpr = 'return Bundle.main.url(forResource: "main", withExtension: "jsbundle")';
+      if (
+        contents.includes(defaultBundleExpr) &&
+        !contents.includes('GdouOtaBundle.resolveBundleURL()')
+      ) {
+        contents = contents.replace(
+          defaultBundleExpr,
+          'return GdouOtaBundle.resolveBundleURL() ?? Bundle.main.url(forResource: "main", withExtension: "jsbundle")'
+        );
+      }
+    }
+
     mod.modResults.contents = contents;
     return mod;
   });

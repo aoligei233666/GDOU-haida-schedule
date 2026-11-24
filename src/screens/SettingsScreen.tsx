@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -21,21 +21,40 @@ import {
   isValidHHMM,
 } from '../constants/gdouTimetable';
 import { openAndroidExactAlarmSettings } from '../services/alarmService';
+import {
+  ActiveOtaState,
+  clearOtaAndRollbackToEmbedded,
+  downloadAndApplyGithubOtaUpdate,
+  downloadAndOpenReleaseInstaller,
+  readActiveOtaState,
+  TransferProgressInfo,
+  triggerNativeOtaReload,
+} from '../services/otaUpdateService';
 import { parseLocalDateStrict } from '../services/scheduleParser';
 import { auditLocalStorageZeroCredentials } from '../services/storageService';
 import {
+  buildAltStoreDirectInstallUrl,
+  buildLiveContainerDirectInstallUrl,
+  buildSideStoreDirectInstallUrl,
+  buildTrollStoreDirectInstallUrl,
   checkForAppUpdate,
+  CURRENT_VERSION_HIGHLIGHTS,
   FEATHER_ADD_SOURCE_URL,
   formatBytesCompact,
   GITHUB_RELEASES_PAGE_URL,
   IOS_ALTSTORE_SOURCE_URL,
   isTrustedGithubReleaseUrl,
+  SIDESTORE_ADD_SOURCE_URL,
   UpdateCheckResult,
 } from '../services/updateService';
 import { COLORS } from '../theme/colors';
 import { AppSettings, CampusPresetKey, PeriodTime, SyncReceipt } from '../types/models';
 
 const APP_VERSION = appConfig.expo.version;
+const APP_BUILD_NUMBER =
+  Platform.OS === 'ios'
+    ? String(appConfig.expo.ios.buildNumber)
+    : String(appConfig.expo.android.versionCode);
 const APP_DISTRIBUTION = (process.env.EXPO_PUBLIC_APP_DISTRIBUTION || 'sideload').toLowerCase();
 const IS_APPLE_OFFICIAL_STORE =
   Platform.OS === 'ios' && (APP_DISTRIBUTION === 'testflight' || APP_DISTRIBUTION === 'appstore');
@@ -69,10 +88,14 @@ export const SettingsScreen: React.FC<Props> = ({
     activePeriods.map((p) => ({ ...p }))
   );
 
-  // GitHub Releases update checker state
+  // GitHub Releases update checker & in-app downloader state
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [activeOta, setActiveOta] = useState<ActiveOtaState | null>(() => readActiveOtaState());
+  const [downloadingMode, setDownloadingMode] = useState<'ota' | 'binary' | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<TransferProgressInfo | null>(null);
+  const downloadAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setTermDateInput(settings.termStartDate);
@@ -86,6 +109,7 @@ export const SettingsScreen: React.FC<Props> = ({
 
   useEffect(() => {
     void runPrivacyAudit();
+    setActiveOta(readActiveOtaState());
   }, [lastSyncReceipt]);
 
   const runPrivacyAudit = async () => {
@@ -153,13 +177,24 @@ export const SettingsScreen: React.FC<Props> = ({
     }
   };
 
+  const handleOpenCustomScheme = async (schemeUrl: string, appLabel: string) => {
+    try {
+      await Linking.openURL(schemeUrl);
+    } catch {
+      Alert.alert(
+        `未检测到 ${appLabel}`,
+        `当前设备未安装 ${appLabel}。你可以直接使用上方「⚡ 软件内直接下载并热更新（免重签）」或「📥 软件内直下 IPA 安装包」！`
+      );
+    }
+  };
+
   const handleOpenFeatherSource = async () => {
     try {
       await Linking.openURL(FEATHER_ADD_SOURCE_URL);
     } catch {
       Alert.alert(
         '未检测到 Feather 客户端',
-        `请先在手机端安装 Feather 或轻松签（ESign），然后在「软件源 → 添加」粘贴以下源地址即可免电脑拉取更新：\n\n${IOS_ALTSTORE_SOURCE_URL}`,
+        `请先在手机端安装 Feather、轻松签（ESign）或 SideStore，然后在「软件源 → 添加」粘贴以下源地址即可免电脑拉取更新：\n\n${IOS_ALTSTORE_SOURCE_URL}`,
         [
           { text: '关闭', style: 'cancel' },
           { text: '分享/复制源地址', onPress: () => void handleShareIosSource() },
@@ -192,6 +227,122 @@ export const SettingsScreen: React.FC<Props> = ({
     }
   };
 
+  const handleCancelActiveDownload = () => {
+    downloadAbortRef.current?.abort();
+    downloadAbortRef.current = null;
+    setDownloadingMode(null);
+    setDownloadProgress(null);
+  };
+
+  const handleInAppOtaHotUpdate = async () => {
+    if (!updateResult?.otaDownloadUrl) return;
+    const ac = new AbortController();
+    downloadAbortRef.current = ac;
+    setDownloadingMode('ota');
+    setDownloadProgress({ bytesWritten: 0, totalBytes: updateResult.otaSizeBytes || 0, fraction: 0 });
+    setUpdateError(null);
+
+    try {
+      const res = await downloadAndApplyGithubOtaUpdate({
+        targetVersion: updateResult.latestVersion,
+        otaDownloadUrl: updateResult.otaDownloadUrl,
+        otaManifestUrl: updateResult.otaManifestUrl,
+        expectedSizeBytes: updateResult.otaSizeBytes,
+        currentRunningVersion: APP_VERSION,
+        fallbackNativeBuild: APP_BUILD_NUMBER,
+        onProgress: (info) => setDownloadProgress(info),
+        signal: ac.signal,
+      });
+      setActiveOta(readActiveOtaState());
+      if (!res.reloadedAutomatically) {
+        Alert.alert(
+          `🎉 v${updateResult.latestVersion} 热更新包已就绪`,
+          'SHA-256 完整性校验已通过！请点击「立即重载」或重新打开 App 即可生效（无需电脑、无需重新签名）。',
+          [
+            {
+              text: '立即重载生效',
+              onPress: () => void triggerNativeOtaReload(),
+            },
+          ]
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      setUpdateError(err instanceof Error ? err.message : String(err));
+    } finally {
+      downloadAbortRef.current = null;
+      setDownloadingMode(null);
+      setDownloadProgress(null);
+    }
+  };
+
+  const handleInAppBinaryDownload = async () => {
+    if (!updateResult) return;
+    const assetName =
+      updateResult.assetName ||
+      (Platform.OS === 'ios'
+        ? `haida-schedule-v${updateResult.latestVersion}-ios-unsigned.ipa`
+        : `haida-schedule-v${updateResult.latestVersion}-android.apk`);
+
+    if (!isTrustedGithubReleaseUrl(updateResult.downloadUrl) || !updateResult.assetName) {
+      await handleOpenTrustedUrl(updateResult.downloadUrl);
+      return;
+    }
+
+    const ac = new AbortController();
+    downloadAbortRef.current = ac;
+    setDownloadingMode('binary');
+    setDownloadProgress({
+      bytesWritten: 0,
+      totalBytes: updateResult.assetSizeBytes || 0,
+      fraction: 0,
+    });
+    setUpdateError(null);
+
+    try {
+      const res = await downloadAndOpenReleaseInstaller({
+        downloadUrl: updateResult.downloadUrl,
+        assetName,
+        expectedSizeBytes: updateResult.assetSizeBytes,
+        onProgress: (info) => setDownloadProgress(info),
+        signal: ac.signal,
+      });
+
+      if (!res.handedOff) {
+        Alert.alert(
+          '安装包已下载至本机',
+          `文件已保存至：\n${res.fileUri}`
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
+      setUpdateError(err instanceof Error ? err.message : String(err));
+    } finally {
+      downloadAbortRef.current = null;
+      setDownloadingMode(null);
+      setDownloadProgress(null);
+    }
+  };
+
+  const handleRollbackOta = () => {
+    Alert.alert(
+      '回退到内置初始包',
+      '将清除本地下载的热更新包并恢复到当前安装包内置版本。确定继续？',
+      [
+        { text: '取消', style: 'cancel' },
+        {
+          text: '确认回退',
+          style: 'destructive',
+          onPress: async () => {
+            await clearOtaAndRollbackToEmbedded();
+            setActiveOta(null);
+            Alert.alert('已清除热更包', '重新打开应用后即恢复内置初始包。');
+          },
+        },
+      ]
+    );
+  };
+
   const handleSaveTermDate = () => {
     const trimmed = termDateInput.trim();
     if (!parseLocalDateStrict(trimmed)) {
@@ -205,7 +356,7 @@ export const SettingsScreen: React.FC<Props> = ({
   const handleConfirmClear = () => {
     Alert.alert(
       '清空全部本地缓存',
-      '将删除本地保存的课表、考试和闹钟列表。确定继续？',
+      '将删除本地保存的课表、情侣课表、考试和闹钟列表。确定继续？',
       [
         { text: '取消', style: 'cancel' },
         {
@@ -237,11 +388,12 @@ export const SettingsScreen: React.FC<Props> = ({
             <Text style={styles.aboutAppName}>海大课表</Text>
             <Text style={styles.aboutPowered}>powered by 种果仁</Text>
             <Text style={styles.aboutDesc}>
-              专为广东海洋大学学子打造 · 支持课表、考试、绩点、学分查询、系统日历写入与智能早起闹钟（账号密码用完即删）
+              专为广东海洋大学学子打造 · 支持课表、情侣课表、考试、绩点学分、系统日历与智能早起闹钟（账号密码用完即删）
             </Text>
           </View>
         </View>
-        {/* Version & Update Card (TestFlight / App Store uses Apple channel; Android & sideload use GitHub Releases) */}
+
+        {/* Version & Direct GitHub Update Card */}
         {IS_APPLE_OFFICIAL_STORE ? (
           <View style={styles.card}>
             <View style={styles.cardHeader}>
@@ -261,17 +413,47 @@ export const SettingsScreen: React.FC<Props> = ({
           <View style={styles.card}>
             <View style={styles.cardHeader}>
               <Ionicons name="cloud-download-outline" size={20} color={COLORS.oceanPrimary} />
-              <Text style={styles.cardTitle}>检查更新与下载（GitHub Releases）</Text>
+              <Text style={styles.cardTitle}>检查更新与软件内直接下载（GitHub）</Text>
             </View>
             <Text style={styles.cardDesc}>
-              当前版本：v{APP_VERSION} · 官方发布地址：{GITHUB_RELEASES_PAGE_URL}
+              当前版本：v{APP_VERSION}
+              {activeOta ? `（⚡ 热更新已生效 · 底座 v${activeOta.baseNativeVersion}）` : ''}
+              {'\n'}支持在软件内直接从 GitHub 下载并完成更新（iOS 支持免电脑免重签热更新 + 直下 IPA 导入安装）。
             </Text>
+
+            {activeOta && (
+              <View style={styles.activeOtaBanner}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.activeOtaText}>
+                    ⚡ 当前运行 GitHub 热更包 v{activeOta.otaVersion}（SHA-256: {activeOta.sha256.slice(0, 10)}…）
+                  </Text>
+                </View>
+                <TouchableOpacity onPress={handleRollbackOta} style={styles.rollbackBtn}>
+                  <Text style={styles.rollbackBtnText}>重置内置包</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {/* Current Version Concise Improvement Summary */}
+            <View style={styles.currentChangelogBox}>
+              <Text style={styles.currentChangelogTitle}>
+                ✨ v{APP_VERSION} 本次更新与改进简述
+              </Text>
+              {CURRENT_VERSION_HIGHLIGHTS.map((line, i) => (
+                <Text key={i} style={styles.changelogBullet}>
+                  • {line}
+                </Text>
+              ))}
+            </View>
 
             <View style={styles.updateBtnRow}>
               <TouchableOpacity
-                style={[styles.updatePrimaryBtn, checkingUpdate && { opacity: 0.65 }]}
+                style={[
+                  styles.updatePrimaryBtn,
+                  (checkingUpdate || downloadingMode !== null) && { opacity: 0.65 },
+                ]}
                 onPress={handleCheckUpdate}
-                disabled={checkingUpdate}
+                disabled={checkingUpdate || downloadingMode !== null}
               >
                 {checkingUpdate ? (
                   <ActivityIndicator size="small" color={COLORS.white} />
@@ -279,7 +461,7 @@ export const SettingsScreen: React.FC<Props> = ({
                   <Ionicons name="refresh-outline" size={16} color={COLORS.white} />
                 )}
                 <Text style={styles.updatePrimaryBtnText}>
-                  {checkingUpdate ? '正在检查...' : '检查新版本'}
+                  {checkingUpdate ? '正在连接 GitHub...' : '检查新版本'}
                 </Text>
               </TouchableOpacity>
 
@@ -288,9 +470,41 @@ export const SettingsScreen: React.FC<Props> = ({
                 onPress={() => void handleOpenTrustedUrl(GITHUB_RELEASES_PAGE_URL)}
               >
                 <Ionicons name="open-outline" size={15} color={COLORS.oceanPrimary} />
-                <Text style={styles.updateSecondaryBtnText}>前往 Releases 下载</Text>
+                <Text style={styles.updateSecondaryBtnText}>GitHub 发布页</Text>
               </TouchableOpacity>
             </View>
+
+            {/* Live In-App Download Progress Bar */}
+            {downloadingMode && downloadProgress && (
+              <View style={styles.progressBox}>
+                <View style={styles.progressHeader}>
+                  <Text style={styles.progressTitle}>
+                    {downloadingMode === 'ota'
+                      ? '⚡ 正在从 GitHub 下载免重签热更新包...'
+                      : `📥 正在从 GitHub 直接下载 ${Platform.OS === 'ios' ? 'IPA' : 'APK'} 安装包...`}
+                  </Text>
+                  <TouchableOpacity onPress={handleCancelActiveDownload}>
+                    <Text style={styles.progressCancel}>取消</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.progressTrack}>
+                  <View
+                    style={[
+                      styles.progressFill,
+                      { width: `${Math.round(downloadProgress.fraction * 100)}%` },
+                    ]}
+                  />
+                </View>
+                <Text style={styles.progressMeta}>
+                  {formatBytesCompact(downloadProgress.bytesWritten) || '0 KB'}
+                  {downloadProgress.totalBytes > 0
+                    ? ` / ${formatBytesCompact(downloadProgress.totalBytes)} (${Math.round(
+                        downloadProgress.fraction * 100
+                      )}%)`
+                    : ''}
+                </Text>
+              </View>
+            )}
 
             {updateError && (
               <View style={styles.updateErrorBox}>
@@ -318,28 +532,128 @@ export const SettingsScreen: React.FC<Props> = ({
                       `✅ 当前 v${updateResult.currentVersion} 已是最新版本（远端 v${updateResult.latestVersion}）`}
                 </Text>
 
-                {updateResult.releaseNotes ? (
-                  <Text style={styles.updateNotes} numberOfLines={5}>
+                {/* Concise parsed highlights of the remote version */}
+                {updateResult.conciseHighlights.length > 0 ? (
+                  <View style={{ marginTop: 6, gap: 3 }}>
+                    <Text style={styles.remoteSummaryLabel}>更新改进摘要：</Text>
+                    {updateResult.conciseHighlights.map((item, idx) => (
+                      <Text key={idx} style={styles.updateNotes}>
+                        • {item}
+                      </Text>
+                    ))}
+                  </View>
+                ) : updateResult.releaseNotes ? (
+                  <Text style={[styles.updateNotes, { marginTop: 6 }]} numberOfLines={5}>
                     {updateResult.releaseNotes}
                   </Text>
                 ) : null}
 
                 {updateResult.hasUpdate && (
-                  <TouchableOpacity
-                    style={styles.downloadReleaseBtn}
-                    onPress={() => void handleOpenTrustedUrl(updateResult.downloadUrl)}
-                  >
-                    <Ionicons name="download-outline" size={16} color={COLORS.white} />
-                    <Text style={styles.downloadReleaseBtnText}>
-                      {updateResult.assetName
-                        ? `直接下载 ${updateResult.assetName}${
-                            updateResult.assetSizeBytes
-                              ? ` (${formatBytesCompact(updateResult.assetSizeBytes)})`
-                              : ''
-                          }`
-                        : `前往下载 v${updateResult.latestVersion}`}
-                    </Text>
-                  </TouchableOpacity>
+                  <View style={{ marginTop: 10, gap: 8 }}>
+                    {/* 1. Primary: In-App OTA Hot-Update (Zero Computer / Zero Re-signing on iOS!) */}
+                    {updateResult.otaDownloadUrl && (
+                      <TouchableOpacity
+                        style={[
+                          styles.otaHotUpdateBtn,
+                          downloadingMode !== null && { opacity: 0.6 },
+                        ]}
+                        onPress={() => void handleInAppOtaHotUpdate()}
+                        disabled={downloadingMode !== null}
+                      >
+                        <Ionicons name="flash" size={16} color={COLORS.white} />
+                        <Text style={styles.downloadReleaseBtnText}>
+                          {Platform.OS === 'ios'
+                            ? `软件内直接下载并热更新 v${updateResult.latestVersion}（免电脑·免重签）`
+                            : `软件内直接下载并极速热更新 v${updateResult.latestVersion}`}
+                          {updateResult.otaSizeBytes
+                            ? ` · ${formatBytesCompact(updateResult.otaSizeBytes)}`
+                            : ''}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+
+                    {/* 2. Secondary: In-App Direct Binary IPA/APK Download & Handoff */}
+                    <TouchableOpacity
+                      style={[
+                        styles.downloadReleaseBtn,
+                        downloadingMode !== null && { opacity: 0.6 },
+                      ]}
+                      onPress={() => void handleInAppBinaryDownload()}
+                      disabled={downloadingMode !== null}
+                    >
+                      <Ionicons name="download-outline" size={16} color={COLORS.white} />
+                      <Text style={styles.downloadReleaseBtnText}>
+                        {Platform.OS === 'ios'
+                          ? `软件内直下 IPA 安装包并导入签名工具${
+                              updateResult.assetSizeBytes
+                                ? ` (${formatBytesCompact(updateResult.assetSizeBytes)})`
+                                : ''
+                            }`
+                          : `软件内直接下载 APK 并调起系统安装${
+                              updateResult.assetSizeBytes
+                                ? ` (${formatBytesCompact(updateResult.assetSizeBytes)})`
+                                : ''
+                            }`}
+                      </Text>
+                    </TouchableOpacity>
+
+                    {/* 3. iOS One-Tap Direct Signer Deep Links when IPA URL is available */}
+                    {Platform.OS === 'ios' && isTrustedGithubReleaseUrl(updateResult.downloadUrl) && (
+                      <View style={styles.iosDirectSchemeGrid}>
+                        <TouchableOpacity
+                          style={styles.iosSchemePill}
+                          onPress={() =>
+                            void handleOpenCustomScheme(
+                              buildSideStoreDirectInstallUrl(updateResult.downloadUrl),
+                              'SideStore'
+                            )
+                          }
+                        >
+                          <Ionicons name="sparkles-outline" size={13} color={COLORS.oceanPrimary} />
+                          <Text style={styles.iosSchemePillText}>SideStore 直装</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.iosSchemePill}
+                          onPress={() =>
+                            void handleOpenCustomScheme(
+                              buildTrollStoreDirectInstallUrl(updateResult.downloadUrl),
+                              'TrollStore'
+                            )
+                          }
+                        >
+                          <Ionicons name="hammer-outline" size={13} color={COLORS.oceanPrimary} />
+                          <Text style={styles.iosSchemePillText}>巨魔 TrollStore</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.iosSchemePill}
+                          onPress={() =>
+                            void handleOpenCustomScheme(
+                              buildAltStoreDirectInstallUrl(updateResult.downloadUrl),
+                              'AltStore'
+                            )
+                          }
+                        >
+                          <Ionicons name="layers-outline" size={13} color={COLORS.oceanPrimary} />
+                          <Text style={styles.iosSchemePillText}>AltStore 直装</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.iosSchemePill}
+                          onPress={() =>
+                            void handleOpenCustomScheme(
+                              buildLiveContainerDirectInstallUrl(updateResult.downloadUrl),
+                              'LiveContainer'
+                            )
+                          }
+                        >
+                          <Ionicons name="cube-outline" size={13} color={COLORS.oceanPrimary} />
+                          <Text style={styles.iosSchemePillText}>LiveContainer</Text>
+                        </TouchableOpacity>
+                      </View>
+                    )}
+                  </View>
                 )}
               </View>
             )}
@@ -347,10 +661,10 @@ export const SettingsScreen: React.FC<Props> = ({
             {/* iOS On-Device Source (Feather / ESign / SideStore) */}
             <View style={styles.iosSourceBox}>
               <Text style={styles.iosSourceTitle}>
-                iOS 手机端免电脑软件源（Feather / 轻松签 / SideStore）
+                iOS 手机端免电脑软件源（SideStore / Feather / 轻松签）
               </Text>
               <Text style={styles.iosSourceDesc}>
-                在手机端签名器添加本源后，发新版可直接拉取并签名覆盖更新，无需连接电脑：
+                除软件内直接热更新外，也可在手机签名工具订阅本源，底座大版本升级时免电脑拉取重签：
               </Text>
               <Text style={styles.iosSourceUrl} selectable>
                 {IOS_ALTSTORE_SOURCE_URL}
@@ -358,17 +672,24 @@ export const SettingsScreen: React.FC<Props> = ({
               <View style={styles.iosSourceBtnRow}>
                 <TouchableOpacity
                   style={styles.iosSourceBtn}
+                  onPress={() => void handleOpenCustomScheme(SIDESTORE_ADD_SOURCE_URL, 'SideStore')}
+                >
+                  <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
+                  <Text style={styles.iosSourceBtnText}>SideStore 加源</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.iosSourceBtn}
                   onPress={() => void handleOpenFeatherSource()}
                 >
                   <Ionicons name="add-circle-outline" size={14} color={COLORS.oceanPrimary} />
-                  <Text style={styles.iosSourceBtnText}>Feather 一键加源</Text>
+                  <Text style={styles.iosSourceBtnText}>Feather 加源</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.iosSourceBtn}
                   onPress={() => void handleShareIosSource()}
                 >
                   <Ionicons name="copy-outline" size={14} color={COLORS.oceanPrimary} />
-                  <Text style={styles.iosSourceBtnText}>复制 / 分享源地址</Text>
+                  <Text style={styles.iosSourceBtnText}>复制源</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -662,7 +983,7 @@ export const SettingsScreen: React.FC<Props> = ({
         {/* Danger Zone */}
         <TouchableOpacity style={styles.clearBtn} onPress={handleConfirmClear}>
           <Ionicons name="trash-outline" size={18} color={COLORS.danger} />
-          <Text style={styles.clearBtnText}>清空本地全部课表、考试、成绩与闹钟数据</Text>
+          <Text style={styles.clearBtnText}>清空本地全部课表、情侣课表、考试、成绩与闹钟数据</Text>
         </TouchableOpacity>
 
         <View style={styles.footerAbout}>
@@ -799,6 +1120,136 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
     lineHeight: 18,
     marginBottom: 10,
+  },
+  activeOtaBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ECFDF5',
+    borderWidth: 1,
+    borderColor: '#A7F3D0',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    marginBottom: 10,
+    gap: 8,
+  },
+  activeOtaText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: '#065F46',
+  },
+  rollbackBtn: {
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: '#6EE7B7',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  rollbackBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#047857',
+  },
+  currentChangelogBox: {
+    backgroundColor: COLORS.oceanTint,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: COLORS.oceanLight,
+    padding: 10,
+    marginBottom: 10,
+    gap: 3,
+  },
+  currentChangelogTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+    marginBottom: 2,
+  },
+  changelogBullet: {
+    fontSize: 11.2,
+    color: COLORS.textSecondary,
+    lineHeight: 16,
+  },
+  progressBox: {
+    backgroundColor: COLORS.bg,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.oceanLight,
+    padding: 10,
+    marginTop: 10,
+    gap: 6,
+  },
+  progressHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  progressTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+    flex: 1,
+  },
+  progressCancel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.danger,
+  },
+  progressTrack: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: '#E2E8F0',
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: COLORS.oceanPrimary,
+    borderRadius: 999,
+  },
+  progressMeta: {
+    fontSize: 11,
+    color: COLORS.textSecondary,
+    textAlign: 'right',
+    fontWeight: '600',
+  },
+  remoteSummaryLabel: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: COLORS.oceanDeep,
+  },
+  otaHotUpdateBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.emerald,
+    borderRadius: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    gap: 6,
+  },
+  iosDirectSchemeGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 2,
+  },
+  iosSchemePill: {
+    width: '48%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: COLORS.oceanLight,
+    borderRadius: 8,
+    paddingVertical: 7,
+    gap: 4,
+  },
+  iosSchemePillText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: COLORS.oceanPrimary,
   },
   auditDesc: {
     fontSize: 12,
@@ -1043,8 +1494,7 @@ const styles = StyleSheet.create({
   updateNotes: {
     fontSize: 11.5,
     color: COLORS.textSecondary,
-    lineHeight: 17,
-    marginTop: 6,
+    lineHeight: 16.5,
   },
   downloadReleaseBtn: {
     flexDirection: 'row',
@@ -1054,13 +1504,14 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     paddingVertical: 10,
     paddingHorizontal: 12,
-    marginTop: 10,
     gap: 6,
   },
   downloadReleaseBtnText: {
-    fontSize: 12.5,
+    fontSize: 12,
     fontWeight: '700',
     color: COLORS.white,
+    textAlign: 'center',
+    flexShrink: 1,
   },
   periodPreviewGrid: {
     flexDirection: 'row',
@@ -1211,7 +1662,7 @@ const styles = StyleSheet.create({
     borderColor: COLORS.oceanLight,
   },
   iosSourceBtnText: {
-    fontSize: 12,
+    fontSize: 11.5,
     fontWeight: '700',
     color: COLORS.oceanPrimary,
   },

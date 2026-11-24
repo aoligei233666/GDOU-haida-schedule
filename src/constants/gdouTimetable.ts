@@ -164,6 +164,8 @@ export function createDefaultSettings(now: Date = new Date()): AppSettings {
     defaultClassAlarmMinutes: 20,
     defaultWakeupMinutes: 45,
     examAdvanceMinutes: 90,
+    showNonCurrentWeekCourses: true,
+    highlightCoupleFreeSlots: true,
   };
 }
 
@@ -299,6 +301,22 @@ export function buildSampleGdouData(now: Date = new Date()): {
       credit: '3.0',
       classGroup: '海洋2401',
       colorIndex: 5,
+    },
+    {
+      id: 'sample-8',
+      name: '海洋遥感与测绘实验',
+      code: 'HY200804',
+      teacher: '郑海涛',
+      location: '钟海楼机房04012',
+      campus: '湖光校区',
+      dayOfWeek: 3,
+      startSection: 9,
+      endSection: 10,
+      weeks: [1, 3, 5, 7, 9, 11, 13, 15],
+      weekText: '1-15周(单)',
+      credit: '1.0',
+      classGroup: '海洋2401',
+      colorIndex: 6,
     },
   ];
 

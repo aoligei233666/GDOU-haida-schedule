@@ -2,14 +2,16 @@ import { Ionicons } from '@expo/vector-icons';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
-  Dimensions,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
+import { CoupleScheduleModal } from '../components/CoupleScheduleModal';
 import { CourseDetailModal } from '../components/CourseDetailModal';
+import { ManualCourseModal } from '../components/ManualCourseModal';
 import {
   DAY_LABELS,
   getActivePeriods,
@@ -24,53 +26,118 @@ import {
   getTodayDayOfWeek,
   isCourseSchedulable,
 } from '../services/scheduleParser';
+import {
+  buildTimetableClusters,
+  computeCoupleScheduleInsights,
+  TimetableSlotCluster,
+} from '../services/timetableCluster';
 import { COLORS, COURSE_PALETTE } from '../theme/colors';
-import { AlarmRule, AppSettings, CourseItem } from '../types/models';
+import {
+  AlarmRule,
+  AppSettings,
+  CoupleScheduleProfile,
+  CourseItem,
+  ScheduleViewMode,
+} from '../types/models';
 
-const SCREEN_WIDTH = Dimensions.get('window').width;
 const TIME_COL_WIDTH = 46;
-const ROW_HEIGHT = 60;
+const ROW_HEIGHT = 62;
 const MIN_VISIBLE_SECTIONS = 12;
+
+const NON_CURRENT_THEME = {
+  bg: '#F1F5F9',
+  border: '#94A3B8',
+  text: '#475569',
+  subtext: '#64748B',
+};
+
+const PARTNER_CURRENT_THEME = {
+  bg: '#FCE7F3',
+  border: '#EC4899',
+  text: '#831843',
+  subtext: '#BE185D',
+};
+
+const COUPLE_TOGETHER_THEME = {
+  bg: '#FFF1F2',
+  border: '#E11D48',
+  text: '#881337',
+  subtext: '#BE123C',
+};
 
 interface Props {
   courses: CourseItem[];
+  coupleSchedule: CoupleScheduleProfile | null;
   alarms: AlarmRule[];
   termLabel: string;
   settings: AppSettings;
   onOpenSync: () => void;
+  onOpenPartnerSync: (partnerNickname: string) => void;
   onLoadSampleData: () => void;
   onAlarmsAdded: (alarms: AlarmRule[]) => void;
+  onUpdateSettings: (next: AppSettings) => void;
+  onSaveCoupleSchedule: (profile: CoupleScheduleProfile | null) => void;
+  onAddManualCourse: (course: CourseItem) => void;
+  onDeleteManualCourse: (courseId: string) => void;
 }
 
 export const ScheduleScreen: React.FC<Props> = ({
   courses,
+  coupleSchedule,
   alarms,
   termLabel,
   settings,
   onOpenSync,
+  onOpenPartnerSync,
   onLoadSampleData,
   onAlarmsAdded,
+  onUpdateSettings,
+  onSaveCoupleSchedule,
+  onAddManualCourse,
+  onDeleteManualCourse,
 }) => {
+  const { width: screenWidth } = useWindowDimensions();
   const currentWeek = useMemo(
     () => Math.min(settings.totalWeeks, Math.max(1, computeTermWeek(settings.termStartDate))),
     [settings.termStartDate, settings.totalWeeks]
   );
   const [selectedWeek, setSelectedWeek] = useState<number>(currentWeek);
-  const [activeCourse, setActiveCourse] = useState<CourseItem | null>(null);
+  const [viewMode, setViewMode] = useState<ScheduleViewMode>('mine');
+  const [activeModalCourses, setActiveModalCourses] = useState<CourseItem[]>([]);
+  const [coupleModalOpen, setCoupleModalOpen] = useState(false);
+  const [manualModalState, setManualModalState] = useState<{
+    visible: boolean;
+    dayOfWeek: number;
+    startSection: number;
+    endSection: number;
+  }>({ visible: false, dayOfWeek: 1, startSection: 1, endSection: 2 });
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
   useEffect(() => {
     setSelectedWeek(currentWeek);
   }, [currentWeek]);
 
+  // Automatically revert to 'mine' if partner schedule is unbound while in couple/partner mode
+  useEffect(() => {
+    if (!coupleSchedule && viewMode !== 'mine') {
+      setViewMode('mine');
+    }
+  }, [coupleSchedule, viewMode]);
+
+  const partnerName = coupleSchedule?.partnerName || 'TA';
+  const partnerCourses = coupleSchedule?.courses ?? [];
+  const showNonCurrentWeek = settings.showNonCurrentWeekCourses !== false;
+
   const periods = useMemo(() => getActivePeriods(settings), [settings]);
   const visibleSections = useMemo(() => {
-    const maxCourseSec = courses.reduce((acc, c) => Math.max(acc, c.endSection || 0), 0);
+    const allCourses = [...courses, ...partnerCourses];
+    const maxCourseSec = allCourses.reduce((acc, c) => Math.max(acc, c.endSection || 0), 0);
     const maxPeriodSec = periods.reduce((acc, p) => Math.max(acc, p.section || 0), 0);
     return Math.max(MIN_VISIBLE_SECTIONS, maxCourseSec, maxPeriodSec);
-  }, [courses, periods]);
+  }, [courses, partnerCourses, periods]);
+
   const todayDow = getTodayDayOfWeek();
-  const colWidth = Math.floor((SCREEN_WIDTH - TIME_COL_WIDTH - 12) / 7);
+  const colWidth = Math.max(38, Math.floor((screenWidth - TIME_COL_WIDTH - 12) / 7));
 
   const weekDates = useMemo(
     () =>
@@ -85,18 +152,60 @@ export const ScheduleScreen: React.FC<Props> = ({
     [courses, selectedWeek]
   );
 
+  const clusters = useMemo(
+    () =>
+      buildTimetableClusters({
+        myCourses: courses,
+        partnerCourses,
+        selectedWeek,
+        showNonCurrentWeek,
+        viewMode,
+      }),
+    [courses, partnerCourses, selectedWeek, showNonCurrentWeek, viewMode]
+  );
+
+  const coupleInsights = useMemo(() => {
+    if (!coupleSchedule) return null;
+    return computeCoupleScheduleInsights({
+      myCourses: courses,
+      partnerCourses,
+      partnerName,
+      selectedWeek,
+      currentWeek,
+      periods,
+    });
+  }, [coupleSchedule, courses, partnerCourses, partnerName, selectedWeek, currentWeek, periods]);
+
   const unparsedCourses = useMemo(
     () => courses.filter((c) => !isCourseSchedulable(c)),
     [courses]
   );
 
-  const todayCourses = useMemo(
-    () =>
-      courses
-        .filter((c) => isCourseSchedulable(c) && c.weeks.includes(currentWeek) && c.dayOfWeek === todayDow)
-        .sort((a, b) => a.startSection - b.startSection),
-    [courses, currentWeek, todayDow]
-  );
+  const todayCourses = useMemo(() => {
+    const base = viewMode === 'partner' ? partnerCourses : courses;
+    return base
+      .filter(
+        (c) =>
+          isCourseSchedulable(c) && c.weeks.includes(currentWeek) && c.dayOfWeek === todayDow
+      )
+      .sort((a, b) => a.startSection - b.startSection)
+      .map((c) => ({ ...c, ownerTag: viewMode === 'partner' ? ('partner' as const) : ('mine' as const) }));
+  }, [courses, partnerCourses, viewMode, currentWeek, todayDow]);
+
+  const handleToggleNonCurrentWeek = () => {
+    onUpdateSettings({
+      ...settings,
+      showNonCurrentWeekCourses: !showNonCurrentWeek,
+    });
+  };
+
+  const handlePressCoupleModeBtn = (targetMode: ScheduleViewMode) => {
+    if (!coupleSchedule && targetMode !== 'mine') {
+      setCoupleModalOpen(true);
+      return;
+    }
+    setViewMode(targetMode);
+  };
 
   const handleQuickCalendarSync = async () => {
     if (courses.length === 0) {
@@ -167,13 +276,183 @@ export const ScheduleScreen: React.FC<Props> = ({
     }
   };
 
+  const renderClusterCard = (cluster: TimetableSlotCluster) => {
+    const { primary, items, startSection, endSection, dayOfWeek } = cluster;
+    const spanCount = Math.max(1, endSection - startSection + 1);
+    const top = (startSection - 1) * ROW_HEIGHT + 2;
+    const height = spanCount * ROW_HEIGHT - 4;
+    const left = (dayOfWeek - 1) * colWidth + 2;
+    const width = colWidth - 4;
+    const totalInSlot = items.length;
+
+    let theme = COURSE_PALETTE[primary.course.colorIndex % COURSE_PALETTE.length];
+    if (!primary.isCurrentWeek) {
+      theme = NON_CURRENT_THEME;
+    } else if (cluster.isSameCourseTogether && viewMode === 'couple') {
+      theme = COUPLE_TOGETHER_THEME;
+    } else if (primary.owner === 'partner') {
+      theme = PARTNER_CURRENT_THEME;
+    }
+
+    // In Couple Split Mode, check if BOTH mine & partner have courses in this cluster
+    const myTopItem = items.find((i) => i.owner === 'mine');
+    const partnerTopItem = items.find((i) => i.owner === 'partner');
+    const showDualPartnerRows =
+      viewMode === 'couple' &&
+      Boolean(myTopItem) &&
+      Boolean(partnerTopItem) &&
+      !cluster.isSameCourseTogether;
+
+    const secondaryItem = items.length > 1 ? items[1] : null;
+
+    // Corner badge text & color for multi-course slots
+    let cornerBadgeText: string | null = null;
+    let cornerBadgeBg = COLORS.oceanPrimary;
+    if (cluster.isSameCourseTogether && viewMode === 'couple') {
+      cornerBadgeText = totalInSlot > 2 ? `同堂·${totalInSlot}` : '💞同堂';
+      cornerBadgeBg = '#E11D48';
+    } else if (cluster.hasSameWeekConflict) {
+      cornerBadgeText = `撞课${totalInSlot}`;
+      cornerBadgeBg = COLORS.coral;
+    } else if (totalInSlot >= 2) {
+      cornerBadgeText = `${totalInSlot}节▾`;
+      cornerBadgeBg = viewMode === 'couple' && cluster.hasBothPartnersInWeek ? '#DB2777' : '#0369A1';
+    }
+
+    return (
+      <TouchableOpacity
+        key={cluster.id}
+        activeOpacity={0.84}
+        onPress={() => setActiveModalCourses(items.map((i) => i.course))}
+        style={[
+          styles.courseCard,
+          !primary.isCurrentWeek && styles.courseCardNonCurrent,
+          totalInSlot >= 2 && styles.courseCardStacked,
+          {
+            top,
+            left,
+            width,
+            height,
+            backgroundColor: theme.bg,
+            borderLeftColor: theme.border,
+          },
+        ]}
+      >
+        {/* Top-right multi-course / conflict / couple badge */}
+        {cornerBadgeText && (
+          <View style={[styles.multiCornerBadge, { backgroundColor: cornerBadgeBg }]}>
+            <Text style={styles.multiCornerBadgeText}>{cornerBadgeText}</Text>
+          </View>
+        )}
+
+        {showDualPartnerRows && myTopItem && partnerTopItem ? (
+          <View style={styles.dualPartnerWrap}>
+            <View style={[styles.dualHalfBox, !myTopItem.isCurrentWeek && { opacity: 0.65 }]}>
+              <Text style={styles.dualMineTag} numberOfLines={1}>
+                我{!myTopItem.isCurrentWeek ? '(非)' : ''}
+              </Text>
+              <Text style={styles.dualMineName} numberOfLines={spanCount >= 3 ? 2 : 1}>
+                {myTopItem.course.name}
+              </Text>
+              <Text style={styles.dualRoomText} numberOfLines={1}>
+                @{myTopItem.course.location}
+              </Text>
+            </View>
+            <View style={styles.dualDivider} />
+            <View style={[styles.dualHalfBox, !partnerTopItem.isCurrentWeek && { opacity: 0.65 }]}>
+              <Text style={styles.dualPartnerTag} numberOfLines={1}>
+                {partnerName}{!partnerTopItem.isCurrentWeek ? '(非)' : ''}
+              </Text>
+              <Text style={styles.dualPartnerName} numberOfLines={spanCount >= 3 ? 2 : 1}>
+                {partnerTopItem.course.name}
+              </Text>
+              <Text style={styles.dualRoomText} numberOfLines={1}>
+                @{partnerTopItem.course.location}
+              </Text>
+            </View>
+          </View>
+        ) : (
+          <>
+            {/* Owner / Non-current-week prefix tag */}
+            {(!primary.isCurrentWeek || viewMode === 'couple') && (
+              <Text
+                style={[
+                  styles.prefixTagText,
+                  {
+                    color: !primary.isCurrentWeek
+                      ? '#64748B'
+                      : primary.owner === 'partner'
+                        ? '#BE185D'
+                        : '#0369A1',
+                  },
+                ]}
+                numberOfLines={1}
+              >
+                {viewMode === 'couple'
+                  ? cluster.isSameCourseTogether
+                    ? '我+TA'
+                    : primary.owner === 'partner'
+                      ? `${partnerName}${!primary.isCurrentWeek ? '·非本周' : ''}`
+                      : `我${!primary.isCurrentWeek ? '·非本周' : ''}`
+                  : '[非本周]'}
+              </Text>
+            )}
+
+            <Text
+              style={[
+                styles.cardName,
+                { color: theme.text },
+                cornerBadgeText ? { paddingRight: 22 } : null,
+              ]}
+              numberOfLines={secondaryItem ? 2 : 3}
+            >
+              {primary.course.name}
+            </Text>
+
+            <Text style={[styles.cardRoom, { color: theme.subtext }]} numberOfLines={1}>
+              @{primary.course.location}
+            </Text>
+
+            {!primary.isCurrentWeek && !secondaryItem && (
+              <Text style={styles.nonWeekRangeText} numberOfLines={1}>
+                {primary.course.weekText}
+              </Text>
+            )}
+
+            {primary.isCurrentWeek && !secondaryItem && spanCount >= 2 && (
+              <Text style={[styles.cardTeacher, { color: theme.subtext }]} numberOfLines={1}>
+                {primary.course.teacher}
+              </Text>
+            )}
+
+            {/* Preview strip for 2nd overlapping course so user immediately sees it */}
+            {secondaryItem && spanCount >= 2 && (
+              <View style={styles.secondCourseStrip}>
+                <Text style={styles.secondCourseStripText} numberOfLines={1}>
+                  +{secondaryItem.isCurrentWeek ? '' : '[非]'}
+                  {secondaryItem.course.name}
+                </Text>
+              </View>
+            )}
+          </>
+        )}
+      </TouchableOpacity>
+    );
+  };
+
+  const hasAnyCourses = courses.length > 0 || Boolean(coupleSchedule);
+
   return (
     <View style={styles.root}>
-      {/* Top Ocean Header */}
-      <View style={styles.header}>
+      {/* Top Ocean / Couple Header */}
+      <View style={[styles.header, viewMode !== 'mine' && styles.headerCoupleTint]}>
         <View style={styles.headerTopRow}>
-          <View>
-            <Text style={styles.termSub}>{termLabel}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.termSub}>
+              {viewMode === 'partner' && coupleSchedule
+                ? `${partnerName}的课表 · ${coupleSchedule.termLabel}`
+                : termLabel}
+            </Text>
             <View style={styles.weekNavRow}>
               <TouchableOpacity
                 onPress={() => setSelectedWeek((w) => Math.max(1, w - 1))}
@@ -202,8 +481,103 @@ export const ScheduleScreen: React.FC<Props> = ({
           </View>
 
           <TouchableOpacity style={styles.syncHeaderBtn} onPress={onOpenSync}>
-            <Ionicons name="shield-checkmark-outline" size={16} color={COLORS.oceanDeep} />
+            <Ionicons name="shield-checkmark-outline" size={15} color={COLORS.oceanDeep} />
             <Text style={styles.syncHeaderBtnText}>无痕同步</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Mode & View Switcher Bar: Non-Current-Week + Couple Mode + Manual Add */}
+        <View style={styles.modeFilterBar}>
+          {/* Couple Mode Segment */}
+          <View style={styles.coupleSegment}>
+            <TouchableOpacity
+              style={[styles.segBtn, viewMode === 'mine' && styles.segBtnActive]}
+              onPress={() => handlePressCoupleModeBtn('mine')}
+            >
+              <Text style={[styles.segBtnText, viewMode === 'mine' && styles.segBtnTextActive]}>
+                我的
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.segBtn, viewMode === 'couple' && styles.segBtnCoupleActive]}
+              onPress={() => handlePressCoupleModeBtn('couple')}
+            >
+              <Ionicons
+                name="heart"
+                size={11}
+                color={viewMode === 'couple' ? '#BE185D' : '#FBCFE8'}
+              />
+              <Text
+                style={[
+                  styles.segBtnText,
+                  viewMode === 'couple' && styles.segBtnTextCoupleActive,
+                ]}
+              >
+                情侣同屏
+              </Text>
+            </TouchableOpacity>
+            {coupleSchedule && (
+              <TouchableOpacity
+                style={[styles.segBtn, viewMode === 'partner' && styles.segBtnCoupleActive]}
+                onPress={() => handlePressCoupleModeBtn('partner')}
+              >
+                <Text
+                  style={[
+                    styles.segBtnText,
+                    viewMode === 'partner' && styles.segBtnTextCoupleActive,
+                  ]}
+                  numberOfLines={1}
+                >
+                  {partnerName}
+                </Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.coupleGearBtn}
+              onPress={() => setCoupleModalOpen(true)}
+              hitSlop={6}
+            >
+              <Ionicons name="options-outline" size={14} color="#FCE7F3" />
+            </TouchableOpacity>
+          </View>
+
+          {/* Non-current-week toggle */}
+          <TouchableOpacity
+            style={[
+              styles.filterTogglePill,
+              showNonCurrentWeek && styles.filterTogglePillActive,
+            ]}
+            onPress={handleToggleNonCurrentWeek}
+          >
+            <Ionicons
+              name={showNonCurrentWeek ? 'eye' : 'eye-off-outline'}
+              size={13}
+              color={showNonCurrentWeek ? COLORS.oceanDeep : '#CBD5E1'}
+            />
+            <Text
+              style={[
+                styles.filterToggleText,
+                showNonCurrentWeek && styles.filterToggleTextActive,
+              ]}
+            >
+              非本周
+            </Text>
+          </TouchableOpacity>
+
+          {/* Manual add course quick button */}
+          <TouchableOpacity
+            style={styles.addCourseHeaderPill}
+            onPress={() =>
+              setManualModalState({
+                visible: true,
+                dayOfWeek: todayDow,
+                startSection: 1,
+                endSection: 2,
+              })
+            }
+          >
+            <Ionicons name="add" size={15} color={COLORS.white} />
+            <Text style={styles.addCourseHeaderText}>加课</Text>
           </TouchableOpacity>
         </View>
 
@@ -233,14 +607,14 @@ export const ScheduleScreen: React.FC<Props> = ({
         </View>
       </View>
 
-      {courses.length === 0 ? (
+      {!hasAnyCourses ? (
         <View style={styles.emptyState}>
           <View style={styles.emptyIconCircle}>
             <Ionicons name="school-outline" size={44} color={COLORS.oceanPrimary} />
           </View>
           <Text style={styles.emptyTitle}>欢迎使用海大课表</Text>
           <Text style={styles.emptyDesc}>
-            支持一键同步广东海洋大学教务课表、考试安排、绩点与学分。登录账号密码仅在拉取时临时验证，拉取完成立即销毁，本地零留存。
+            支持一键同步广东海洋大学教务课表、考试安排、绩点学分与情侣双人课表。账号密码仅在拉取时临时验证，拉取完成立即销毁，本地零留存。
           </Text>
           <TouchableOpacity style={styles.emptyPrimaryBtn} onPress={onOpenSync}>
             <Ionicons name="cloud-download-outline" size={19} color={COLORS.white} />
@@ -248,26 +622,53 @@ export const ScheduleScreen: React.FC<Props> = ({
           </TouchableOpacity>
           <TouchableOpacity style={styles.emptySecondaryBtn} onPress={onLoadSampleData}>
             <Ionicons name="sparkles-outline" size={17} color={COLORS.oceanPrimary} />
-            <Text style={styles.emptySecondaryText}>加载海大示例数据体验课表 / 绩点 / 日历 / 闹钟</Text>
+            <Text style={styles.emptySecondaryText}>加载海大示例数据体验课表 / 情侣同屏 / 绩点</Text>
           </TouchableOpacity>
-          <Text style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 18, fontWeight: '600' }}>
+          <TouchableOpacity
+            style={[styles.emptySecondaryBtn, { borderColor: '#FBCFE8', backgroundColor: '#FDF2F8' }]}
+            onPress={() => setCoupleModalOpen(true)}
+          >
+            <Ionicons name="heart-outline" size={17} color="#DB2777" />
+            <Text style={[styles.emptySecondaryText, { color: '#DB2777' }]}>
+              开启情侣课表（口令互传 / 面对面代拉取）
+            </Text>
+          </TouchableOpacity>
+          <Text style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 16, fontWeight: '600' }}>
             powered by 种果仁
           </Text>
         </View>
       ) : (
         <>
-          {/* Unparsed courses explicit warning banner */}
-          {unparsedCourses.length > 0 && (
-            <View
-              style={{
-                flexDirection: 'row',
-                alignItems: 'center',
-                backgroundColor: COLORS.amberLight,
-                paddingHorizontal: 12,
-                paddingVertical: 6,
-                gap: 6,
-              }}
+          {/* Couple Live Status & Weekly Insights Banner */}
+          {viewMode !== 'mine' && coupleSchedule && coupleInsights && (
+            <TouchableOpacity
+              style={styles.coupleInsightBanner}
+              activeOpacity={0.85}
+              onPress={() => setCoupleModalOpen(true)}
             >
+              <View style={{ flex: 1 }}>
+                <Text style={styles.coupleHeadline} numberOfLines={1}>
+                  {coupleInsights.liveHeadline}
+                </Text>
+                <Text style={styles.coupleSubline} numberOfLines={1}>
+                  {coupleInsights.liveSubline}
+                  {coupleInsights.togetherSessionsCount > 0
+                    ? ` · 同堂 ${coupleInsights.togetherSessionsCount} 节`
+                    : ''}
+                  {coupleInsights.sameBuildingSessionsCount > 0
+                    ? ` · 同楼 ${coupleInsights.sameBuildingSessionsCount} 次`
+                    : ''}
+                </Text>
+              </View>
+              <View style={styles.coupleManageBadge}>
+                <Text style={styles.coupleManageText}>管理</Text>
+              </View>
+            </TouchableOpacity>
+          )}
+
+          {/* Unparsed courses explicit warning banner */}
+          {viewMode === 'mine' && unparsedCourses.length > 0 && (
+            <View style={styles.unparsedBanner}>
               <Ionicons name="warning-outline" size={14} color={COLORS.amber} />
               <Text style={{ flex: 1, fontSize: 11, color: '#92400E' }} numberOfLines={2}>
                 有 {unparsedCourses.length} 门课程缺少星期/节次/周次（
@@ -278,19 +679,25 @@ export const ScheduleScreen: React.FC<Props> = ({
           )}
 
           {/* Today's Spotlight */}
-          {todayCourses.length > 0 && (
+          {viewMode !== 'couple' && todayCourses.length > 0 && (
             <View style={styles.todayBanner}>
               <View style={styles.todayBadge}>
-                <Text style={styles.todayBadgeText}>今日 {todayCourses.length} 节</Text>
+                <Text style={styles.todayBadgeText}>
+                  {viewMode === 'partner' ? `${partnerName}今日` : '今日'} {todayCourses.length} 节
+                </Text>
               </View>
               <ScrollView horizontal showsHorizontalScrollIndicator={false}>
                 {todayCourses.map((c) => {
                   const span = getCourseTimeSpan(c, periods);
+                  const overlappingToday = todayCourses.filter(
+                    (other) =>
+                      other.startSection <= c.endSection && c.startSection <= other.endSection
+                  );
                   return (
                     <TouchableOpacity
                       key={c.id}
                       style={styles.todayChip}
-                      onPress={() => setActiveCourse(c)}
+                      onPress={() => setActiveModalCourses(overlappingToday)}
                     >
                       <Text style={styles.todayChipTitle} numberOfLines={1}>
                         {span.startText} {c.name}
@@ -354,57 +761,71 @@ export const ScheduleScreen: React.FC<Props> = ({
 
               {/* 7-Day Columns */}
               <View style={[styles.columnsWrap, { height: visibleSections * ROW_HEIGHT }]}>
-                {/* Background Grid Lines */}
-                {Array.from({ length: visibleSections }, (_, i) => (
+                {/* Interactive Empty Grid Cells (tap any slot to add custom course) */}
+                {Array.from({ length: visibleSections }, (_, sIdx) => (
                   <View
-                    key={`line-${i}`}
+                    key={`row-${sIdx}`}
                     style={[
                       styles.gridRowLine,
-                      { top: i * ROW_HEIGHT, height: ROW_HEIGHT },
+                      { top: sIdx * ROW_HEIGHT, height: ROW_HEIGHT, flexDirection: 'row' },
                     ]}
-                  />
+                  >
+                    {Array.from({ length: 7 }, (__, dIdx) => (
+                      <TouchableOpacity
+                        key={`empty-${dIdx}-${sIdx}`}
+                        activeOpacity={0.5}
+                        style={{
+                          width: colWidth,
+                          height: ROW_HEIGHT,
+                          borderRightWidth: StyleSheet.hairlineWidth,
+                          borderRightColor: COLORS.borderLight,
+                        }}
+                        onPress={() => {
+                          const startSec = sIdx + 1;
+                          const endSec = Math.min(visibleSections, startSec + 1);
+                          setManualModalState({
+                            visible: true,
+                            dayOfWeek: dIdx + 1,
+                            startSection: startSec,
+                            endSection: endSec,
+                          });
+                        }}
+                      />
+                    ))}
+                  </View>
                 ))}
 
-                {/* Course Cards */}
-                {weekCourses.map((course) => {
-                  const theme = COURSE_PALETTE[course.colorIndex % COURSE_PALETTE.length];
-                  const top = (course.startSection - 1) * ROW_HEIGHT + 2;
-                  const spanCount = Math.max(1, course.endSection - course.startSection + 1);
-                  const height = spanCount * ROW_HEIGHT - 4;
-                  const left = (course.dayOfWeek - 1) * colWidth + 2;
-                  const width = colWidth - 4;
+                {/* Couple Mode Shared Free Slot Hints */}
+                {viewMode === 'couple' &&
+                  coupleInsights &&
+                  settings.highlightCoupleFreeSlots !== false &&
+                  coupleInsights.sharedFreeBlocks.map((free) => {
+                    // Skip drawing free hint if a non-current-week course is occupying that spot
+                    const occupiedByNonCurrent = clusters.some(
+                      (cl) =>
+                        cl.dayOfWeek === free.dayOfWeek &&
+                        cl.startSection <= free.endSection &&
+                        cl.endSection >= free.startSection
+                    );
+                    if (occupiedByNonCurrent) return null;
+                    const top = (free.startSection - 1) * ROW_HEIGHT + 3;
+                    const height = (free.endSection - free.startSection + 1) * ROW_HEIGHT - 6;
+                    const left = (free.dayOfWeek - 1) * colWidth + 3;
+                    const width = colWidth - 6;
+                    return (
+                      <View
+                        key={`free-${free.dayOfWeek}-${free.startSection}`}
+                        pointerEvents="none"
+                        style={[styles.coupleFreeCard, { top, left, width, height }]}
+                      >
+                        <Text style={styles.coupleFreeText}>♡ 共同没课</Text>
+                        <Text style={styles.coupleFreeSub}>{free.startText}</Text>
+                      </View>
+                    );
+                  })}
 
-                  return (
-                    <TouchableOpacity
-                      key={course.id}
-                      activeOpacity={0.85}
-                      onPress={() => setActiveCourse(course)}
-                      style={[
-                        styles.courseCard,
-                        {
-                          top,
-                          left,
-                          width,
-                          height,
-                          backgroundColor: theme.bg,
-                          borderLeftColor: theme.border,
-                        },
-                      ]}
-                    >
-                      <Text style={[styles.cardName, { color: theme.text }]} numberOfLines={3}>
-                        {course.name}
-                      </Text>
-                      <Text style={[styles.cardRoom, { color: theme.subtext }]} numberOfLines={2}>
-                        @{course.location}
-                      </Text>
-                      {spanCount >= 2 && (
-                        <Text style={[styles.cardTeacher, { color: theme.subtext }]} numberOfLines={1}>
-                          {course.teacher}
-                        </Text>
-                      )}
-                    </TouchableOpacity>
-                  );
-                })}
+                {/* Clustered Course Cards */}
+                {clusters.map(renderClusterCard)}
               </View>
             </View>
           </ScrollView>
@@ -412,12 +833,49 @@ export const ScheduleScreen: React.FC<Props> = ({
       )}
 
       <CourseDetailModal
-        course={activeCourse}
+        courses={activeModalCourses}
         selectedWeek={selectedWeek}
         settings={settings}
+        partnerName={partnerName}
         existingAlarms={alarms}
-        onClose={() => setActiveCourse(null)}
+        onClose={() => setActiveModalCourses([])}
         onAlarmCreated={(alarm) => onAlarmsAdded([alarm])}
+        onAddManualCourseInSlot={(day, startSec, endSec) =>
+          setManualModalState({
+            visible: true,
+            dayOfWeek: day,
+            startSection: startSec,
+            endSection: endSec,
+          })
+        }
+        onDeleteManualCourse={onDeleteManualCourse}
+      />
+
+      <ManualCourseModal
+        visible={manualModalState.visible}
+        initialDayOfWeek={manualModalState.dayOfWeek}
+        initialStartSection={manualModalState.startSection}
+        initialEndSection={manualModalState.endSection}
+        totalWeeks={settings.totalWeeks}
+        onClose={() => setManualModalState((s) => ({ ...s, visible: false }))}
+        onSave={onAddManualCourse}
+      />
+
+      <CoupleScheduleModal
+        visible={coupleModalOpen}
+        myCourses={courses}
+        termLabel={termLabel}
+        settings={settings}
+        coupleSchedule={coupleSchedule}
+        onClose={() => setCoupleModalOpen(false)}
+        onSaveCoupleSchedule={(profile) => {
+          onSaveCoupleSchedule(profile);
+          if (profile) {
+            setViewMode('couple');
+          }
+        }}
+        onUpdateSettings={onUpdateSettings}
+        onOpenPartnerEphemeralSync={onOpenPartnerSync}
       />
     </View>
   );
@@ -432,12 +890,16 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.oceanDeep,
     paddingHorizontal: 14,
     paddingTop: 10,
-    paddingBottom: 12,
+    paddingBottom: 11,
+  },
+  headerCoupleTint: {
+    backgroundColor: '#3B0764',
   },
   headerTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 8,
   },
   termSub: {
     fontSize: 11,
@@ -456,7 +918,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.12)',
   },
   weekTitle: {
-    fontSize: 18,
+    fontSize: 17.5,
     fontWeight: '700',
     color: COLORS.white,
   },
@@ -465,10 +927,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 999,
-    marginLeft: 4,
+    marginLeft: 2,
   },
   backToNowText: {
-    fontSize: 11,
+    fontSize: 10.5,
     fontWeight: '700',
     color: COLORS.white,
   },
@@ -476,20 +938,99 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: COLORS.oceanLight,
-    paddingHorizontal: 11,
+    paddingHorizontal: 10,
     paddingVertical: 7,
     borderRadius: 999,
-    gap: 5,
+    gap: 4,
   },
   syncHeaderBtnText: {
     fontSize: 12,
     fontWeight: '700',
     color: COLORS.oceanDeep,
   },
+  modeFilterBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 9,
+    gap: 6,
+  },
+  coupleSegment: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 999,
+    padding: 2,
+  },
+  segBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 4.5,
+    paddingHorizontal: 6,
+    borderRadius: 999,
+    gap: 3,
+  },
+  segBtnActive: {
+    backgroundColor: COLORS.white,
+  },
+  segBtnCoupleActive: {
+    backgroundColor: '#FCE7F3',
+  },
+  segBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.85)',
+  },
+  segBtnTextActive: {
+    color: COLORS.oceanDeep,
+  },
+  segBtnTextCoupleActive: {
+    color: '#9D174D',
+  },
+  coupleGearBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+  },
+  filterTogglePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 9,
+    paddingVertical: 5.5,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    gap: 4,
+  },
+  filterTogglePillActive: {
+    backgroundColor: '#BAE6FD',
+  },
+  filterToggleText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#CBD5E1',
+  },
+  filterToggleTextActive: {
+    color: COLORS.oceanDeep,
+  },
+  addCourseHeaderPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 5.5,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    gap: 2,
+  },
+  addCourseHeaderText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
   quickRow: {
     flexDirection: 'row',
     gap: 8,
-    marginTop: 10,
+    marginTop: 8,
   },
   quickPill: {
     flex: 1,
@@ -497,14 +1038,55 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: 'rgba(255,255,255,0.14)',
-    paddingVertical: 7,
+    paddingVertical: 6.5,
     borderRadius: 10,
     gap: 5,
   },
   quickPillText: {
-    fontSize: 12,
+    fontSize: 11.5,
     fontWeight: '600',
     color: COLORS.white,
+  },
+  coupleInsightBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FDF2F8',
+    borderBottomWidth: 1,
+    borderBottomColor: '#FBCFE8',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    gap: 8,
+  },
+  coupleHeadline: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: '#831843',
+  },
+  coupleSubline: {
+    fontSize: 11,
+    color: '#9D174D',
+    marginTop: 1,
+  },
+  coupleManageBadge: {
+    backgroundColor: '#FCE7F3',
+    borderWidth: 1,
+    borderColor: '#F9A8D4',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  coupleManageText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#BE185D',
+  },
+  unparsedBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.amberLight,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    gap: 6,
   },
   emptyState: {
     flex: 1,
@@ -532,7 +1114,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
     marginTop: 8,
-    marginBottom: 22,
+    marginBottom: 20,
   },
   emptyPrimaryBtn: {
     flexDirection: 'row',
@@ -573,7 +1155,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: COLORS.surface,
-    paddingVertical: 8,
+    paddingVertical: 7,
     paddingHorizontal: 10,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
@@ -687,6 +1269,28 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: COLORS.borderLight,
   },
+  coupleFreeCard: {
+    position: 'absolute',
+    borderRadius: 7,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#F9A8D4',
+    backgroundColor: 'rgba(253, 242, 248, 0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 2,
+  },
+  coupleFreeText: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: '#DB2777',
+    textAlign: 'center',
+  },
+  coupleFreeSub: {
+    fontSize: 8.5,
+    color: '#EC4899',
+    marginTop: 1,
+  },
   courseCard: {
     position: 'absolute',
     borderRadius: 8,
@@ -694,19 +1298,105 @@ const styles = StyleSheet.create({
     padding: 4,
     overflow: 'hidden',
   },
+  courseCardNonCurrent: {
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    borderLeftWidth: 3,
+    opacity: 0.88,
+  },
+  courseCardStacked: {
+    borderBottomWidth: 2.5,
+    borderBottomColor: 'rgba(15, 23, 42, 0.16)',
+  },
+  multiCornerBadge: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    borderRadius: 5,
+    zIndex: 5,
+  },
+  multiCornerBadgeText: {
+    fontSize: 8.5,
+    fontWeight: '800',
+    color: COLORS.white,
+  },
+  prefixTagText: {
+    fontSize: 8.5,
+    fontWeight: '800',
+    marginBottom: 1,
+  },
   cardName: {
-    fontSize: 11,
+    fontSize: 10.5,
     fontWeight: '700',
-    lineHeight: 14,
+    lineHeight: 13.5,
   },
   cardRoom: {
-    fontSize: 9.5,
-    marginTop: 3,
-    lineHeight: 12,
-  },
-  cardTeacher: {
     fontSize: 9,
     marginTop: 2,
+    lineHeight: 11.5,
+  },
+  nonWeekRangeText: {
+    fontSize: 8.5,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  cardTeacher: {
+    fontSize: 8.5,
+    marginTop: 2,
     opacity: 0.85,
+  },
+  secondCourseStrip: {
+    marginTop: 'auto',
+    backgroundColor: 'rgba(15, 23, 42, 0.07)',
+    borderRadius: 4,
+    paddingHorizontal: 3,
+    paddingVertical: 1.5,
+  },
+  secondCourseStripText: {
+    fontSize: 8.5,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  dualPartnerWrap: {
+    flex: 1,
+    justifyContent: 'space-between',
+    paddingTop: 10,
+  },
+  dualHalfBox: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  dualDivider: {
+    height: 1,
+    backgroundColor: 'rgba(236, 72, 153, 0.22)',
+    marginVertical: 2,
+  },
+  dualMineTag: {
+    fontSize: 8,
+    fontWeight: '800',
+    color: '#0369A1',
+  },
+  dualMineName: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: '#0C4A6E',
+    lineHeight: 11.5,
+  },
+  dualPartnerTag: {
+    fontSize: 8,
+    fontWeight: '800',
+    color: '#BE185D',
+  },
+  dualPartnerName: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: '#831843',
+    lineHeight: 11.5,
+  },
+  dualRoomText: {
+    fontSize: 8,
+    color: '#64748B',
   },
 });

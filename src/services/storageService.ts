@@ -20,6 +20,7 @@ export function createInitialAppData(now: Date = new Date()): PersistedAppData {
     exams: [],
     grades: [],
     alarms: [],
+    coupleSchedule: null,
     termLabel: term.label,
     academicYear: term.xnm,
     semesterCode: term.xqm,
@@ -35,6 +36,19 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
     if (!raw) return createInitialAppData();
     const parsed = JSON.parse(raw) as Partial<PersistedAppData>;
     const defaults = createInitialAppData();
+    const rawCouple = parsed.coupleSchedule;
+    const coupleSchedule =
+      rawCouple &&
+      typeof rawCouple === 'object' &&
+      Array.isArray(rawCouple.courses)
+        ? {
+            partnerName: String(rawCouple.partnerName || 'TA').trim().slice(0, 20) || 'TA',
+            termLabel: String(rawCouple.termLabel || defaults.termLabel),
+            termStartDate: String(rawCouple.termStartDate || defaults.settings.termStartDate),
+            courses: rawCouple.courses,
+            updatedAtIso: String(rawCouple.updatedAtIso || new Date().toISOString()),
+          }
+        : null;
     return {
       ...defaults,
       ...parsed,
@@ -42,6 +56,7 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
       exams: Array.isArray(parsed.exams) ? parsed.exams : [],
       grades: Array.isArray(parsed.grades) ? parsed.grades : [],
       alarms: Array.isArray(parsed.alarms) ? parsed.alarms : [],
+      coupleSchedule,
       settings: {
         ...defaults.settings,
         ...(parsed.settings ?? {}),

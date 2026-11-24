@@ -22,6 +22,18 @@ export interface CourseItem {
   classGroup: string;
   colorIndex: number;
   parseWarning?: string;
+  isManual?: boolean;
+  ownerTag?: 'mine' | 'partner';
+}
+
+export type ScheduleViewMode = 'mine' | 'couple' | 'partner';
+
+export interface CoupleScheduleProfile {
+  partnerName: string;
+  termLabel: string;
+  termStartDate: string;
+  courses: CourseItem[];
+  updatedAtIso: string;
 }
 
 export interface ExamItem {
@@ -134,6 +146,8 @@ export interface AppSettings {
   defaultClassAlarmMinutes: number;
   defaultWakeupMinutes: number;
   examAdvanceMinutes: number;
+  showNonCurrentWeekCourses: boolean;
+  highlightCoupleFreeSlots: boolean;
 }
 
 export interface LogoutVerificationDetails {
@@ -170,6 +184,7 @@ export interface PersistedAppData {
   exams: ExamItem[];
   grades: GradeItem[];
   alarms: AlarmRule[];
+  coupleSchedule: CoupleScheduleProfile | null;
   termLabel: string;
   academicYear: string; // e.g. "2025"
   semesterCode: string; // "3" (秋/第一学期) | "12" (春/第二学期) | "16" (第三学期)
