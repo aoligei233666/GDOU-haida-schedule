@@ -2,7 +2,7 @@
   "expo": {
     "name": "海大课表",
     "slug": "gdou-schedule-app",
-    "version": "1.4.1",
+    "version": "1.4.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -13,7 +13,7 @@
     },
     "ios": {
       "bundleIdentifier": "cn.edu.gdou.schedule",
-      "buildNumber": "7",
+      "buildNumber": "8",
       "supportsTablet": true,
       "infoPlist": {
         "CFBundleDisplayName": "海大课表",
@@ -34,7 +34,7 @@
     },
     "android": {
       "package": "cn.edu.gdou.schedule",
-      "versionCode": 7,
+      "versionCode": 8,
       "adaptiveIcon": {
         "backgroundColor": "#003B90",
         "foregroundImage": "./assets/android-icon-foreground.png",

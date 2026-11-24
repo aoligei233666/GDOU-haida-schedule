@@ -19,7 +19,6 @@ import {
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
   GDOU_JW_SSO_SERVICE,
-  GDOU_JW_WFW_SSO_SERVICE,
   GDOU_WFW_ORIGIN,
   healWfwWrongSsoUrl,
   isAllowedWebViewNavigationUrl,
@@ -125,6 +124,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const autoReinitCountRef = useRef<number>(0);
   const webViewCompletingRef = useRef<boolean>(false);
   const lastRedirectRewriteRef = useRef<{ url: string; ts: number }>({ url: '', ts: 0 });
+  const webViewCurrentUrlRef = useRef<string>('');
   const pendingWebViewRedirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   bridgeTokenRef.current = bridgeToken;
 
@@ -571,6 +571,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         (step) => setStatusLog((prev) => [...prev, step]),
         { signal: ac.signal }
       );
+      if (outcome.status === 'mfa_required') {
+        setWfwSubAuth(null);
+        setMfaChallenge(outcome.mfa);
+        setMfaType(outcome.mfa.defaultReAuthType);
+        setMfaCode('');
+        setMfaHint(null);
+        setErrorText(null);
+        setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 80);
+        return;
+      }
       if (outcome.status === 'wfw_subauth_required') {
         setMfaChallenge(null);
         setWfwSubAuth(outcome.subAuth);
@@ -646,7 +656,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     setStatusLog([...wfwSubAuth.previousSteps]);
 
     try {
-      const result = await completeWfwSubAuthAndSync(
+      const outcome = await completeWfwSubAuthAndSync(
         wfwSubAuth,
         ephemeral,
         xnmOverride || xqmOverride
@@ -655,9 +665,19 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         (step) => setStatusLog((prev) => [...prev, step]),
         { signal: ac.signal }
       );
+      if (outcome.status === 'mfa_required') {
+        setWfwSubAuth(null);
+        setMfaChallenge(outcome.mfa);
+        setMfaType(outcome.mfa.defaultReAuthType);
+        setMfaCode('');
+        setMfaHint(null);
+        setErrorText(null);
+        setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 80);
+        return;
+      }
       setWfwSubAuth(null);
       wipeFormInputs(false);
-      onSyncSuccess(result);
+      onSyncSuccess(outcome.result);
       onClose();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -855,15 +875,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   );
 
   const expectedWebViewServiceUrl = useMemo(() => {
-    return useCampusWebView ? GDOU_JW_SSO_SERVICE : GDOU_JW_WFW_SSO_SERVICE;
+    return useCampusWebView ? GDOU_JW_SSO_SERVICE : `${GDOU_WFW_ORIGIN}/`;
   }, [useCampusWebView]);
 
   const effectiveWebViewUrl = useMemo(() => {
-    const authBase = useCampusWebView ? GDOU_AUTH_ORIGIN : GDOU_WFW_ORIGIN;
-    return `${authBase}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+    return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
       expectedWebViewServiceUrl
     )}`;
-  }, [useCampusWebView, expectedWebViewServiceUrl]);
+  }, [expectedWebViewServiceUrl]);
 
   // Keep source object strictly memoized per session so React/Fabric NEVER mutates `source` mid-login
   const initialWebViewSource = useMemo(
@@ -890,6 +909,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     if (nextPref) setWebViewRoutePref(nextPref);
     setErrorText(null);
     lastRedirectRewriteRef.current = { url: '', ts: 0 };
+    webViewCurrentUrlRef.current = '';
     setBridgeToken(generateSecureHex(16));
     setWebViewProgress(0.15);
     setWebViewKey((k) => k + 1);
@@ -1439,16 +1459,35 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   }
 
                   // 1) Seamlessly upgrade GDOU server cleartext redirects (e.g. http://authserver.gdou.edu.cn/authserver/reAuthCheck/...) to HTTPS
-                  // 2) Heal wrong off-campus wfw SSO paths (/https://authserver.gdou.edu.cn/sso/jziotlogin -> jw/sso/jziotlogin) so post-MFA never hits 404
-                  // 3) Normalize wfw /https://(authserver|jw).gdou.edu.cn/authserver/... -> /authserver/... so Path=/authserver cookies attach in WebView
+                  // 2) Heal wrong off-campus wfw SSO paths & bare jw.gdou.edu.cn callbacks (post-Step-2 ticket -> wfw/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=...)
+                  // 3) Keep Step-2 authserver redirects inside wfw.gdou.edu.cn/authserver/... and normalize ONLY once urlss=authserver is active
                   const upgradedHttps = upgradeGdouHttpToHttps(req.url);
                   const afterUpgrade = upgradedHttps ?? req.url;
-                  const healedWfwSso = healWfwWrongSsoUrl(afterUpgrade);
-                  const normalizedWfw = normalizeWfwAuthUrl(healedWfwSso ?? afterUpgrade);
-                  if (upgradedHttps || healedWfwSso || normalizedWfw) {
-                    const rawTarget = normalizedWfw ?? healedWfwSso ?? upgradedHttps!;
+                  const healedWfwSso = healWfwWrongSsoUrl(afterUpgrade, !useCampusWebView);
+                  const curUrl = webViewCurrentUrlRef.current || '';
+                  const isCurrentlyInWfwAuth =
+                    curUrl.startsWith(`${GDOU_WFW_ORIGIN}/authserver/`) ||
+                    curUrl.includes(`${GDOU_WFW_ORIGIN}/https://authserver.gdou.edu.cn/authserver/`);
+                  let keptInWfwAuth: string | null = null;
+                  if (!useCampusWebView && isCurrentlyInWfwAuth) {
+                    const bareStep2Auth = afterUpgrade.match(
+                      /^https:\/\/authserver\.gdou\.edu\.cn(\/authserver\/(?:reAuthCheck|dynamicCode|login).*)$/i
+                    );
+                    if (
+                      bareStep2Auth &&
+                      !afterUpgrade.includes(encodeURIComponent(`${GDOU_WFW_ORIGIN}/`))
+                    ) {
+                      keptInWfwAuth = `${GDOU_WFW_ORIGIN}${bareStep2Auth[1]}`;
+                    }
+                  }
+                  const normalizedWfw = isCurrentlyInWfwAuth
+                    ? normalizeWfwAuthUrl(keptInWfwAuth ?? healedWfwSso ?? afterUpgrade)
+                    : null;
+                  if (upgradedHttps || healedWfwSso || keptInWfwAuth || normalizedWfw) {
+                    const rawTarget =
+                      normalizedWfw ?? keptInWfwAuth ?? healedWfwSso ?? upgradedHttps!;
                     const fallbackService = rawTarget.includes('wfw.gdou.edu.cn')
-                      ? GDOU_JW_WFW_SSO_SERVICE
+                      ? GDOU_JW_SSO_SERVICE
                       : expectedWebViewServiceUrl;
                     const targetUrl = ensureAuthLoginServiceParam(rawTarget, fallbackService);
                     const nowTs = Date.now();
@@ -1475,6 +1514,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                     prev && prev.startsWith('已拦截非海大官方') ? null : prev
                   );
                   return true;
+                }}
+                onNavigationStateChange={(navState) => {
+                  if (navState?.url) {
+                    webViewCurrentUrlRef.current = navState.url;
+                  }
                 }}
                 onError={(event) => {
                   const { url, code, description } = event.nativeEvent;

@@ -45,7 +45,6 @@ import expo.modules.ApplicationLifecycleDispatcher
 import expo.modules.ExpoReactHostFactory
 import okhttp3.Cookie
 import okhttp3.CookieJar
-import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Protocol
@@ -110,10 +109,11 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
     val now = System.currentTimeMillis()
     for (cookie in cookies) {
       val key = "\${cookie.domain}|\${cookie.path}|\${cookie.name}"
-      // Pin load-balancer \`route\` cookie once set for authserver or wfw /authserver so session stays on one node
-      val isAuthRouteHost = url.host.contains("authserver.gdou.edu.cn") ||
-        url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
-      if (cookie.name == "route" && isAuthRouteHost) {
+      // Pin load-balancer \`route\` cookie strictly for authserver (/authserver path or authserver host),
+      // never freezing jw.gdou.edu.cn Path=/ route across SSO login!
+      val isAuthRouteCookie = cookie.path.startsWith("/authserver", ignoreCase = true) ||
+        url.host.contains("authserver.gdou.edu.cn", ignoreCase = true)
+      if (cookie.name == "route" && isAuthRouteCookie) {
         val existing = store[key]
         if (existing != null && existing.expiresAt > now) {
           continue
@@ -129,7 +129,7 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
 
   override fun loadForRequest(url: HttpUrl): List<Cookie> {
     val now = System.currentTimeMillis()
-    val result = ArrayList<Cookie>()
+    val candidates = ArrayList<Cookie>()
     val innerUrl = extractWfwInnerUrl(url)
     val iterator = store.entries.iterator()
     while (iterator.hasNext()) {
@@ -138,10 +138,19 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
       if (cookie.expiresAt <= now) {
         iterator.remove()
       } else if (cookie.matches(url) || (innerUrl != null && cookie.matches(innerUrl))) {
+        candidates.add(cookie)
+      }
+    }
+    candidates.sortByDescending { it.path.length }
+    // Keep only the most-specific path per cookie name so /authserver JSESSIONID/route
+    // never collide with jw.gdou.edu.cn Path=/ JSESSIONID/route behind wfw.gdou.edu.cn!
+    val seenNames = HashSet<String>(candidates.size)
+    val result = ArrayList<Cookie>(candidates.size)
+    for (cookie in candidates) {
+      if (seenNames.add(cookie.name)) {
         result.add(cookie)
       }
     }
-    result.sortByDescending { it.path.length }
     return result
   }
 
@@ -470,29 +479,8 @@ class MainApplication : Application(), ReactApplication {
           }
 
           val reqCookieHeader = effectiveReq.header("Cookie") ?: ""
-          val hasPinnedRoute = reqCookieHeader.contains("route=")
           val resp = chain.proceed(effectiveReq)
           val builder = resp.newBuilder()
-
-          // Drop duplicate Set-Cookie: route=... headers once pinned
-          val isAuthRouteHost = effectiveReq.url.host.contains("authserver.gdou.edu.cn") ||
-            effectiveReq.url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
-          if (hasPinnedRoute && isAuthRouteHost) {
-            val allCookies = resp.headers("Set-Cookie")
-            if (allCookies.any { it.trim().startsWith("route=") }) {
-              val filtered = Headers.Builder()
-              val headers = resp.headers
-              for (i in 0 until headers.size) {
-                val name = headers.name(i)
-                val value = headers.value(i)
-                if (name.equals("Set-Cookie", ignoreCase = true) && value.trim().startsWith("route=")) {
-                  continue
-                }
-                filtered.add(name, value)
-              }
-              builder.headers(filtered.build())
-            }
-          }
 
           // Upgrade cleartext http://*.gdou.edu.cn redirects to https:// and heal off-campus wfw redirects
           val loc = resp.header("Location")
@@ -509,6 +497,7 @@ class MainApplication : Application(), ReactApplication {
               loc
             }
             val isOnWfw = effectiveReq.url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
+            val isInWfwProxiedPath = isOnWfw && effectiveReq.url.encodedPath.startsWith("/https://", ignoreCase = true)
             val wrongWfwSsoRe = Regex(
               "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn)?(?:/https?://authserver\\\\.gdou\\\\.edu\\\\.cn)?/sso/jziotlogin([?#].*)?\$",
               RegexOption.IGNORE_CASE
@@ -517,13 +506,23 @@ class MainApplication : Application(), ReactApplication {
               "^https?://jw\\\\.gdou\\\\.edu\\\\.cn(/.*)?\$",
               RegexOption.IGNORE_CASE
             )
+            val bareAuthLocRe = Regex(
+              "^https?://authserver\\\\.gdou\\\\.edu\\\\.cn(/.*)?\$",
+              RegexOption.IGNORE_CASE
+            )
             val wrongSsoMatch = if (isOnWfw) wrongWfwSsoRe.matchEntire(upgradedCandidate) else null
             val bareJwMatch = if (isOnWfw) bareJwLocRe.matchEntire(upgradedCandidate) else null
+            val bareAuthMatch = if (isInWfwProxiedPath) bareAuthLocRe.matchEntire(upgradedCandidate) else null
             rewrittenLoc = when {
               wrongSsoMatch != null ->
                 "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin\${wrongSsoMatch.groupValues[1]}"
               bareJwMatch != null ->
                 "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\${bareJwMatch.groupValues[1]}"
+              bareAuthMatch != null ->
+                "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn\${bareAuthMatch.groupValues[1]}"
+              loc.startsWith("/authserver", ignoreCase = true) &&
+                reqUrl.contains("wfw.gdou.edu.cn/https://authserver.gdou.edu.cn", ignoreCase = true) ->
+                "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn\$loc"
               loc.startsWith("/") &&
                 !loc.startsWith("/https://") &&
                 !loc.startsWith("/http://") &&
@@ -729,14 +728,15 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
 
     let now = Date()
     let host = (url.host ?? "").lowercased()
-    let isAuthRouteHost = host.contains("authserver.gdou.edu.cn") || host == "wfw.gdou.edu.cn"
 
     lock.lock()
     defer { lock.unlock() }
 
     for cookie in parsed {
       let key = "\\(cookie.domain.lowercased())|\\(cookie.path)|\\(cookie.name)"
-      if cookie.name == "route" && isAuthRouteHost {
+      let isAuthRouteCookie = cookie.path.lowercased().hasPrefix("/authserver") ||
+        host.contains("authserver.gdou.edu.cn")
+      if cookie.name == "route" && isAuthRouteCookie {
         if let existing = cookiesByKey[key] {
           let notExpired = existing.expiresDate.map { $0 > now } ?? true
           if notExpired {
@@ -790,7 +790,14 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
 
     guard !matched.isEmpty else { return nil }
     matched.sort { $0.path.count > $1.path.count }
-    let headerMap = HTTPCookie.requestHeaderFields(with: matched)
+    var seenNames = Set<String>()
+    var deduped: [HTTPCookie] = []
+    for cookie in matched {
+      if seenNames.insert(cookie.name).inserted {
+        deduped.append(cookie)
+      }
+    }
+    let headerMap = HTTPCookie.requestHeaderFields(with: deduped)
     return headerMap["Cookie"]
   }
 
@@ -878,7 +885,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     return upgradeGdouHttpUrl(parsed)
   }
 
-  private static func healWfwRedirectUrl(_ raw: String, isOnWfw: Bool) -> URL? {
+  private static func healWfwRedirectUrl(_ raw: String, isOnWfw: Bool, isInWfwProxiedPath: Bool = false) -> URL? {
     guard isOnWfw else { return nil }
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     let lower = trimmed.lowercased()
@@ -903,6 +910,16 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
         let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: jwPrefix.count)
         let suffix = String(trimmed[suffixStart...])
         return URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" + suffix)
+      }
+    }
+
+    if isInWfwProxiedPath {
+      for authPrefix in ["https://authserver.gdou.edu.cn", "http://authserver.gdou.edu.cn"] {
+        if lower.hasPrefix(authPrefix) {
+          let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: authPrefix.count)
+          let suffix = String(trimmed[suffixStart...])
+          return URL(string: "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn" + suffix)
+        }
       }
     }
     return nil
@@ -1086,12 +1103,18 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       task.currentRequest?.url?.absoluteString ??
       task.originalRequest?.url?.absoluteString ??
       ""
-    let isOnWfw = sourceUrlStr.lowercased().contains("wfw.gdou.edu.cn")
+    let lowerSource = sourceUrlStr.lowercased()
+    let isOnWfw = lowerSource.contains("wfw.gdou.edu.cn")
+    let isInWfwProxiedPath = lowerSource.contains("wfw.gdou.edu.cn/https://")
 
     if let loc = rawLoc {
       let upgradedLocStr = Self.upgradeGdouHttpUrl(from: loc)?.absoluteString ?? loc
-      if let healedWfw = Self.healWfwRedirectUrl(upgradedLocStr, isOnWfw: isOnWfw) {
+      if let healedWfw = Self.healWfwRedirectUrl(upgradedLocStr, isOnWfw: isOnWfw, isInWfwProxiedPath: isInWfwProxiedPath) {
         nextMutable.url = healedWfw
+      } else if loc.lowercased().hasPrefix("/authserver"),
+                lowerSource.contains("wfw.gdou.edu.cn/https://authserver.gdou.edu.cn"),
+                let rewrittenAuth = URL(string: "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn" + loc) {
+        nextMutable.url = rewrittenAuth
       } else if loc.hasPrefix("/"),
                 !loc.hasPrefix("/https://"),
                 !loc.hasPrefix("/http://"),
@@ -1109,7 +1132,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       if let upgradedResolved = Self.upgradeGdouHttpUrl(resolvedUrl) {
         nextMutable.url = upgradedResolved
       }
-      if let healedResolved = Self.healWfwRedirectUrl(nextMutable.url?.absoluteString ?? "", isOnWfw: isOnWfw) {
+      if let healedResolved = Self.healWfwRedirectUrl(nextMutable.url?.absoluteString ?? "", isOnWfw: isOnWfw, isInWfwProxiedPath: isInWfwProxiedPath) {
         nextMutable.url = healedResolved
       }
     }

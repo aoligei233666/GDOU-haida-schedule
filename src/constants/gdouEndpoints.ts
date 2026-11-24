@@ -159,14 +159,18 @@ export function normalizeWfwAuthUrl(rawUrl: string): string | null {
 }
 
 /**
- * Heal broken off-campus WebVPN (`wfw.gdou.edu.cn`) SSO callback URLs:
+ * Heal broken off-campus WebVPN (`wfw.gdou.edu.cn`) SSO callback & leaked campus URLs:
  * 1. `https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/sso/jziotlogin*` (HTTP 404 on authserver)
  * 2. `https://wfw.gdou.edu.cn/sso/jziotlogin*` (HTTP 500/404 when urlss!=jw)
  * -> `https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin*`.
- * 3. On `wfw.gdou.edu.cn/.../authserver/login?service=https://jw.gdou.edu.cn/sso/jziotlogin`,
- *    upgrade the unproxied campus `service` param to `GDOU_JW_WFW_SSO_SERVICE`.
+ * 3. When off-campus WebVPN is active (`isOffCampusWfw = true`), wrap bare `http(s)://jw.gdou.edu.cn/...`
+ *    callbacks (e.g. post-Step-2 `https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-...`) into
+ *    `https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/...` so the ticket is exchanged inside `WFWSESSID`!
+ *
+ * IMPORTANT: Never rewrite `?service=https://jw.gdou.edu.cn/sso/jziotlogin` into `wfw/...`,
+ * because campus `jw.gdou.edu.cn` validates `ST-...` tickets strictly against `https://jw.gdou.edu.cn/sso/jziotlogin`.
  */
-export function healWfwWrongSsoUrl(rawUrl: string): string | null {
+export function healWfwWrongSsoUrl(rawUrl: string, isOffCampusWfw = false): string | null {
   const trimmed = (rawUrl || '').trim();
   if (!trimmed) return null;
 
@@ -177,19 +181,13 @@ export function healWfwWrongSsoUrl(rawUrl: string): string | null {
     return `${GDOU_JW_WFW_SSO_SERVICE}${wrongSsoMatch[1] || ''}`;
   }
 
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.hostname.toLowerCase() === 'wfw.gdou.edu.cn') {
-      const svc = parsed.searchParams.get('service');
-      if (svc && /^https?:\/\/jw\.gdou\.edu\.cn\/sso\/jziotlogin/i.test(svc)) {
-        const suffix = svc.replace(/^https?:\/\/jw\.gdou\.edu\.cn\/sso\/jziotlogin/i, '');
-        parsed.searchParams.set('service', `${GDOU_JW_WFW_SSO_SERVICE}${suffix}`);
-        return parsed.toString();
-      }
+  if (isOffCampusWfw) {
+    const bareJwMatch = trimmed.match(/^https?:\/\/jw\.gdou\.edu\.cn(\/.*)?$/i);
+    if (bareJwMatch) {
+      return `${GDOU_JW_WFW_BASE}${bareJwMatch[1] || ''}`;
     }
-  } catch {
-    // Ignore malformed URLs
   }
+
   return null;
 }
 
@@ -211,18 +209,11 @@ export function ensureAuthLoginServiceParam(rawUrl: string, fallbackServiceUrl: 
     if (
       parsed.protocol === 'https:' &&
       (host === 'authserver.gdou.edu.cn' || host === 'wfw.gdou.edu.cn') &&
-      isAuthLoginPath
+      isAuthLoginPath &&
+      !parsed.searchParams.get('service')
     ) {
-      const curSvc = parsed.searchParams.get('service');
-      if (!curSvc) {
-        parsed.searchParams.set('service', fallbackServiceUrl);
-        return parsed.toString();
-      }
-      if (host === 'wfw.gdou.edu.cn' && /^https?:\/\/jw\.gdou\.edu\.cn\/sso\/jziotlogin/i.test(curSvc)) {
-        const suffix = curSvc.replace(/^https?:\/\/jw\.gdou\.edu\.cn\/sso\/jziotlogin/i, '');
-        parsed.searchParams.set('service', `${GDOU_JW_WFW_SSO_SERVICE}${suffix}`);
-        return parsed.toString();
-      }
+      parsed.searchParams.set('service', fallbackServiceUrl);
+      return parsed.toString();
     }
   } catch {
     // Return original string if URL parsing fails

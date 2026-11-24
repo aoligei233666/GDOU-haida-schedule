@@ -4,6 +4,8 @@ import pkgLockJson from '../package-lock.json';
 import pkgJson from '../package.json';
 import {
   ensureAuthLoginServiceParam,
+  GDOU_AUTH_WFW_BASE,
+  GDOU_JW_SSO_SERVICE,
   GDOU_JW_WFW_SSO_SERVICE,
   healWfwWrongSsoUrl,
   isAllowedWebViewNavigationUrl,
@@ -319,7 +321,18 @@ async function run() {
       healWfwWrongSsoUrl(
         'https://wfw.gdou.edu.cn/authserver/login?service=https%3A%2F%2Fjw.gdou.edu.cn%2Fsso%2Fjziotlogin'
       ),
-      `https://wfw.gdou.edu.cn/authserver/login?service=${encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE)}`
+      null,
+      'Must NEVER mangle campus service=https://jw.gdou.edu.cn/sso/jziotlogin (causes CAS INVALID_SERVICE)'
+    );
+    assert.equal(
+      healWfwWrongSsoUrl('https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-222', true),
+      'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-222',
+      'Off-campus bare jw.gdou.edu.cn callback must be wrapped inside wfw'
+    );
+    assert.equal(
+      healWfwWrongSsoUrl('https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-222', false),
+      null,
+      'Campus direct mode must leave jw.gdou.edu.cn untouched'
     );
     assert.equal(
       ensureAuthLoginServiceParam(
@@ -340,7 +353,7 @@ async function run() {
     const preloadScript = buildIncognitoWebViewPreloadScript();
     assert.ok(preloadScript.includes('upgrade-insecure-requests'), 'Preload script must inject HTTPS upgrade CSP');
     assert.ok(preloadScript.includes('XMLHttpRequest.prototype.open'), 'Preload script must hook XHR for wfw /authserver/ cookies');
-    assert.ok(preloadScript.includes('window.fetch'), 'Preload script must hook fetch for wfw /authserver/ cookies');
+    assert.ok(preloadScript.includes('window.__GDOU_RAW_FETCH__'), 'Preload script must expose unpatched raw fetch for urlss priming');
     // Syntax-validate both injected WebView scripts so malformed escapes fail fast
     new Function(preloadScript);
     const token = generateSecureHex(16);
@@ -349,6 +362,8 @@ async function run() {
     assert.ok(injected.includes(token), 'WebView script must embed bridgeToken');
     assert.ok(injected.includes('upgrade-insecure-requests'), 'WebView script must inject HTTPS upgrade CSP');
     assert.ok(injected.includes('__gdou_wfw_step2_banner__'), 'WebView script must render Step 2 guidance banner on wfw auth');
+    assert.ok(injected.includes('__gdou_404_healed__'), 'WebView script must auto-heal stale urlss 404');
+    assert.ok(injected.includes(GDOU_AUTH_WFW_BASE), 'WebView script must embed GDOU_AUTH_WFW_BASE for urlss priming & logout');
     assert.ok(injected.includes('/authserver/index.do'), 'WebView script must auto-recover from CAS index.do');
     assert.ok(injected.includes('xskbcx_cxRjc.html'), 'WebView script must query official section period times');
     assert.ok(injected.includes('sessionStorage.clear()'), 'WebView script must clear sessionStorage');
@@ -356,17 +371,22 @@ async function run() {
     assert.ok(injected.includes('Promise.race'), 'WebView timedFetch must have Promise.race timeout fallback');
     assert.ok(injected.includes("xnm: '', xqm: ''"), 'WebView script must include 3rd exam query variant');
     assert.ok(
-      injected.includes(GDOU_JW_WFW_SSO_SERVICE),
-      'WebView script must embed GDOU_JW_WFW_SSO_SERVICE to prevent post-MFA 404'
+      injected.includes(GDOU_JW_SSO_SERVICE),
+      'WebView script must embed campus GDOU_JW_SSO_SERVICE so jw serviceValidate succeeds'
     );
 
-    // 3e-0. 1-step off-campus wfw MFA -> JWXT ticket handoff (no 2nd password, no HTTP 901!)
+    // 3e-0. Phase-2 MFA on GDOU_AUTH_WFW_BASE -> campus GDOU_JW_SSO_SERVICE ticket -> JWXT sync!
+    const phase2Urls: string[] = [];
     globalThis.fetch = (async (input: unknown) => {
       const url = String(input);
+      phase2Urls.push(url);
       if (url.includes('reAuthSubmit.do')) {
         return makeMockResponse(200, JSON.stringify({ code: 'reAuth_success', msg: '认证成功' }), url);
       }
-      if (url.includes(encodeURIComponent(GDOU_JW_WFW_SSO_SERVICE))) {
+      if (
+        url.startsWith(`${GDOU_AUTH_WFW_BASE}/authserver/login`) &&
+        url.includes(encodeURIComponent(GDOU_JW_SSO_SERVICE))
+      ) {
         return makeMockResponse(
           200,
           '<html><body>教学管理信息服务平台 index_initMenu</body></html>',
@@ -384,7 +404,7 @@ async function run() {
         return makeMockResponse(
           200,
           JSON.stringify({
-            kbList: [{ kcmc: '一步直通测试课', xqj: '1', jcs: '1-2', zcd: '1-16周', xqh_id: '1', xqmc: '湖光校区' }],
+            kbList: [{ kcmc: '二阶段多因子直通测试课', xqj: '1', jcs: '1-2', zcd: '1-16周', xqh_id: '1', xqmc: '湖光校区' }],
           }),
           url
         );
@@ -398,30 +418,36 @@ async function run() {
       return makeMockResponse(200, 'ok', url);
     }) as typeof fetch;
 
-    const oneStepWfwMfa: MfaChallengeState = {
+    const phase2WfwMfa: MfaChallengeState = {
       required: true,
       reAuthUserId: 'TEST_STUDENT_001',
-      serviceUrl: GDOU_JW_WFW_SSO_SERVICE,
+      serviceUrl: GDOU_JW_SSO_SERVICE,
       defaultReAuthType: '3',
       credentialsPurged: true,
       session: {
         ...mockSession,
-        authOrigin: 'https://wfw.gdou.edu.cn',
+        authOrigin: GDOU_AUTH_WFW_BASE,
         jwBaseUrl: 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn',
         isWebVpn: true,
-        serviceUrl: GDOU_JW_WFW_SSO_SERVICE,
+        serviceUrl: GDOU_JW_SSO_SERVICE,
       },
-      previousSteps: ['1. init', '2. enc', '3. mfa'],
+      previousSteps: ['1. init', '2. enc', '3. mfa', '5c. wfw-mfa'],
     };
-    const oneStepRes = await submitGdouMfaAndCompleteSync(oneStepWfwMfa, '654321', '3');
-    assert.equal(oneStepRes.status, 'completed', '1-step wfw MFA must complete directly without 901');
-    if (oneStepRes.status === 'completed') {
-      assert.equal(oneStepRes.result.courses[0]?.name, '一步直通测试课');
+    const phase2Res = await submitGdouMfaAndCompleteSync(phase2WfwMfa, '654321', '3');
+    assert.equal(phase2Res.status, 'completed', 'Phase-2 wfw MFA must complete directly without 901');
+    if (phase2Res.status === 'completed') {
+      assert.equal(phase2Res.result.courses[0]?.name, '二阶段多因子直通测试课');
     }
+    assert.ok(
+      phase2Urls.some((u) => u.startsWith(`${GDOU_AUTH_WFW_BASE}/authserver/logout`)) &&
+        phase2Urls.some((u) => u.startsWith('https://authserver.gdou.edu.cn/authserver/logout')),
+      'Phase-2 completion must log out BOTH proxied wfw authserver and outer authserver'
+    );
 
-    // 3e. Off-campus wfw MFA -> Step 2 sub-session auth keeps WFWSESSID alive with ZERO retained password
+    // 3e. Off-campus wfw Phase-1 MFA -> Step 2 sub-session auth keeps WFWSESSID alive with ZERO retained password
     let logoutCalledDuringMfaHandoff = false;
-    globalThis.fetch = (async (input: unknown) => {
+    let observedSubAuthPostUrl = '';
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/logout')) {
         logoutCalledDuringMfaHandoff = true;
@@ -435,6 +461,21 @@ async function run() {
           200,
           '<input id="pwdEncryptSalt" value="WFW2Salt12345678"/><input name="execution" value="e2s1"/>',
           url
+        );
+      }
+      if (url.startsWith(`${GDOU_AUTH_WFW_BASE}/authserver/login`) && (!init?.method || init.method === 'GET')) {
+        return makeMockResponse(
+          200,
+          '<input id="pwdEncryptSalt" value="WFW2FreshSalt789"/><input name="execution" value="e2s2"/>',
+          url
+        );
+      }
+      if (url.startsWith(`${GDOU_AUTH_WFW_BASE}/authserver/login`) && init?.method === 'POST') {
+        observedSubAuthPostUrl = url;
+        return makeMockResponse(
+          200,
+          '<html><body>教学管理信息服务平台 index_initMenu</body></html>',
+          'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/xtgl/index_initMenu.html'
         );
       }
       if (url.includes('checkNeedCaptcha.htl')) {
@@ -496,15 +537,23 @@ async function run() {
     assert.equal(mfaOutcome.status, 'wfw_subauth_required');
     assert.equal(logoutCalledDuringMfaHandoff, false, 'Must NOT log out WFWSESSID while awaiting Step 2');
     if (mfaOutcome.status === 'wfw_subauth_required') {
-      assert.equal(mfaOutcome.subAuth.salt2, 'WFW2Salt12345678');
+      assert.equal(mfaOutcome.subAuth.salt2, 'WFW2FreshSalt789', 'Must use fresh synchronized salt2 from GDOU_AUTH_WFW_BASE');
       assert.equal('password' in mfaOutcome.subAuth, false, 'WfwSubAuthState must never carry password');
       const step2Creds: EphemeralCredentials = { username: 'TEST_STUDENT_001', password: 'TempPassword123' };
-      const finalSync = await completeWfwSubAuthAndSync(mfaOutcome.subAuth, step2Creds);
+      const finalOutcome = await completeWfwSubAuthAndSync(mfaOutcome.subAuth, step2Creds);
       assert.equal(areCredentialsPurged(step2Creds), true, 'Step 2 credentials must be purged');
-      assert.equal(finalSync.courses.length, 1);
-      assert.equal(finalSync.syncedPeriods?.length, 8);
-      assert.equal(finalSync.syncedPeriods?.[1].start, '09:00');
-      assert.equal(finalSync.receipt.sessionLoggedOut, true);
+      assert.equal(
+        observedSubAuthPostUrl,
+        `${GDOU_AUTH_WFW_BASE}/authserver/login?service=${encodeURIComponent(GDOU_JW_SSO_SERVICE)}`,
+        'Step 2 POST must target explicit GDOU_AUTH_WFW_BASE with campus GDOU_JW_SSO_SERVICE'
+      );
+      assert.equal(finalOutcome.status, 'completed');
+      if (finalOutcome.status === 'completed') {
+        assert.equal(finalOutcome.result.courses.length, 1);
+        assert.equal(finalOutcome.result.syncedPeriods?.length, 8);
+        assert.equal(finalOutcome.result.syncedPeriods?.[1].start, '09:00');
+        assert.equal(finalOutcome.result.receipt.sessionLoggedOut, true);
+      }
       assert.equal(logoutCalledDuringMfaHandoff, true, 'Must log out after Step 2 completes');
     }
   } finally {

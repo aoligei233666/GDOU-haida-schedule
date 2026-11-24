@@ -28,20 +28,20 @@ export function buildLiveContainerDirectInstallUrl(ipaUrl: string): string {
 }
 
 /**
- * Concise summary of current v1.4.1 improvements & bug fixes shown directly in Settings -> Update Card.
+ * Concise summary of current v1.4.2 improvements & bug fixes shown directly in Settings -> Update Card.
  */
 export const CURRENT_VERSION_HIGHLIGHTS: string[] = [
-  '登录同步彻底修复：修复校外极速直连报 HTTP 901 与无痕网页二次验证后报 HTTP 404 的问题，支持一步直通教务',
+  '双通道校外登录彻底修复：修复极速直连「校外教务子会话验证未通过 / HTTP 901」与官网无痕网页「二次认证后 HTTP 404」，并无缝支持第 2 步多因子校验',
+  '双端原生 Cookie 与代理路由隔离：精确匹配 /authserver 与教务 Cookie 路径并自动预热 wfw urlss，消除会话串扰与空登录页',
   '非本周排课不计撞课：严格限定仅同周重叠才标撞课，非本周课程不挤压本周卡片、不桥接合并相邻节次',
   '定闹钟直写系统闹钟：早起/课前/考前闹钟直接写入修改手机自带系统时钟（同唤醒时间点自动合并星期）',
-  '自动识别手机系统：自动检测 Android 与 iOS 平台并适配更新通道，Android 端彻底隐藏 iOS 软件源模块',
-  '情侣课表与 GitHub 软件内直连热更：支持双人同屏、共同空闲统计及应用内直接下载更新包',
+  '自动识别手机系统与软件内 GitHub 直连热更：自动适配 Android / iOS 平台并支持应用内直接下载更新包',
 ];
 
 export function getPlatformVersionHighlights(platformOs: string): string[] {
   if (platformOs === 'android') {
     return [
-      '登录同步修复：彻底解决极速直连 HTTP 901 与无痕网页二次认证后 404 问题，一步直通海大教务',
+      '双通道登录彻底修复：根治极速直连校外教务子会话验证失败 / 901 及无痕网页二次认证后 404，全面支持两阶段多因子验证',
       '非本周不计撞课：非本周课程绝不标记撞课、不挤压本周卡片，点击仍可切换查看各周排课',
       '直写手机系统闹钟：早起/课前/考前定闹钟直接修改 Android 系统时钟，相同时间自动合并星期',
       '系统自动识别（当前 Android）：支持软件内从 GitHub 直下热更包或 APK 安装，已自动精简隐藏无关平台字样',
@@ -50,7 +50,7 @@ export function getPlatformVersionHighlights(platformOs: string): string[] {
   }
   if (platformOs === 'ios') {
     return [
-      '登录同步修复：彻底解决极速直连 HTTP 901 与无痕网页二次认证后 404 问题，一步直通海大教务',
+      '双通道登录彻底修复：根治极速直连校外教务子会话验证失败 / 901 及无痕网页二次认证后 404，全面支持两阶段多因子验证',
       '非本周不计撞课：非本周课程绝不标记撞课、不挤压本周卡片，点击仍可切换查看各周排课',
       '系统闹钟与时效提醒联动：支持时效性响铃提醒并支持一键跳转苹果系统时钟查看/设定',
       '系统自动识别（当前 iOS）：支持软件内从 GitHub 免电脑免重签热更新，或直下 IPA 导入签名工具',
