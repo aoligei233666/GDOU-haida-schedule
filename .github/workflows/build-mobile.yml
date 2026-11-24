@@ -165,7 +165,10 @@ jobs:
             exit 1
           fi
           grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
+          grep -q "GdouIosAlarmBridge" "$SWIFT_FILE"
+          grep -q "AlarmManager.shared" "$SWIFT_FILE"
           grep -q "GdouOtaBundle" "$SWIFT_FILE"
+          grep -q "NSAlarmKitUsageDescription" ios/*/Info.plist
           grep -q "ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider" "$SWIFT_FILE"
           grep -q "readBodyStream" "$SWIFT_FILE"
           grep -q "if didRedirect {" "$SWIFT_FILE"

@@ -13,9 +13,10 @@ import {
 import { DAY_FULL_LABELS, getActivePeriods } from '../constants/gdouTimetable';
 import {
   createClassAlarm,
-  openNativeSystemClockApp,
+  openAppSystemSettings,
   setNativeAndroidSystemClockAlarm,
 } from '../services/alarmService';
+import { openSystemClockOrGuide, showAlarmErrorAlert } from '../services/alarmUiHelper';
 import { addSingleCourseToCalendar } from '../services/calendarService';
 import { getCourseTimeSpan } from '../services/scheduleParser';
 import { COLORS, COURSE_PALETTE } from '../theme/colors';
@@ -138,23 +139,45 @@ export const CourseDetailModal: React.FC<Props> = ({
       );
       onAlarmCreated(rule);
       const hhmm = `${String(rule.hour).padStart(2, '0')}:${String(rule.minute).padStart(2, '0')}`;
-      Alert.alert(
+      const isIosAlarmKit = Platform.OS === 'ios' && rule.systemEngine === 'ios_alarmkit';
+      const fallbackNote =
+        Platform.OS === 'ios' && !isIosAlarmKit && rule.fallbackReason
+          ? `\n\n说明：${rule.fallbackReason}，已改用高优先级系统铃声提醒。`
+          : '';
+      const alertTitle =
         Platform.OS === 'android' && rule.systemClockWritten
           ? '已直接写入手机系统闹钟'
-          : '课前闹钟已设定',
+          : isIosAlarmKit
+            ? '已直接写入 iOS 系统闹钟'
+            : '课前闹钟已设定';
+      const alertBody =
         Platform.OS === 'android' && rule.systemClockWritten
           ? `已在手机自带「系统时钟」创建/更新 ${dayLabel} ${hhmm} 课前闹钟（提前 ${leadMinutes} 分钟 · ${targetCourse.name}）。`
-          : `将在第 ${targetWeek} 周 ${dayLabel} 上课前 ${leadMinutes} 分钟（${hhmm}）响铃提醒。`,
-        [
-          { text: '完成', style: 'cancel' },
-          {
-            text: '打开系统闹钟',
-            onPress: () => void openNativeSystemClockApp(),
-          },
-        ]
+          : isIosAlarmKit
+            ? `已通过 iOS 原生 AlarmKit 写入 ${rule.repeatsWeekly ? `每周${dayLabel.replace('周', '')}` : `第 ${targetWeek} 周 ${dayLabel}`} ${hhmm} 系统级闹钟（提前 ${leadMinutes} 分钟 · ${targetCourse.name}，支持锁屏全屏响铃与穿透静音/专注模式）。`
+            : `将在${rule.repeatsWeekly ? `每周${dayLabel.replace('周', '')}` : `第 ${targetWeek} 周 ${dayLabel}`}上课前 ${leadMinutes} 分钟（${hhmm}）响铃提醒。${fallbackNote}`;
+
+      Alert.alert(
+        alertTitle,
+        alertBody,
+        Platform.OS === 'ios'
+          ? [
+              { text: '完成', style: 'cancel' },
+              {
+                text: '系统权限设置',
+                onPress: () => void openAppSystemSettings(),
+              },
+            ]
+          : [
+              { text: '完成', style: 'cancel' },
+              {
+                text: '打开系统闹钟',
+                onPress: () => void openSystemClockOrGuide(false),
+              },
+            ]
       );
     } catch (err) {
-      Alert.alert('设定系统闹钟失败', err instanceof Error ? err.message : String(err));
+      showAlarmErrorAlert('设定系统闹钟失败', err);
     } finally {
       setBusy(false);
     }
@@ -176,7 +199,7 @@ export const CourseDetailModal: React.FC<Props> = ({
       });
       return;
     }
-    await openNativeSystemClockApp();
+    await openSystemClockOrGuide(true);
   };
 
   const handleConfirmDeleteManual = () => {
@@ -429,11 +452,7 @@ export const CourseDetailModal: React.FC<Props> = ({
               <Text style={styles.actionBtnText}>
                 {Platform.OS === 'android'
                   ? `直接设为手机系统闹钟（提前 ${leadMinutes} 分）`
-                  : `设第 ${
-                      isCurrentWeek
-                        ? selectedWeek
-                        : course.weeks.find((w) => w > selectedWeek) ?? course.weeks[0] ?? selectedWeek
-                    } 周课前闹钟`}
+                  : `直接设为 iOS 系统闹钟（提前 ${leadMinutes} 分）`}
               </Text>
             </TouchableOpacity>
 
@@ -446,7 +465,7 @@ export const CourseDetailModal: React.FC<Props> = ({
               <Text style={[styles.actionBtnText, { color: COLORS.oceanDeep }]}>
                 {Platform.OS === 'android'
                   ? '打开系统闹钟面板手动微调铃声'
-                  : '打开 iOS 系统时钟 App 查看/设定'}
+                  : '检查 iOS 系统闹钟说明与权限'}
               </Text>
             </TouchableOpacity>
 

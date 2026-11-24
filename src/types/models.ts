@@ -121,6 +121,8 @@ export interface GpaSummary {
 
 export type AlarmKind = 'class' | 'morning_wakeup' | 'exam';
 
+export type AlarmSystemEngine = 'android_clock' | 'ios_alarmkit' | 'notification';
+
 export interface AlarmRule {
   id: string;
   dedupeKey?: string;
@@ -135,6 +137,9 @@ export interface AlarmRule {
   advanceMinutes: number;
   enabled: boolean;
   notificationId?: string;
+  systemAlarmId?: string;
+  systemEngine?: AlarmSystemEngine;
+  repeatsWeekly?: boolean;
 }
 
 export interface AppSettings {

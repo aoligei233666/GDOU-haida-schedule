@@ -2,7 +2,7 @@ import * as IntentLauncher from 'expo-intent-launcher';
 import * as Notifications from 'expo-notifications';
 import { Linking, Platform } from 'react-native';
 import { DAY_FULL_LABELS, DAY_LABELS, getActivePeriods } from '../constants/gdouTimetable';
-import { AlarmRule, AppSettings, CourseItem, ExamItem } from '../types/models';
+import { AlarmRule, AlarmSystemEngine, AppSettings, CourseItem, ExamItem } from '../types/models';
 import {
   buildClassAlarmDedupeKey,
   buildExamAlarmDedupeKey,
@@ -30,6 +30,160 @@ export {
 };
 
 export const ALARM_CHANNEL_ID = 'gdou-alarm-channel';
+
+export interface SystemAlarmCapabilities {
+  platform: string;
+  engine: AlarmSystemEngine;
+  supported: boolean;
+  authStatus: 'authorized' | 'denied' | 'notDetermined' | 'unsupported' | 'unknown';
+  osVersion?: string;
+}
+
+export interface SystemClockAlarmSpec {
+  id?: string;
+  dedupeKey?: string;
+  hour: number;
+  minute: number;
+  message: string;
+  isoWeekdays?: number[]; // 1=Mon .. 7=Sun
+  triggerEpochMs?: number;
+  mode?: 'relative' | 'fixed';
+  skipUi?: boolean;
+}
+
+export interface SystemClockBatchResult {
+  ok: boolean;
+  writtenCount: number;
+  engine?: AlarmSystemEngine;
+  supported?: boolean;
+  authStatus?: string;
+  alarmIds?: string[];
+  scheduled?: Array<{ id: string; dedupeKey: string }>;
+  error?: string;
+}
+
+function isoWeekdayToCalendarDay(isoDay: number): number {
+  // ISO 1=Mon..7=Sun -> Java/Apple Calendar 1=Sun, 2=Mon..7=Sat
+  return isoDay === 7 ? 1 : isoDay + 1;
+}
+
+async function fetchAlarmBridge(
+  path: string,
+  options?: { method?: 'GET' | 'POST'; body?: unknown; timeoutMs?: number }
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutMs = options?.timeoutMs ?? 12_000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(`https://gdou-alarm-internal.local${path}`, {
+      method: options?.method ?? 'POST',
+      headers: options?.body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      body: options?.body !== undefined ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function openAppSystemSettings(): Promise<boolean> {
+  try {
+    await Linking.openSettings();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function getSystemAlarmCapabilities(): Promise<SystemAlarmCapabilities> {
+  if (Platform.OS === 'android') {
+    return {
+      platform: 'android',
+      engine: 'android_clock',
+      supported: true,
+      authStatus: 'authorized',
+    };
+  }
+  if (Platform.OS === 'ios') {
+    try {
+      const resp = await fetchAlarmBridge('/alarm-capabilities', { method: 'GET', timeoutMs: 5000 });
+      if (resp.ok) {
+        const json = (await resp.json()) as {
+          engine?: string;
+          supported?: boolean;
+          authStatus?: string;
+          osVersion?: string;
+        };
+        const isAlarmKit = json.supported === true && json.engine === 'alarmkit';
+        const authStatus =
+          json.authStatus === 'authorized' ||
+          json.authStatus === 'denied' ||
+          json.authStatus === 'notDetermined' ||
+          json.authStatus === 'unsupported'
+            ? json.authStatus
+            : 'unknown';
+        return {
+          platform: 'ios',
+          engine: isAlarmKit ? 'ios_alarmkit' : 'notification',
+          supported: isAlarmKit,
+          authStatus,
+          osVersion: json.osVersion,
+        };
+      }
+    } catch {
+      // Fallback below
+    }
+    return {
+      platform: 'ios',
+      engine: 'notification',
+      supported: false,
+      authStatus: 'unsupported',
+    };
+  }
+  return {
+    platform: Platform.OS,
+    engine: 'notification',
+    supported: false,
+    authStatus: 'unsupported',
+  };
+}
+
+export async function cancelSystemAlarmsByIds(ids: string[]): Promise<number> {
+  const validIds = ids.map((s) => String(s || '').trim()).filter(Boolean);
+  if (Platform.OS !== 'ios' || validIds.length === 0) return 0;
+  try {
+    const resp = await fetchAlarmBridge('/cancel-system-alarms', {
+      method: 'POST',
+      body: { ids: validIds },
+      timeoutMs: 6000,
+    });
+    if (resp.ok) {
+      const json = (await resp.json()) as { cancelledCount?: number };
+      return json.cancelledCount ?? 0;
+    }
+  } catch {
+    // Best-effort cancellation
+  }
+  return 0;
+}
+
+export async function clearAllSystemAlarms(): Promise<number> {
+  if (Platform.OS !== 'ios') return 0;
+  try {
+    const resp = await fetchAlarmBridge('/clear-system-alarms', {
+      method: 'POST',
+      body: {},
+      timeoutMs: 6000,
+    });
+    if (resp.ok) {
+      const json = (await resp.json()) as { cancelledCount?: number };
+      return json.cancelledCount ?? 0;
+    }
+  } catch {
+    // Best-effort clear
+  }
+  return 0;
+}
 
 /**
  * Configure foreground notification behavior & Android high-priority alarm channel.
@@ -106,27 +260,69 @@ export async function openAndroidExactAlarmSettings(): Promise<void> {
 async function scheduleLocalAlarmNotification(
   title: string,
   body: string,
-  triggerDate: Date
+  triggerDate: Date,
+  options?: { weeklyIsoWeekday?: number; hour?: number; minute?: number }
 ): Promise<string> {
   await ensureNotificationPermission();
-  if (triggerDate.getTime() <= Date.now() + 2000) {
+
+  const useWeekly =
+    typeof options?.weeklyIsoWeekday === 'number' &&
+    typeof options?.hour === 'number' &&
+    typeof options?.minute === 'number';
+
+  if (!useWeekly && triggerDate.getTime() <= Date.now() + 2000) {
     throw new Error('该提醒时间已过，请选择未来的周次或日期');
   }
 
-  return Notifications.scheduleNotificationAsync({
-    content: {
-      title,
-      body,
-      sound: 'default',
-      priority: Notifications.AndroidNotificationPriority.MAX,
-      interruptionLevel: 'timeSensitive',
-    },
-    trigger: {
-      type: Notifications.SchedulableTriggerInputTypes.DATE,
-      date: triggerDate,
-      channelId: Platform.OS === 'android' ? ALARM_CHANNEL_ID : undefined,
-    },
-  });
+  const trigger: Notifications.NotificationTriggerInput = useWeekly
+    ? {
+        type: Notifications.SchedulableTriggerInputTypes.WEEKLY,
+        weekday: isoWeekdayToCalendarDay(options!.weeklyIsoWeekday!),
+        hour: options!.hour!,
+        minute: options!.minute!,
+        ...(Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : {}),
+      }
+    : {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: triggerDate,
+        ...(Platform.OS === 'android' ? { channelId: ALARM_CHANNEL_ID } : {}),
+      };
+
+  const primaryContent: Notifications.NotificationContentInput =
+    Platform.OS === 'ios'
+      ? {
+          title,
+          body,
+          sound: 'defaultRingtone',
+          interruptionLevel: 'timeSensitive',
+        }
+      : {
+          title,
+          body,
+          sound: 'default',
+          priority: Notifications.AndroidNotificationPriority.MAX,
+        };
+
+  try {
+    return await Notifications.scheduleNotificationAsync({
+      content: primaryContent,
+      trigger,
+    });
+  } catch (primaryErr) {
+    if (Platform.OS === 'ios') {
+      // Safe fallback for sideloaded profiles without time-sensitive entitlement or custom ringtone quirks
+      return await Notifications.scheduleNotificationAsync({
+        content: {
+          title,
+          body,
+          sound: 'default',
+          interruptionLevel: 'active',
+        },
+        trigger,
+      });
+    }
+    throw primaryErr;
+  }
 }
 
 async function rollbackNotifications(notificationIds: string[]): Promise<void> {
@@ -138,20 +334,26 @@ async function rollbackNotifications(notificationIds: string[]): Promise<void> {
 async function cancelExistingByDedupeKey(
   existingAlarms: AlarmRule[] | undefined,
   dedupeKey: string
-): Promise<number> {
-  if (!existingAlarms || existingAlarms.length === 0) return 0;
+): Promise<{ count: number; cancelledSystemIds: string[] }> {
+  if (!existingAlarms || existingAlarms.length === 0) {
+    return { count: 0, cancelledSystemIds: [] };
+  }
   const matched = existingAlarms.filter((a) => resolveAlarmDedupeKey(a) === dedupeKey);
+  const cancelledSystemIds: string[] = [];
   for (const old of matched) {
+    if (old.systemAlarmId) cancelledSystemIds.push(old.systemAlarmId);
     await cancelScheduledAlarm(old);
   }
-  return matched.length;
+  return { count: matched.length, cancelledSystemIds };
 }
 
 /**
  * Idempotently schedule an advance reminder alarm for a specific course in a specific week.
- * - On Android: Directly writes/updates the native System Clock alarm (`AlarmClock.ACTION_SET_ALARM`)
+ * - Android: Directly writes/updates the native System Clock alarm (`AlarmClock.ACTION_SET_ALARM`)
  *   with `EXTRA_DAYS` and `EXTRA_SKIP_UI = true`, plus best-effort local notification backup.
- * - On iOS: Schedules a `timeSensitive` notification and supports 1-tap handoff to System Clock.
+ * - iOS 26+: Directly writes a native iOS System Alarm via `AlarmKit` (breaks Silent/Focus modes,
+ *   full-screen lock screen alarm UI).
+ * - iOS < 26 (or fallback): Schedules an iOS `defaultRingtone` notification (exact date or weekly repeat).
  */
 export async function createClassAlarm(
   course: CourseItem,
@@ -159,7 +361,7 @@ export async function createClassAlarm(
   advanceMinutes: number,
   settings: AppSettings,
   existingAlarms?: AlarmRule[]
-): Promise<AlarmRule & { systemClockWritten?: boolean }> {
+): Promise<AlarmRule & { systemClockWritten?: boolean; fallbackReason?: string }> {
   if (!isCourseSchedulable(course)) {
     throw new Error(`《${course.name}》缺少有效上课时间信息，无法设定闹钟`);
   }
@@ -172,9 +374,10 @@ export async function createClassAlarm(
   const dayDate = getDateForWeekAndDay(settings.termStartDate, week, course.dayOfWeek);
   const classStart = applyTimeToDate(dayDate, startText);
   const triggerDate = new Date(classStart.getTime() - advanceMinutes * 60 * 1000);
+  const isFuture = triggerDate.getTime() > Date.now() + 2000;
   const dedupeKey = buildClassAlarmDedupeKey(course.id, week);
 
-  await cancelExistingByDedupeKey(existingAlarms, dedupeKey);
+  const { cancelledSystemIds } = await cancelExistingByDedupeKey(existingAlarms, dedupeKey);
 
   const hour = triggerDate.getHours();
   const minute = triggerDate.getMinutes();
@@ -182,6 +385,10 @@ export async function createClassAlarm(
   const body = `${advanceMinutes} 分钟后上课（${startText}）· 地点：${course.location} · 教师：${course.teacher}`;
 
   let systemClockWritten = false;
+  let systemAlarmId: string | undefined;
+  let systemEngine: AlarmSystemEngine = 'notification';
+  let fallbackReason: string | undefined;
+
   if (Platform.OS === 'android') {
     systemClockWritten = await setNativeAndroidSystemClockAlarm({
       hour,
@@ -190,14 +397,52 @@ export async function createClassAlarm(
       isoWeekdays: [course.dayOfWeek],
       skipUi: true,
     });
+    if (systemClockWritten) {
+      systemEngine = 'android_clock';
+    }
+  } else if (Platform.OS === 'ios') {
+    const sysRes = await setSystemClockAlarmsBatch(
+      [
+        {
+          dedupeKey,
+          hour,
+          minute,
+          message: `上课：${course.name} (${course.location})`,
+          mode: isFuture ? 'fixed' : 'relative',
+          triggerEpochMs: triggerDate.getTime(),
+          isoWeekdays: isFuture ? undefined : [course.dayOfWeek],
+        },
+      ],
+      cancelledSystemIds
+    );
+    if (sysRes.ok && sysRes.engine === 'ios_alarmkit') {
+      systemClockWritten = true;
+      systemEngine = 'ios_alarmkit';
+      systemAlarmId = sysRes.alarmIds?.[0];
+    } else if (sysRes.authStatus === 'denied') {
+      throw new Error(
+        sysRes.error || '未开启 iOS 系统闹钟权限，请在系统「设置 -> 海大课表 -> 闹钟」中允许后重试'
+      );
+    } else if (sysRes.error) {
+      fallbackReason = sysRes.error;
+    }
   }
 
   let notificationId: string | undefined;
-  try {
-    notificationId = await scheduleLocalAlarmNotification(title, body, triggerDate);
-  } catch (notifErr) {
-    if (!systemClockWritten) {
-      throw notifErr;
+  if (systemEngine !== 'ios_alarmkit') {
+    try {
+      notificationId = await scheduleLocalAlarmNotification(
+        title,
+        body,
+        triggerDate,
+        !isFuture
+          ? { weeklyIsoWeekday: course.dayOfWeek, hour, minute }
+          : undefined
+      );
+    } catch (notifErr) {
+      if (!systemClockWritten) {
+        throw notifErr;
+      }
     }
   }
 
@@ -215,15 +460,21 @@ export async function createClassAlarm(
     advanceMinutes,
     enabled: true,
     notificationId,
+    systemAlarmId,
+    systemEngine,
+    repeatsWeekly: !isFuture,
     systemClockWritten,
+    fallbackReason,
   };
 }
 
 /**
- * Smart Morning Wake-Up Generator (directly writes to System Clock on Android):
- * - Groups weekdays sharing the exact same wake-up `HH:mm` into merged multi-day System Clock alarms
- *   so e.g. Mon/Wed/Fri 08:10 classes produce ONE clean `07:25 (周一、三、五)` System Clock alarm!
- * - Also maintains idempotent local notification backup for future occurrences in `week`.
+ * Smart Morning Wake-Up Generator:
+ * - Android: Groups weekdays sharing the exact same wake-up `HH:mm` into merged multi-day
+ *   System Clock alarms (`AlarmClock.ACTION_SET_ALARM` with `EXTRA_DAYS`).
+ * - iOS 26+: Directly writes per-weekday repeating native iOS System Alarms via `AlarmKit`
+ *   (so each weekday can be individually toggled/deleted inside the app while breaking Silent/Focus).
+ * - iOS < 26 (or fallback): Schedules weekly repeating `defaultRingtone` notifications for every class day.
  */
 export async function createWeeklyMorningWakeupAlarms(
   courses: CourseItem[],
@@ -234,10 +485,12 @@ export async function createWeeklyMorningWakeupAlarms(
 ): Promise<{
   created: AlarmRule[];
   systemClockGroupsCount: number;
+  systemEngine: AlarmSystemEngine;
   replacedCount: number;
   skippedPast: number;
   failed: number;
   exactAlarmHint?: string;
+  fallbackReason?: string;
 }> {
   if (!parseLocalDateStrict(settings.termStartDate)) {
     throw new Error(`开学基准日期无效（${settings.termStartDate}），请先在设置页修正`);
@@ -245,18 +498,6 @@ export async function createWeeklyMorningWakeupAlarms(
   const periods = getActivePeriods(settings);
   const firstPerDay = getFirstClassPerDayInWeek(courses, week);
   const nowMs = Date.now();
-
-  let exactAlarmHint: string | undefined;
-  let canScheduleNotifications = false;
-  try {
-    const perm = await ensureNotificationPermission();
-    exactAlarmHint = perm.exactAlarmHint;
-    canScheduleNotifications = true;
-  } catch (permErr) {
-    if (Platform.OS !== 'android') {
-      throw permErr;
-    }
-  }
 
   let skippedPast = 0;
   let replacedCount = 0;
@@ -279,11 +520,6 @@ export async function createWeeklyMorningWakeupAlarms(
     const classStart = applyTimeToDate(dayDate, startText);
     const triggerDate = new Date(classStart.getTime() - wakeupMinutesBefore * 60 * 1000);
     const isFutureInWeek = triggerDate.getTime() > nowMs + 5000;
-
-    if (!isFutureInWeek && Platform.OS !== 'android') {
-      skippedPast++;
-      continue;
-    }
     if (!isFutureInWeek) {
       skippedPast++;
     }
@@ -305,9 +541,31 @@ export async function createWeeklyMorningWakeupAlarms(
     });
   }
 
-  // Directly write merged weekday wake-up alarms into Android System Clock!
+  if (tasks.length === 0) {
+    return {
+      created: [],
+      systemClockGroupsCount: 0,
+      systemEngine: Platform.OS === 'android' ? 'android_clock' : 'notification',
+      replacedCount: 0,
+      skippedPast: 0,
+      failed: 0,
+    };
+  }
+
+  // Cancel any existing alarms for these dedupeKeys before creating fresh ones
+  const cancelledSystemIds: string[] = [];
+  for (const t of tasks) {
+    const res = await cancelExistingByDedupeKey(existingAlarms, t.dedupeKey);
+    replacedCount += res.count;
+    cancelledSystemIds.push(...res.cancelledSystemIds);
+  }
+
   let systemClockGroupsCount = 0;
-  if (Platform.OS === 'android' && tasks.length > 0) {
+  let systemEngine: AlarmSystemEngine = 'notification';
+  let fallbackReason: string | undefined;
+  const iosSystemIdByDedupeKey = new Map<string, string>();
+
+  if (Platform.OS === 'android') {
     const byTimeKey = new Map<
       string,
       { hour: number; minute: number; startText: string; days: number[]; names: string[] }
@@ -344,23 +602,78 @@ export async function createWeeklyMorningWakeupAlarms(
     const sysRes = await setSystemClockAlarmsBatch(batchSpecs);
     if (sysRes.ok) {
       systemClockGroupsCount = sysRes.writtenCount;
-    } else if (!canScheduleNotifications) {
-      throw new Error(sysRes.error || '写入手机系统闹钟失败，请检查系统时钟应用权限');
+      systemEngine = 'android_clock';
+    } else {
+      fallbackReason = sysRes.error;
+    }
+  } else if (Platform.OS === 'ios') {
+    // Schedule 1 dedicated repeating AlarmKit system alarm per class weekday so each row in AlarmsScreen
+    // can be toggled or deleted independently while still breaking Silent & Focus modes!
+    const iosSpecs: SystemClockAlarmSpec[] = tasks.map((t) => {
+      const dayShort = DAY_LABELS[t.dayOfWeek - 1] ?? String(t.dayOfWeek);
+      return {
+        dedupeKey: t.dedupeKey,
+        hour: t.hour,
+        minute: t.minute,
+        isoWeekdays: [t.dayOfWeek],
+        mode: 'relative',
+        message: `海大早起 · 周${dayShort}首课${t.startText} ${t.firstCourse.name}`,
+      };
+    });
+
+    const sysRes = await setSystemClockAlarmsBatch(iosSpecs, cancelledSystemIds);
+    if (sysRes.ok && sysRes.engine === 'ios_alarmkit') {
+      systemClockGroupsCount = sysRes.writtenCount;
+      systemEngine = 'ios_alarmkit';
+      if (Array.isArray(sysRes.scheduled)) {
+        for (const item of sysRes.scheduled) {
+          if (item.dedupeKey && item.id) {
+            iosSystemIdByDedupeKey.set(item.dedupeKey, item.id);
+          }
+        }
+      }
+    } else if (sysRes.authStatus === 'denied') {
+      throw new Error(
+        sysRes.error || '未开启 iOS 系统闹钟权限，请在系统「设置 -> 海大课表 -> 闹钟」中允许后重试'
+      );
+    } else if (sysRes.error) {
+      fallbackReason = sysRes.error;
     }
   }
 
-  for (const t of tasks) {
-    replacedCount += await cancelExistingByDedupeKey(existingAlarms, t.dedupeKey);
+  let exactAlarmHint: string | undefined;
+  let canScheduleNotifications = false;
+  if (systemEngine !== 'ios_alarmkit') {
+    try {
+      const perm = await ensureNotificationPermission();
+      exactAlarmHint = perm.exactAlarmHint;
+      canScheduleNotifications = true;
+    } catch (permErr) {
+      if (systemClockGroupsCount === 0) {
+        throw permErr;
+      }
+    }
   }
 
   const settled = await Promise.allSettled(
     tasks.map(async (t) => {
+      const iosAlarmId = iosSystemIdByDedupeKey.get(t.dedupeKey);
       let notificationId: string | undefined;
-      if (canScheduleNotifications && t.isFutureInWeek) {
-        notificationId = await scheduleLocalAlarmNotification(t.title, t.body, t.triggerDate);
-      } else if (Platform.OS !== 'android') {
-        notificationId = await scheduleLocalAlarmNotification(t.title, t.body, t.triggerDate);
+      if (systemEngine !== 'ios_alarmkit' && canScheduleNotifications) {
+        if (Platform.OS === 'android') {
+          if (t.isFutureInWeek) {
+            notificationId = await scheduleLocalAlarmNotification(t.title, t.body, t.triggerDate);
+          }
+        } else {
+          // iOS < 26 fallback: schedule weekly repeating ringtone alarm so past weekdays never fail
+          notificationId = await scheduleLocalAlarmNotification(t.title, t.body, t.triggerDate, {
+            weeklyIsoWeekday: t.dayOfWeek,
+            hour: t.hour,
+            minute: t.minute,
+          });
+        }
       }
+
       const rule: AlarmRule = {
         id: `alarm-wake-${week}-${t.dayOfWeek}-${Date.now()}-${generateSecureHex(3)}`,
         dedupeKey: t.dedupeKey,
@@ -375,6 +688,13 @@ export async function createWeeklyMorningWakeupAlarms(
         advanceMinutes: wakeupMinutesBefore,
         enabled: true,
         notificationId,
+        systemAlarmId: iosAlarmId,
+        systemEngine: iosAlarmId
+          ? 'ios_alarmkit'
+          : systemEngine === 'android_clock'
+            ? 'android_clock'
+            : 'notification',
+        repeatsWeekly: true,
       };
       return rule;
     })
@@ -399,18 +719,21 @@ export async function createWeeklyMorningWakeupAlarms(
   return {
     created,
     systemClockGroupsCount,
+    systemEngine,
     replacedCount,
-    skippedPast,
+    skippedPast: systemEngine === 'notification' && Platform.OS !== 'ios' ? skippedPast : 0,
     failed,
     exactAlarmHint: systemClockGroupsCount > 0 ? undefined : exactAlarmHint,
+    fallbackReason,
   };
 }
 
 /**
  * Schedule exam alarms idempotently:
- * - On Android: Directly writes pre-exam departure alarms into the native System Clock (`ACTION_SET_ALARM`),
- *   plus schedules pre-exam & eve reminders.
- * - On iOS: Schedules `timeSensitive` notifications for both eve (20:00) and pre-exam departure.
+ * - Android: Writes pre-exam departure alarms directly to Android System Clock (`ACTION_SET_ALARM`)
+ *   plus pre-exam & eve reminders.
+ * - iOS 26+: Writes exact-date pre-exam departure & eve alarms directly into native iOS `AlarmKit`.
+ * - iOS < 26 (or fallback): Schedules `defaultRingtone` notifications for eve (20:00) and pre-exam departure.
  */
 export async function createExamAlarms(
   exams: ExamItem[],
@@ -419,23 +742,13 @@ export async function createExamAlarms(
 ): Promise<{
   created: AlarmRule[];
   systemClockGroupsCount: number;
+  systemEngine: AlarmSystemEngine;
   replacedCount: number;
   skipped: number;
   failed: number;
   exactAlarmHint?: string;
+  fallbackReason?: string;
 }> {
-  let exactAlarmHint: string | undefined;
-  let canScheduleNotifications = false;
-  try {
-    const perm = await ensureNotificationPermission();
-    exactAlarmHint = perm.exactAlarmHint;
-    canScheduleNotifications = true;
-  } catch (permErr) {
-    if (Platform.OS !== 'android') {
-      throw permErr;
-    }
-  }
-
   const advanceMin = settings.examAdvanceMinutes || 90;
   const nowMs = Date.now();
   let skipped = 0;
@@ -498,8 +811,29 @@ export async function createExamAlarms(
     }
   }
 
-  // Write pre-exam departure alarms directly to Android System Clock
+  if (candidates.length === 0) {
+    return {
+      created: [],
+      systemClockGroupsCount: 0,
+      systemEngine: Platform.OS === 'android' ? 'android_clock' : 'notification',
+      replacedCount: 0,
+      skipped,
+      failed: 0,
+    };
+  }
+
+  const cancelledSystemIds: string[] = [];
+  for (const c of candidates) {
+    const res = await cancelExistingByDedupeKey(existingAlarms, c.dedupeKey);
+    replacedCount += res.count;
+    cancelledSystemIds.push(...res.cancelledSystemIds);
+  }
+
   let systemClockGroupsCount = 0;
+  let systemEngine: AlarmSystemEngine = 'notification';
+  let fallbackReason: string | undefined;
+  const iosSystemIdByDedupeKey = new Map<string, string>();
+
   if (Platform.OS === 'android') {
     const preCandidates = candidates.filter((c) => c.suffix === 'pre');
     if (preCandidates.length > 0) {
@@ -519,20 +853,62 @@ export async function createExamAlarms(
       const sysRes = await setSystemClockAlarmsBatch(specs);
       if (sysRes.ok) {
         systemClockGroupsCount = sysRes.writtenCount;
+        systemEngine = 'android_clock';
+      }
+    }
+  } else if (Platform.OS === 'ios') {
+    const iosSpecs: SystemClockAlarmSpec[] = candidates.map((c) => ({
+      dedupeKey: c.dedupeKey,
+      hour: c.triggerDate.getHours(),
+      minute: c.triggerDate.getMinutes(),
+      mode: 'fixed',
+      triggerEpochMs: c.triggerDate.getTime(),
+      message:
+        c.suffix === 'pre'
+          ? `考前出发：${c.exam.courseName} (${c.exam.location}${
+              c.exam.seatNumber ? ` 座位${c.exam.seatNumber}` : ''
+            })`
+          : `明日考试：${c.exam.courseName} (${c.exam.startTimeText})`,
+    }));
+    const sysRes = await setSystemClockAlarmsBatch(iosSpecs, cancelledSystemIds);
+    if (sysRes.ok && sysRes.engine === 'ios_alarmkit') {
+      systemClockGroupsCount = sysRes.writtenCount;
+      systemEngine = 'ios_alarmkit';
+      if (Array.isArray(sysRes.scheduled)) {
+        for (const item of sysRes.scheduled) {
+          if (item.dedupeKey && item.id) {
+            iosSystemIdByDedupeKey.set(item.dedupeKey, item.id);
+          }
+        }
+      }
+    } else if (sysRes.authStatus === 'denied') {
+      throw new Error(
+        sysRes.error || '未开启 iOS 系统闹钟权限，请在系统「设置 -> 海大课表 -> 闹钟」中允许后重试'
+      );
+    } else if (sysRes.error) {
+      fallbackReason = sysRes.error;
+    }
+  }
+
+  let exactAlarmHint: string | undefined;
+  let canScheduleNotifications = false;
+  if (systemEngine !== 'ios_alarmkit') {
+    try {
+      const perm = await ensureNotificationPermission();
+      exactAlarmHint = perm.exactAlarmHint;
+      canScheduleNotifications = true;
+    } catch (permErr) {
+      if (systemClockGroupsCount === 0) {
+        throw permErr;
       }
     }
   }
 
-  for (const c of candidates) {
-    replacedCount += await cancelExistingByDedupeKey(existingAlarms, c.dedupeKey);
-  }
-
   const settled = await Promise.allSettled(
     candidates.map(async (c) => {
+      const iosAlarmId = iosSystemIdByDedupeKey.get(c.dedupeKey);
       let notificationId: string | undefined;
-      if (canScheduleNotifications) {
-        notificationId = await scheduleLocalAlarmNotification(c.title, c.body, c.triggerDate);
-      } else if (Platform.OS !== 'android') {
+      if (!iosAlarmId && canScheduleNotifications) {
         notificationId = await scheduleLocalAlarmNotification(c.title, c.body, c.triggerDate);
       }
       const rule: AlarmRule = {
@@ -549,6 +925,13 @@ export async function createExamAlarms(
         advanceMinutes: c.advanceMinutes,
         enabled: true,
         notificationId,
+        systemAlarmId: iosAlarmId,
+        systemEngine: iosAlarmId
+          ? 'ios_alarmkit'
+          : systemEngine === 'android_clock' && c.suffix === 'pre'
+            ? 'android_clock'
+            : 'notification',
+        repeatsWeekly: false,
       };
       return rule;
     })
@@ -577,14 +960,19 @@ export async function createExamAlarms(
   return {
     created,
     systemClockGroupsCount,
+    systemEngine,
     replacedCount,
     skipped,
     failed,
     exactAlarmHint: systemClockGroupsCount > 0 ? undefined : exactAlarmHint,
+    fallbackReason,
   };
 }
 
 export async function cancelScheduledAlarm(alarm: AlarmRule): Promise<void> {
+  if (alarm.systemAlarmId && Platform.OS === 'ios') {
+    await cancelSystemAlarmsByIds([alarm.systemAlarmId]);
+  }
   if (alarm.notificationId) {
     try {
       await Notifications.cancelScheduledNotificationAsync(alarm.notificationId);
@@ -597,90 +985,186 @@ export async function cancelScheduledAlarm(alarm: AlarmRule): Promise<void> {
 export async function toggleAlarmEnabled(alarm: AlarmRule, enable: boolean): Promise<AlarmRule> {
   if (!enable) {
     await cancelScheduledAlarm(alarm);
-    return { ...alarm, enabled: false, notificationId: undefined };
+    return {
+      ...alarm,
+      enabled: false,
+      notificationId: undefined,
+      systemAlarmId: undefined,
+    };
   }
+
   const triggerDate = new Date(alarm.triggerIso);
+  const isFuture = triggerDate.getTime() > Date.now() + 2000;
+  const shouldRepeatWeekly = alarm.repeatsWeekly === true || (alarm.kind === 'morning_wakeup' && !isFuture);
+
+  if (Platform.OS === 'ios') {
+    const sysRes = await setSystemClockAlarmsBatch([
+      {
+        dedupeKey: resolveAlarmDedupeKey(alarm),
+        hour: alarm.hour,
+        minute: alarm.minute,
+        message: alarm.title.replace(/^[^\u4e00-\u9fa5A-Za-z0-9]+/, '') || alarm.title,
+        mode: !shouldRepeatWeekly && isFuture ? 'fixed' : 'relative',
+        triggerEpochMs: triggerDate.getTime(),
+        isoWeekdays: shouldRepeatWeekly || !isFuture ? [alarm.weekday] : undefined,
+      },
+    ]);
+    if (sysRes.ok && sysRes.engine === 'ios_alarmkit') {
+      return {
+        ...alarm,
+        enabled: true,
+        notificationId: undefined,
+        systemAlarmId: sysRes.alarmIds?.[0],
+        systemEngine: 'ios_alarmkit',
+        repeatsWeekly: shouldRepeatWeekly || !isFuture,
+      };
+    }
+    if (sysRes.authStatus === 'denied') {
+      throw new Error(
+        sysRes.error || '未开启 iOS 系统闹钟权限，请在系统「设置 -> 海大课表 -> 闹钟」中允许后重试'
+      );
+    }
+  }
+
   const notificationId = await scheduleLocalAlarmNotification(
     alarm.title,
     alarm.body,
-    triggerDate
+    triggerDate,
+    shouldRepeatWeekly
+      ? { weeklyIsoWeekday: alarm.weekday, hour: alarm.hour, minute: alarm.minute }
+      : undefined
   );
-  return { ...alarm, enabled: true, notificationId };
+  return {
+    ...alarm,
+    enabled: true,
+    notificationId,
+    systemEngine: 'notification',
+    repeatsWeekly: shouldRepeatWeekly,
+  };
 }
 
 export async function cancelAllScheduledAlarms(): Promise<void> {
+  if (Platform.OS === 'ios') {
+    await clearAllSystemAlarms();
+  }
   await Notifications.cancelAllScheduledNotificationsAsync();
 }
 
-export interface SystemClockAlarmSpec {
-  hour: number;
-  minute: number;
-  message: string;
-  isoWeekdays?: number[]; // 1=Mon .. 7=Sun
-  skipUi?: boolean;
-}
-
 /**
- * Batch-write alarms directly into the Android native System Clock (`AlarmClock.ACTION_SET_ALARM`)
- * via our `MainApplication.kt` native bridge (with genuine `ArrayList<Integer>` `EXTRA_DAYS` and
- * `EXTRA_SKIP_UI`), falling back to `IntentLauncher` if running outside custom native build.
+ * Batch-write alarms directly into the native OS system alarm engine:
+ * - Android: `AlarmClock.ACTION_SET_ALARM` via `MainApplication.kt` (`GdouSystemAlarmBridge`),
+ *   falling back to `IntentLauncher` if running outside the custom native build.
+ * - iOS 26+: `AlarmKit` (`AlarmManager.shared.schedule`) via `GdouEphemeralNetworking.swift`
+ *   (`GdouIosAlarmBridge`). On iOS < 26, returns `{ ok: false, supported: false }` so callers
+ *   cleanly fall back to `UNUserNotificationCenter` ringtone notifications.
  */
 export async function setSystemClockAlarmsBatch(
-  specs: SystemClockAlarmSpec[]
-): Promise<{ ok: boolean; writtenCount: number; error?: string }> {
-  if (Platform.OS !== 'android' || specs.length === 0) {
-    return { ok: false, writtenCount: 0 };
+  specs: SystemClockAlarmSpec[],
+  cancelIds?: string[]
+): Promise<SystemClockBatchResult> {
+  if ((Platform.OS !== 'android' && Platform.OS !== 'ios') || specs.length === 0) {
+    return { ok: false, writtenCount: 0, supported: false };
   }
 
   const alarmsPayload = specs.map((s) => ({
+    ...(s.id ? { id: s.id } : {}),
+    ...(s.dedupeKey ? { dedupeKey: s.dedupeKey } : {}),
     hour: s.hour,
     minute: s.minute,
     message: s.message,
     skipUi: s.skipUi !== false,
     vibrate: true,
+    mode: s.mode ?? (s.isoWeekdays && s.isoWeekdays.length > 0 ? 'relative' : 'fixed'),
+    ...(typeof s.triggerEpochMs === 'number' ? { triggerEpochMs: s.triggerEpochMs } : {}),
     days:
       s.isoWeekdays && s.isoWeekdays.length > 0
-        ? s.isoWeekdays.map((d) => (d === 7 ? 1 : d + 1))
+        ? s.isoWeekdays.map(isoWeekdayToCalendarDay)
         : [],
   }));
 
   try {
-    const resp = await fetch('https://gdou-alarm-internal.local/set-system-alarms', {
+    const resp = await fetchAlarmBridge('/set-system-alarms', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ alarms: alarmsPayload }),
+      body: {
+        alarms: alarmsPayload,
+        ...(cancelIds && cancelIds.length > 0 ? { cancelIds } : {}),
+      },
+      timeoutMs: Platform.OS === 'ios' ? 32_000 : 10_000,
     });
     if (resp.ok) {
-      const json = (await resp.json()) as { ok?: boolean; count?: number; error?: string };
+      const json = (await resp.json()) as {
+        ok?: boolean;
+        count?: number;
+        engine?: string;
+        supported?: boolean;
+        authStatus?: string;
+        alarmIds?: string[];
+        scheduled?: Array<{ id: string; dedupeKey: string }>;
+        error?: string;
+      };
+      const resolvedEngine: AlarmSystemEngine =
+        Platform.OS === 'android'
+          ? 'android_clock'
+          : json.engine === 'alarmkit'
+            ? 'ios_alarmkit'
+            : 'notification';
       if (json.ok && (json.count ?? 0) > 0) {
-        return { ok: true, writtenCount: json.count ?? specs.length };
+        return {
+          ok: true,
+          writtenCount: json.count ?? specs.length,
+          engine: resolvedEngine,
+          supported: json.supported ?? true,
+          authStatus: json.authStatus,
+          alarmIds: json.alarmIds,
+          scheduled: json.scheduled,
+        };
       }
-      if (json.error) {
-        return { ok: false, writtenCount: 0, error: json.error };
-      }
+      return {
+        ok: false,
+        writtenCount: 0,
+        engine: resolvedEngine,
+        supported: json.supported,
+        authStatus: json.authStatus,
+        error: json.error || undefined,
+      };
     }
-  } catch {
-    // Fallback to IntentLauncher for first item below
+  } catch (bridgeErr) {
+    if (Platform.OS === 'ios') {
+      return {
+        ok: false,
+        writtenCount: 0,
+        engine: 'notification',
+        supported: false,
+        error: bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr),
+      };
+    }
+    // Android falls back to IntentLauncher below
   }
 
-  try {
-    const first = specs[0];
-    await IntentLauncher.startActivityAsync('android.intent.action.SET_ALARM', {
-      extra: {
-        'android.intent.extra.alarm.HOUR': first.hour,
-        'android.intent.extra.alarm.MINUTES': first.minute,
-        'android.intent.extra.alarm.MESSAGE': first.message,
-        'android.intent.extra.alarm.SKIP_UI': first.skipUi !== false,
-      },
-    });
-    return { ok: true, writtenCount: 1 };
-  } catch (err) {
-    return {
-      ok: false,
-      writtenCount: 0,
-      error: err instanceof Error ? err.message : String(err),
-    };
+  if (Platform.OS === 'android') {
+    try {
+      const first = specs[0];
+      await IntentLauncher.startActivityAsync('android.intent.action.SET_ALARM', {
+        extra: {
+          'android.intent.extra.alarm.HOUR': first.hour,
+          'android.intent.extra.alarm.MINUTES': first.minute,
+          'android.intent.extra.alarm.MESSAGE': first.message,
+          'android.intent.extra.alarm.SKIP_UI': first.skipUi !== false,
+        },
+      });
+      return { ok: true, writtenCount: 1, engine: 'android_clock', supported: true };
+    } catch (err) {
+      return {
+        ok: false,
+        writtenCount: 0,
+        engine: 'android_clock',
+        supported: true,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
+
+  return { ok: false, writtenCount: 0, supported: false };
 }
 
 /**
@@ -711,16 +1195,15 @@ export async function setNativeAndroidSystemClockAlarm(params: {
 }
 
 /**
- * Open the phone's native System Clock Alarms screen directly:
+ * Open the phone's native System Clock Alarms screen:
  * - Android: `AlarmClock.ACTION_SHOW_ALARMS`
- * - iOS: `clock-alarm://` (built-in Apple Clock app Alarm tab)
+ * - iOS: tries `clock-alarm://` via native `UIApplication.shared.open` (returns `false` honestly
+ *   on iOS 18/26 where Apple blocks third-party Clock URL schemes so callers can offer Settings).
  */
 export async function openNativeSystemClockApp(): Promise<boolean> {
   if (Platform.OS === 'android') {
     try {
-      const resp = await fetch('https://gdou-alarm-internal.local/show-alarms', {
-        method: 'POST',
-      });
+      const resp = await fetchAlarmBridge('/show-alarms', { method: 'POST', timeoutMs: 5000 });
       if (resp.ok) {
         const json = (await resp.json()) as { ok?: boolean };
         if (json.ok) return true;
@@ -738,6 +1221,17 @@ export async function openNativeSystemClockApp(): Promise<boolean> {
 
   if (Platform.OS === 'ios') {
     try {
+      const resp = await fetchAlarmBridge('/show-alarms', { method: 'POST', timeoutMs: 5000 });
+      if (resp.ok) {
+        const json = (await resp.json()) as { ok?: boolean };
+        return json.ok === true;
+      }
+    } catch {
+      // Fallback to Linking below
+    }
+    try {
+      const can = await Linking.canOpenURL('clock-alarm://');
+      if (!can) return false;
       await Linking.openURL('clock-alarm://');
       return true;
     } catch {

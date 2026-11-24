@@ -20,14 +20,23 @@
       "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
       "tintColor": "#0284C7",
       "category": "utilities",
-      "version": "1.4.2",
-      "buildVersion": "8",
-      "versionDate": "2026-11-24",
-      "versionDescription": "v1.4.2：\n1. 双通道校外登录根治修复：恢复海大微门户（wfw）两阶段标准鉴权并锁定教务原始 service 票据校验，显式隔离代理 Cookie 路径（/authserver 与 / 不再冲突）及自动预热 urlss 路由，彻底解决极速直连「教务子会话验证未通过 / 901」与官网无痕网页「二次认证后 404」问题，且直连模式无缝支持第 2 步多因子验证；\n2. 非本周排课不计撞课、早起/课前/考前直写系统闹钟、Android/iOS 系统自动识别隐藏无关平台字样均完整保留。",
-      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.2/haida-schedule-v1.4.2-ios-unsigned.ipa",
+      "version": "1.4.3",
+      "buildVersion": "9",
+      "versionDate": "2026-11-25",
+      "versionDescription": "v1.4.3：\n1. 修复 iOS 系统闹钟无法成功设置：接入 iOS 26 原生 AlarmKit 系统级闹钟（新增 NSAlarmKitUsageDescription 与原生 Swift 桥接，锁屏全屏响铃并穿透静音/专注模式，支持早起/课前/考前直写与单条开关/删除），低于 iOS 26 自动降级为每周循环系统铃声提醒，并修复 iOS 18/26 跳转无响应及本周已过星期被跳过的问题；\n2. 修复「含他周」角标挤压课程块文字：取消绝对定位浮层与右侧挤压留白，「含他周」改为底部细条、撞课/同堂改为流式顶标，课程名始终保持 100% 宽度完整显示。",
+      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.3/haida-schedule-v1.4.3-ios-unsigned.ipa",
       "size": 11965309,
       "minOSVersion": "16.4",
       "versions": [
+        {
+          "version": "1.4.3",
+          "buildVersion": "9",
+          "date": "2026-11-25",
+          "localizedDescription": "v1.4.3：\n1. 修复 iOS 系统闹钟设置失败：原生接入 iOS 26 AlarmKit 系统级闹钟（锁屏全屏响铃并穿透静音/专注模式，支持单条独立开关与删除）及低版本每周循环铃声提醒兜底，新增系统权限一键引导；\n2. 修复「含他周」挤压课块文字：移除绝对定位角标与右侧挤压留白，课程名称占满全宽不再挤成竖条。",
+          "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.4.3/haida-schedule-v1.4.3-ios-unsigned.ipa",
+          "size": 11965309,
+          "minOSVersion": "16.4"
+        },
         {
           "version": "1.4.2",
           "buildVersion": "8",
@@ -77,6 +86,7 @@
       "appPermissions": {
         "entitlements": [],
         "privacy": {
+          "NSAlarmKitUsageDescription": "用于在 iOS 系统中直接写入海大课表每日早起、课前及考前系统级闹钟（支持锁屏全屏响铃与穿透静音/专注模式）",
           "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",
           "NSCalendarsFullAccessUsageDescription": "用于创建并同步“海大课表”专属系统日历及考试提醒",
           "NSRemindersUsageDescription": "用于设置课前提醒与考前提醒事项"

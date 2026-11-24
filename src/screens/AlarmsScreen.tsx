@@ -1,5 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Platform,
@@ -16,11 +16,14 @@ import {
   cancelScheduledAlarm,
   createWeeklyMorningWakeupAlarms,
   formatHourMinute,
+  getSystemAlarmCapabilities,
   mergeAlarmsIdempotently,
-  openNativeSystemClockApp,
+  openAppSystemSettings,
   setNativeAndroidSystemClockAlarm,
+  SystemAlarmCapabilities,
   toggleAlarmEnabled,
 } from '../services/alarmService';
+import { openSystemClockOrGuide, showAlarmErrorAlert } from '../services/alarmUiHelper';
 import {
   deleteGdouCalendar,
   syncAllCoursesToCalendar,
@@ -57,6 +60,19 @@ export const AlarmsScreen: React.FC<Props> = ({
   const [targetWeek, setTargetWeek] = useState(currentWeek);
   const [wakeupMinutes, setWakeupMinutes] = useState(settings.defaultWakeupMinutes || 45);
   const [busy, setBusy] = useState<string | null>(null);
+  const [capabilities, setCapabilities] = useState<SystemAlarmCapabilities | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void getSystemAlarmCapabilities().then((cap) => {
+      if (active) setCapabilities(cap);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const isIosAlarmKit = Platform.OS === 'ios' && capabilities?.engine === 'ios_alarmkit';
 
   const handleGenerateWakeup = async () => {
     if (courses.length === 0) {
@@ -65,39 +81,68 @@ export const AlarmsScreen: React.FC<Props> = ({
     }
     setBusy('wakeup');
     try {
-      const { created, systemClockGroupsCount, replacedCount, skippedPast, failed, exactAlarmHint } =
-        await createWeeklyMorningWakeupAlarms(
-          courses,
-          targetWeek,
-          wakeupMinutes,
-          settings,
-          alarms
-        );
+      const {
+        created,
+        systemClockGroupsCount,
+        systemEngine,
+        replacedCount,
+        skippedPast,
+        failed,
+        exactAlarmHint,
+        fallbackReason,
+      } = await createWeeklyMorningWakeupAlarms(
+        courses,
+        targetWeek,
+        wakeupMinutes,
+        settings,
+        alarms
+      );
       if (created.length > 0) {
         const { merged } = mergeAlarmsIdempotently(alarms, created);
         onAlarmsUpdated(merged);
       }
+      if (Platform.OS === 'ios') {
+        void getSystemAlarmCapabilities().then(setCapabilities);
+      }
       const dedupeNote = replacedCount > 0 ? `（已更新 ${replacedCount} 条旧记录）` : '';
       const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
+      const fallbackNote =
+        Platform.OS === 'ios' && systemEngine !== 'ios_alarmkit' && fallbackReason
+          ? `\n\n说明：${fallbackReason}，已自动改用高优先级系统铃声循环提醒。`
+          : '';
       const bodyMsg =
         Platform.OS === 'android' && systemClockGroupsCount > 0
           ? `已直接写入手机「系统闹钟」${systemClockGroupsCount} 组（同唤醒时间点已自动合并星期，首节课提前 ${wakeupMinutes} 分钟）${dedupeNote}${failNote}。`
-          : created.length > 0
-            ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${dedupeNote}${
-                skippedPast > 0 ? `，已跳过 ${skippedPast} 个过期时段` : ''
-              }${failNote}。${hintNote}`
-            : `第 ${targetWeek} 周所有首课时间均已过去，请切换到下一周再生成。`;
+          : Platform.OS === 'ios' && systemEngine === 'ios_alarmkit' && systemClockGroupsCount > 0
+            ? `已直接写入 iOS 原生系统级闹钟（AlarmKit）${systemClockGroupsCount} 条（每周循环，锁屏全屏响铃且穿透静音/专注模式，首节课提前 ${wakeupMinutes} 分钟）${dedupeNote}${failNote}。`
+            : created.length > 0
+              ? `已为第 ${targetWeek} 周自动安排 ${created.length} 个每日首课起床闹钟（首节课前 ${wakeupMinutes} 分钟）${dedupeNote}${
+                  skippedPast > 0 ? `，已跳过 ${skippedPast} 个过期时段` : ''
+                }${failNote}。${hintNote}${fallbackNote}`
+              : `第 ${targetWeek} 周暂无排课，请切换周次后再生成。`;
 
-      Alert.alert('系统早起闹钟已更新', bodyMsg, [
-        { text: '完成', style: 'cancel' },
-        {
-          text: '打开系统闹钟查看',
-          onPress: () => void openNativeSystemClockApp(),
-        },
-      ]);
+      Alert.alert(
+        systemEngine === 'ios_alarmkit' ? 'iOS 系统闹钟已写入' : '系统早起闹钟已更新',
+        bodyMsg,
+        Platform.OS === 'ios'
+          ? [
+              { text: '完成', style: 'cancel' },
+              {
+                text: '系统权限设置',
+                onPress: () => void openAppSystemSettings(),
+              },
+            ]
+          : [
+              { text: '完成', style: 'cancel' },
+              {
+                text: '打开系统闹钟查看',
+                onPress: () => void openSystemClockOrGuide(false),
+              },
+            ]
+      );
     } catch (err) {
-      Alert.alert('写入系统闹钟失败', err instanceof Error ? err.message : String(err));
+      showAlarmErrorAlert('写入系统闹钟失败', err);
     } finally {
       setBusy(null);
     }
@@ -198,7 +243,7 @@ export const AlarmsScreen: React.FC<Props> = ({
       const updated = await toggleAlarmEnabled(alarm, nextVal);
       onAlarmsUpdated(alarms.map((a) => (a.id === alarm.id ? updated : a)));
     } catch (err) {
-      Alert.alert('切换失败', err instanceof Error ? err.message : String(err));
+      showAlarmErrorAlert('切换失败', err);
     }
   };
 
@@ -223,7 +268,7 @@ export const AlarmsScreen: React.FC<Props> = ({
 
   const handleWriteAndroidClock = async (alarm: AlarmRule) => {
     if (Platform.OS === 'ios') {
-      await openNativeSystemClockApp();
+      await openSystemClockOrGuide(alarm.systemEngine === 'ios_alarmkit' || isIosAlarmKit);
       return;
     }
     try {
@@ -245,7 +290,9 @@ export const AlarmsScreen: React.FC<Props> = ({
         <Text style={styles.headerTitle}>闹钟与日历中心</Text>
         <Text style={styles.headerSub}>
           {Platform.OS === 'ios'
-            ? '当前系统：iOS · 系统日历 EventKit 与时效闹钟一键联动'
+            ? isIosAlarmKit
+              ? '当前系统：iOS · 原生 AlarmKit 系统级闹钟直写与日历一键联动'
+              : '当前系统：iOS · 系统铃声提醒与 EventKit 日历一键联动'
             : '当前系统：Android · 手机系统闹钟直写与系统日历一键联动'}
         </Text>
       </View>
@@ -352,7 +399,9 @@ export const AlarmsScreen: React.FC<Props> = ({
                   ? '正在写入...'
                   : Platform.OS === 'android'
                     ? `直接写入第 ${targetWeek} 周系统起床闹钟`
-                    : `生成第 ${targetWeek} 周每日起床闹钟`}
+                    : isIosAlarmKit
+                      ? `直接写入第 ${targetWeek} 周 iOS 系统闹钟`
+                      : `生成第 ${targetWeek} 周每日起床闹钟`}
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
@@ -360,17 +409,29 @@ export const AlarmsScreen: React.FC<Props> = ({
                 styles.outlineBtn,
                 { flex: 0, paddingHorizontal: 12, height: 44, borderColor: COLORS.coralLight },
               ]}
-              onPress={() => void openNativeSystemClockApp()}
+              onPress={() =>
+                Platform.OS === 'ios'
+                  ? void openAppSystemSettings()
+                  : void openSystemClockOrGuide(false)
+              }
             >
-              <Ionicons name="time-outline" size={16} color={COLORS.coral} />
-              <Text style={[styles.outlineBtnText, { color: COLORS.coral }]}>系统闹钟</Text>
+              <Ionicons
+                name={Platform.OS === 'ios' ? 'settings-outline' : 'time-outline'}
+                size={16}
+                color={COLORS.coral}
+              />
+              <Text style={[styles.outlineBtnText, { color: COLORS.coral }]}>
+                {Platform.OS === 'ios' ? '闹钟权限' : '系统闹钟'}
+              </Text>
             </TouchableOpacity>
           </View>
 
           <Text style={styles.platformNote}>
             {Platform.OS === 'android'
               ? '提示：点击上方按钮将直接修改写入手机自带「系统闹钟」（相同唤醒时间自动合并星期，锁屏/后台杀进程/勿扰均准时响铃）。'
-              : '提示：iOS 端自动注册系统高优先级时效提醒（Time-Sensitive），点击右侧「系统闹钟」可一键跳转苹果自带时钟 App。'}
+              : isIosAlarmKit
+                ? '提示：当前设备支持 iOS 26 原生 AlarmKit，点击上方按钮将直接写入系统级闹钟（每周循环、锁屏全屏响铃并穿透静音/专注模式），可直接在下方列表开关或删除。'
+                : '提示：低于 iOS 26 的设备无法写入系统级 AlarmKit 闹钟，已自动采用每周循环系统铃声提醒；升级 iOS 26+ 后将自动启用原生系统闹钟。'}
           </Text>
         </View>
 
@@ -394,10 +455,19 @@ export const AlarmsScreen: React.FC<Props> = ({
         ) : (
           alarms.map((alarm) => {
             const dt = new Date(alarm.triggerIso);
-            const dateStr = `${dt.getMonth() + 1}月${dt.getDate()}日 ${
-              DAY_FULL_LABELS[alarm.weekday - 1] ?? ''
-            }`;
-            const isExpired = dt.getTime() < Date.now();
+            const isRepeating = alarm.repeatsWeekly === true;
+            const dateStr = isRepeating
+              ? `每周${DAY_FULL_LABELS[alarm.weekday - 1]?.replace('周', '') ?? ''}`
+              : `${dt.getMonth() + 1}月${dt.getDate()}日 ${
+                  DAY_FULL_LABELS[alarm.weekday - 1] ?? ''
+                }`;
+            const isExpired = !isRepeating && dt.getTime() < Date.now();
+            const engineBadge =
+              alarm.systemEngine === 'ios_alarmkit'
+                ? 'iOS 系统闹钟'
+                : alarm.systemEngine === 'android_clock'
+                  ? '系统时钟'
+                  : null;
             return (
               <View key={alarm.id} style={styles.alarmItem}>
                 <View style={styles.alarmTop}>
@@ -412,6 +482,9 @@ export const AlarmsScreen: React.FC<Props> = ({
                     <Text style={styles.alarmBody} numberOfLines={2}>
                       {alarm.body}
                     </Text>
+                    {engineBadge && !isExpired && (
+                      <Text style={styles.engineTag}>✓ {engineBadge}</Text>
+                    )}
                     {isExpired && <Text style={styles.expiredTag}>已触发 / 已过期</Text>}
                   </View>
                   <Switch
@@ -430,7 +503,7 @@ export const AlarmsScreen: React.FC<Props> = ({
                   >
                     <Ionicons name="time-outline" size={14} color={COLORS.oceanPrimary} />
                     <Text style={styles.miniActionText}>
-                      {Platform.OS === 'android' ? '在系统闹钟中编辑/修改' : '打开系统时钟'}
+                      {Platform.OS === 'android' ? '在系统闹钟中编辑/修改' : '系统闹钟说明/权限'}
                     </Text>
                   </TouchableOpacity>
                   <TouchableOpacity
@@ -680,6 +753,12 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
     marginTop: 2,
     lineHeight: 16,
+  },
+  engineTag: {
+    fontSize: 10.5,
+    color: COLORS.oceanPrimary,
+    marginTop: 3,
+    fontWeight: '700',
   },
   expiredTag: {
     fontSize: 11,

@@ -13,9 +13,10 @@ import {
 } from 'react-native';
 import {
   createExamAlarms,
-  openNativeSystemClockApp,
+  openAppSystemSettings,
   setNativeAndroidSystemClockAlarm,
 } from '../services/alarmService';
+import { openSystemClockOrGuide, showAlarmErrorAlert } from '../services/alarmUiHelper';
 import { syncExamsToCalendar } from '../services/calendarService';
 import { getExamCountdown, parseExamIsoLocal } from '../services/examParser';
 import { COLORS } from '../theme/colors';
@@ -91,32 +92,55 @@ export const ExamsScreen: React.FC<Props> = ({
     }
     setBusy(true);
     try {
-      const { created, systemClockGroupsCount, replacedCount, skipped, failed, exactAlarmHint } =
-        await createExamAlarms(exams, settings, alarms);
+      const {
+        created,
+        systemClockGroupsCount,
+        systemEngine,
+        replacedCount,
+        skipped,
+        failed,
+        exactAlarmHint,
+        fallbackReason,
+      } = await createExamAlarms(exams, settings, alarms);
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
       const dedupeNote = replacedCount > 0 ? `（已覆盖更新 ${replacedCount} 条旧记录）` : '';
       const failNote = failed > 0 ? `，另有 ${failed} 条创建失败` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
+      const fallbackNote =
+        Platform.OS === 'ios' && systemEngine !== 'ios_alarmkit' && fallbackReason
+          ? `\n\n说明：${fallbackReason}，已改用高优先级系统铃声提醒。`
+          : '';
       const msg =
         Platform.OS === 'android' && systemClockGroupsCount > 0
           ? `已直接写入手机系统闹钟 ${systemClockGroupsCount} 场考前出发闹钟（考前 ${settings.examAdvanceMinutes} 分钟），并同步设置前晚 20:00 备考提醒${dedupeNote}${failNote}。`
-          : created.length > 0
-            ? `已配置 ${created.length} 条考前闹钟（含前晚 20:00 提醒 + 考前 ${settings.examAdvanceMinutes} 分钟出发闹钟）${dedupeNote}${
-                skipped > 0 ? `，已跳过 ${skipped} 场已结束或时间待定考试` : ''
-              }${failNote}。${hintNote}`
-            : '暂无可设置的未来考试提醒。';
+          : Platform.OS === 'ios' && systemEngine === 'ios_alarmkit' && systemClockGroupsCount > 0
+            ? `已通过 iOS 原生 AlarmKit 直接写入 ${systemClockGroupsCount} 条考前系统级闹钟（含前晚 20:00 与考前 ${settings.examAdvanceMinutes} 分钟出发闹钟，穿透静音/专注模式）${dedupeNote}${failNote}。`
+            : created.length > 0
+              ? `已配置 ${created.length} 条考前闹钟（含前晚 20:00 提醒 + 考前 ${settings.examAdvanceMinutes} 分钟出发闹钟）${dedupeNote}${
+                  skipped > 0 ? `，已跳过 ${skipped} 场已结束或时间待定考试` : ''
+                }${failNote}。${hintNote}${fallbackNote}`
+              : '暂无可设置的未来考试提醒。';
 
-      Alert.alert('考试系统闹钟已配置', msg, [
-        { text: '好的', style: 'cancel' },
-        {
-          text: '打开系统闹钟查看',
-          onPress: () => void openNativeSystemClockApp(),
-        },
-      ]);
+      Alert.alert(
+        systemEngine === 'ios_alarmkit' ? 'iOS 考试系统闹钟已写入' : '考试系统闹钟已配置',
+        msg,
+        Platform.OS === 'ios'
+          ? [
+              { text: '好的', style: 'cancel' },
+              { text: '系统权限设置', onPress: () => void openAppSystemSettings() },
+            ]
+          : [
+              { text: '好的', style: 'cancel' },
+              {
+                text: '打开系统闹钟查看',
+                onPress: () => void openSystemClockOrGuide(false),
+              },
+            ]
+      );
     } catch (err) {
-      Alert.alert('设定考试闹钟失败', err instanceof Error ? err.message : String(err));
+      showAlarmErrorAlert('设定考试闹钟失败', err);
     } finally {
       setBusy(false);
     }
@@ -140,26 +164,41 @@ export const ExamsScreen: React.FC<Props> = ({
 
   const handleSingleExamAlarm = async (exam: ExamItem) => {
     try {
-      const { created, systemClockGroupsCount } = await createExamAlarms([exam], settings, alarms);
+      const { created, systemClockGroupsCount, systemEngine, fallbackReason } =
+        await createExamAlarms([exam], settings, alarms);
       if (created.length > 0 || systemClockGroupsCount > 0) {
         if (created.length > 0) onAlarmsAdded(created);
+        const isIosAlarmKit = Platform.OS === 'ios' && systemEngine === 'ios_alarmkit';
+        const fallbackNote =
+          Platform.OS === 'ios' && !isIosAlarmKit && fallbackReason
+            ? `\n\n说明：${fallbackReason}，已改用高优先级系统铃声提醒。`
+            : '';
         Alert.alert(
           Platform.OS === 'android' && systemClockGroupsCount > 0
             ? '已直接写入手机系统闹钟'
-            : '考前闹钟已设定',
+            : isIosAlarmKit
+              ? '已直接写入 iOS 系统闹钟'
+              : '考前闹钟已设定',
           Platform.OS === 'android' && systemClockGroupsCount > 0
             ? `已为《${exam.courseName}》在手机系统时钟创建考前 ${settings.examAdvanceMinutes} 分钟闹钟，并配置前晚提醒。`
-            : `已为《${exam.courseName}》配置 ${created.length} 条提醒闹钟（已自动去重）。`,
-          [
-            { text: '完成', style: 'cancel' },
-            { text: '打开系统闹钟', onPress: () => void openNativeSystemClockApp() },
-          ]
+            : isIosAlarmKit
+              ? `已通过 iOS 原生 AlarmKit 为《${exam.courseName}》写入 ${systemClockGroupsCount} 条系统级考前闹钟（穿透静音/专注模式）。`
+              : `已为《${exam.courseName}》配置 ${created.length} 条提醒闹钟（已自动去重）。${fallbackNote}`,
+          Platform.OS === 'ios'
+            ? [
+                { text: '完成', style: 'cancel' },
+                { text: '系统权限设置', onPress: () => void openAppSystemSettings() },
+              ]
+            : [
+                { text: '完成', style: 'cancel' },
+                { text: '打开系统闹钟', onPress: () => void openSystemClockOrGuide(false) },
+              ]
         );
       } else {
         Alert.alert('无法设置', '该考试时间已过或时间待定。');
       }
     } catch (err) {
-      Alert.alert('设定失败', err instanceof Error ? err.message : String(err));
+      showAlarmErrorAlert('设定失败', err);
     }
   };
 

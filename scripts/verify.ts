@@ -1041,14 +1041,34 @@ async function run() {
   assert.equal(mergedSegmentsKb.courses.length, 1, 'Split week segments of identical course must merge');
   assert.deepEqual(mergedSegmentsKb.courses[0]?.weeks, [1, 2, 3, 4, 6, 7, 8]);
 
-  // Verify Native System Clock bridge & OS auto-detection guards
+  // Verify Native System Clock & iOS 26 AlarmKit bridges + OS auto-detection + zero-squeeze card layout guards
   assert.ok(
     pluginSrc.includes('GdouSystemAlarmBridge') &&
       pluginSrc.includes('AlarmClock.ACTION_SET_ALARM') &&
       pluginSrc.includes('putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS') &&
+      pluginSrc.includes('GdouIosAlarmBridge') &&
+      pluginSrc.includes('canImport(AlarmKit)') &&
+      pluginSrc.includes('#available(iOS 26.0, *)') &&
+      pluginSrc.includes('#available(iOS 26.1, *)') &&
+      pluginSrc.includes('AlarmManager.shared') &&
+      pluginSrc.includes('NSAlarmKitUsageDescription') &&
       pluginSrc.includes('extractWfwInnerUrl') &&
       pluginSrc.includes('extractWfwInnerPath'),
-    'Native plugin must include GdouSystemAlarmBridge & inner wfw cookie path matching'
+    'Native plugin must include Android GdouSystemAlarmBridge, iOS 26 AlarmKit GdouIosAlarmBridge & inner wfw cookie path matching'
+  );
+  assert.ok(
+    Boolean(appJson.expo.ios?.infoPlist?.NSAlarmKitUsageDescription),
+    'app.json must declare NSAlarmKitUsageDescription for iOS 26 AlarmKit'
+  );
+  const scheduleScreenSrc = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'src', 'screens', 'ScheduleScreen.tsx'),
+    'utf8'
+  );
+  assert.ok(
+    !scheduleScreenSrc.includes('paddingRight: 26') &&
+      !scheduleScreenSrc.includes('multiCornerBadge') &&
+      scheduleScreenSrc.includes('otherWeekFooterPill'),
+    'ScheduleScreen must place 含他周 in bottom footer pill and NEVER horizontally squeeze cardName with paddingRight: 26'
   );
   const settingsScreenSrc = nodeFs.readFileSync(
     nodePath.join(process.cwd(), 'src', 'screens', 'SettingsScreen.tsx'),

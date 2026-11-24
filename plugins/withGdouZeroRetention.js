@@ -576,6 +576,335 @@ import Foundation
 import React
 import UIKit
 import WebKit
+#if canImport(AlarmKit)
+import AlarmKit
+import ActivityKit
+import SwiftUI
+#endif
+
+#if canImport(AlarmKit)
+@available(iOS 26.0, *)
+nonisolated struct GdouAlarmMetadata: AlarmMetadata {
+  let title: String
+  let dedupeKey: String
+}
+#endif
+
+/// Native iOS System Alarm bridge (iOS 26+ AlarmKit with safe weak-linked fallback for iOS < 26).
+/// Handles \`https://gdou-alarm-internal.local/*\` intercepted by \`GdouEphemeralURLProtocol\`:
+/// - \`/alarm-capabilities\`: reports AlarmKit availability & authorization status
+/// - \`/set-system-alarms\`: requests AlarmKit permission & schedules fixed / weekly relative system alarms
+/// - \`/cancel-system-alarms\`: cancels specific AlarmKit UUIDs
+/// - \`/clear-system-alarms\`: cancels all active alarms scheduled by this app
+/// - \`/show-alarms\`: attempts to open Apple Clock and reports true/false accurately
+enum GdouIosAlarmBridge {
+  private static func encodeJSON(_ obj: [String: Any]) -> Data {
+    if let data = try? JSONSerialization.data(withJSONObject: obj, options: []) {
+      return data
+    }
+    return Data("{\\"ok\\":false,\\"error\\":\\"JSON encode failed\\"}".utf8)
+  }
+
+  @MainActor
+  private static func openClockUrl() async -> Bool {
+    guard let url = URL(string: "clock-alarm://") else { return false }
+    return await UIApplication.shared.open(url, options: [:])
+  }
+
+  #if canImport(AlarmKit)
+  @available(iOS 26.0, *)
+  private static func authorizationStateString(_ state: AlarmManager.AuthorizationState) -> String {
+    switch state {
+    case .authorized:
+      return "authorized"
+    case .denied:
+      return "denied"
+    case .notDetermined:
+      return "notDetermined"
+    @unknown default:
+      return "unknown"
+    }
+  }
+
+  @available(iOS 26.0, *)
+  private static func mapCalendarDayToLocaleWeekday(_ day: Int) -> Locale.Weekday? {
+    switch day {
+    case 1: return .sunday
+    case 2: return .monday
+    case 3: return .tuesday
+    case 4: return .wednesday
+    case 5: return .thursday
+    case 6: return .friday
+    case 7: return .saturday
+    default: return nil
+    }
+  }
+
+  @available(iOS 26.0, *)
+  private static func scheduleAlarmKitBatch(bodyData: Data) async -> Data {
+    guard let payload = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+          let rawAlarms = payload["alarms"] as? [[String: Any]],
+          !rawAlarms.isEmpty else {
+      return encodeJSON([
+        "ok": false,
+        "platform": "ios",
+        "engine": "alarmkit",
+        "supported": true,
+        "count": 0,
+        "error": "Empty alarms payload",
+      ])
+    }
+
+    let manager = AlarmManager.shared
+    var authState = manager.authorizationState
+    if authState == .notDetermined {
+      do {
+        authState = try await manager.requestAuthorization()
+      } catch {
+        return encodeJSON([
+          "ok": false,
+          "platform": "ios",
+          "engine": "alarmkit",
+          "supported": true,
+          "authStatus": "error",
+          "count": 0,
+          "error": "请求 iOS 系统闹钟权限失败：\\(error.localizedDescription)",
+        ])
+      }
+    }
+
+    guard authState == .authorized else {
+      return encodeJSON([
+        "ok": false,
+        "platform": "ios",
+        "engine": "alarmkit",
+        "supported": true,
+        "authStatus": "denied",
+        "count": 0,
+        "error": "未开启 iOS 系统闹钟权限，请在系统「设置 -> 海大课表 -> 闹钟」中允许后重试",
+      ])
+    }
+
+    if let cancelIds = payload["cancelIds"] as? [String] {
+      for rawId in cancelIds {
+        if let uuid = UUID(uuidString: rawId) {
+          try? manager.cancel(id: uuid)
+        }
+      }
+    }
+
+    var alarmIds: [String] = []
+    var scheduledItems: [[String: String]] = []
+    var firstError: String? = nil
+
+    for item in rawAlarms {
+      let hour = (item["hour"] as? NSNumber)?.intValue ?? -1
+      let minute = (item["minute"] as? NSNumber)?.intValue ?? -1
+      guard (0...23).contains(hour), (0...59).contains(minute) else { continue }
+
+      let rawMessage = (item["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let message = rawMessage.isEmpty ? "海大课表闹钟" : rawMessage
+      let dedupeKey = (item["dedupeKey"] as? String) ?? ""
+      let mode = ((item["mode"] as? String) ?? "relative").lowercased()
+      let alarmUUID = (item["id"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID()
+
+      // Idempotent replacement if the same UUID already exists
+      try? manager.cancel(id: alarmUUID)
+
+      let schedule: Alarm.Schedule
+      if mode == "fixed",
+         let triggerEpochMs = (item["triggerEpochMs"] as? NSNumber)?.doubleValue,
+         triggerEpochMs > 0 {
+        let targetDate = Date(timeIntervalSince1970: triggerEpochMs / 1000.0)
+        if targetDate.timeIntervalSinceNow > 2.0 {
+          schedule = Alarm.Schedule.fixed(targetDate)
+        } else {
+          let time = Alarm.Schedule.Relative.Time(hour: hour, minute: minute)
+          let rawDays = (item["days"] as? [NSNumber])?.map { $0.intValue } ?? []
+          let weekdays = rawDays.compactMap(mapCalendarDayToLocaleWeekday)
+          let repeats: Alarm.Schedule.Relative.Recurrence = weekdays.isEmpty ? .never : .weekly(weekdays)
+          schedule = Alarm.Schedule.relative(Alarm.Schedule.Relative(time: time, repeats: repeats))
+        }
+      } else {
+        let time = Alarm.Schedule.Relative.Time(hour: hour, minute: minute)
+        let rawDays = (item["days"] as? [NSNumber])?.map { $0.intValue } ?? []
+        let weekdays = rawDays.compactMap(mapCalendarDayToLocaleWeekday)
+        let repeats: Alarm.Schedule.Relative.Recurrence = weekdays.isEmpty ? .never : .weekly(weekdays)
+        schedule = Alarm.Schedule.relative(Alarm.Schedule.Relative(time: time, repeats: repeats))
+      }
+
+      let titleResource = LocalizedStringResource(stringLiteral: message)
+      let alertPresentation: AlarmPresentation.Alert
+      if #available(iOS 26.1, *) {
+        alertPresentation = AlarmPresentation.Alert(title: titleResource)
+      } else {
+        let stopBtn = AlarmButton(
+          text: LocalizedStringResource(stringLiteral: "停止"),
+          textColor: .white,
+          systemImageName: "stop.circle.fill"
+        )
+        alertPresentation = AlarmPresentation.Alert(
+          title: titleResource,
+          stopButton: stopBtn
+        )
+      }
+
+      let presentation = AlarmPresentation(alert: alertPresentation)
+      let metadata = GdouAlarmMetadata(title: message, dedupeKey: dedupeKey)
+      let attributes = AlarmAttributes<GdouAlarmMetadata>(
+        presentation: presentation,
+        metadata: metadata,
+        tintColor: Color(red: 0.008, green: 0.518, blue: 0.780)
+      )
+      let configuration = AlarmManager.AlarmConfiguration<GdouAlarmMetadata>.alarm(
+        schedule: schedule,
+        attributes: attributes,
+        sound: .default
+      )
+
+      do {
+        _ = try await manager.schedule(id: alarmUUID, configuration: configuration)
+        alarmIds.append(alarmUUID.uuidString)
+        scheduledItems.append([
+          "id": alarmUUID.uuidString,
+          "dedupeKey": dedupeKey,
+        ])
+      } catch {
+        if firstError == nil {
+          firstError = error.localizedDescription
+        }
+      }
+    }
+
+    return encodeJSON([
+      "ok": !alarmIds.isEmpty,
+      "platform": "ios",
+      "engine": "alarmkit",
+      "supported": true,
+      "authStatus": "authorized",
+      "count": alarmIds.count,
+      "alarmIds": alarmIds,
+      "scheduled": scheduledItems,
+      "error": firstError ?? "",
+    ])
+  }
+  #endif
+
+  static func handleRequest(path: String, bodyData: Data) async -> Data {
+    let normalized = path.lowercased()
+
+    if normalized == "/show-alarms" {
+      let opened = await openClockUrl()
+      return encodeJSON([
+        "ok": opened,
+        "platform": "ios",
+      ])
+    }
+
+    if normalized == "/alarm-capabilities" {
+      let osVer = ProcessInfo.processInfo.operatingSystemVersionString
+      #if canImport(AlarmKit)
+      if #available(iOS 26.0, *) {
+        return encodeJSON([
+          "ok": true,
+          "platform": "ios",
+          "engine": "alarmkit",
+          "supported": true,
+          "authStatus": authorizationStateString(AlarmManager.shared.authorizationState),
+          "osVersion": osVer,
+        ])
+      }
+      #endif
+      return encodeJSON([
+        "ok": true,
+        "platform": "ios",
+        "engine": "notification",
+        "supported": false,
+        "authStatus": "unsupported",
+        "osVersion": osVer,
+      ])
+    }
+
+    if normalized == "/cancel-system-alarms" {
+      #if canImport(AlarmKit)
+      if #available(iOS 26.0, *) {
+        var cancelled = 0
+        if let payload = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+           let rawIds = payload["ids"] as? [String] {
+          for rawId in rawIds {
+            if let uuid = UUID(uuidString: rawId) {
+              do {
+                try AlarmManager.shared.cancel(id: uuid)
+                cancelled += 1
+              } catch {
+                // ignore already removed alarm
+              }
+            }
+          }
+        }
+        return encodeJSON([
+          "ok": true,
+          "platform": "ios",
+          "supported": true,
+          "cancelledCount": cancelled,
+        ])
+      }
+      #endif
+      return encodeJSON([
+        "ok": true,
+        "platform": "ios",
+        "supported": false,
+        "cancelledCount": 0,
+      ])
+    }
+
+    if normalized == "/clear-system-alarms" {
+      #if canImport(AlarmKit)
+      if #available(iOS 26.0, *) {
+        var cancelled = 0
+        if let active = try? AlarmManager.shared.alarms {
+          for alarm in active {
+            do {
+              try AlarmManager.shared.cancel(id: alarm.id)
+              cancelled += 1
+            } catch {
+              // ignore individual cancel error
+            }
+          }
+        }
+        return encodeJSON([
+          "ok": true,
+          "platform": "ios",
+          "supported": true,
+          "cancelledCount": cancelled,
+        ])
+      }
+      #endif
+      return encodeJSON([
+        "ok": true,
+        "platform": "ios",
+        "supported": false,
+        "cancelledCount": 0,
+      ])
+    }
+
+    #if canImport(AlarmKit)
+    if #available(iOS 26.0, *) {
+      return await scheduleAlarmKitBatch(bodyData: bodyData)
+    }
+    #endif
+
+    return encodeJSON([
+      "ok": false,
+      "platform": "ios",
+      "engine": "notification",
+      "supported": false,
+      "authStatus": "unsupported",
+      "count": 0,
+      "error": "当前 iOS 版本低于 iOS 26，不支持 AlarmKit 系统闹钟",
+    ])
+  }
+}
 
 /// GitHub in-app OTA JS bundle loader for sideloaded iOS builds (Sideloadly / AltStore / SideStore / Feather)
 /// with 2-strike unconfirmed boot crash auto-rollback and automatic cleanup on native IPA upgrade.
@@ -855,6 +1184,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
 
   private var innerSession: URLSession?
   private var innerTask: URLSessionDataTask?
+  private var alarmTask: Task<Void, Never>?
   private var clearAfter = false
   private var didRedirect = false
   private var shouldFollowRedirects = true
@@ -979,16 +1309,28 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       return
     }
     if initialUrl.host?.lowercased() == "gdou-alarm-internal.local" {
-      let payload = Data("{\\"ok\\":false,\\"platform\\":\\"ios\\"}".utf8)
-      if let resp = HTTPURLResponse(
-        url: initialUrl,
-        statusCode: 200,
-        httpVersion: "HTTP/1.1",
-        headerFields: ["Content-Type": "application/json"]
-      ) {
-        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: payload)
-        client?.urlProtocolDidFinishLoading(self)
+      let path = initialUrl.path
+      let reqBodyData: Data
+      if let directBody = request.httpBody {
+        reqBodyData = directBody
+      } else if let stream = request.httpBodyStream {
+        reqBodyData = Self.readBodyStream(stream, maxBytes: 2 * 1024 * 1024)
+      } else {
+        reqBodyData = Data()
+      }
+      self.alarmTask = Task { [weak self] in
+        let respData = await GdouIosAlarmBridge.handleRequest(path: path, bodyData: reqBodyData)
+        guard !Task.isCancelled, let self = self else { return }
+        if let resp = HTTPURLResponse(
+          url: initialUrl,
+          statusCode: 200,
+          httpVersion: "HTTP/1.1",
+          headerFields: ["Content-Type": "application/json"]
+        ) {
+          self.client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+          self.client?.urlProtocol(self, didLoad: respData)
+          self.client?.urlProtocolDidFinishLoading(self)
+        }
       }
       return
     }
@@ -1064,6 +1406,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
   }
 
   override func stopLoading() {
+    alarmTask?.cancel()
+    alarmTask = nil
     innerTask?.cancel()
     innerTask = nil
     innerSession?.invalidateAndCancel()
@@ -1215,8 +1559,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     config.httpCookieStorage = nil
     config.httpShouldSetCookies = false
     config.httpCookieAcceptPolicy = .never
-    config.timeoutIntervalForRequest = 25
-    config.timeoutIntervalForResource = 45
+    config.timeoutIntervalForRequest = 35
+    config.timeoutIntervalForResource = 60
     config.protocolClasses = [GdouEphemeralURLProtocol.self]
     return config
   }
@@ -1436,8 +1780,12 @@ function withGdouProguardRules(config) {
 
 function withGdouIosInfoPlist(config) {
   return withInfoPlist(config, (mod) => {
-    mod.modResults.CFBundleShortVersionString = config.version || '1.3.2';
-    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '5');
+    mod.modResults.CFBundleShortVersionString = config.version || '1.4.3';
+    mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '9');
+    if (!mod.modResults.NSAlarmKitUsageDescription) {
+      mod.modResults.NSAlarmKitUsageDescription =
+        '用于在 iOS 系统中直接写入海大课表每日早起、课前及考前系统级闹钟（支持锁屏全屏响铃与穿透静音/专注模式）';
+    }
     mod.modResults.NSAppTransportSecurity = {
       NSAllowsArbitraryLoads: false,
       NSAllowsLocalNetworking: true,

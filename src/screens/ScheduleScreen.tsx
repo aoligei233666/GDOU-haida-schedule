@@ -19,8 +19,9 @@ import {
 } from '../constants/gdouTimetable';
 import {
   createWeeklyMorningWakeupAlarms,
-  openNativeSystemClockApp,
+  openAppSystemSettings,
 } from '../services/alarmService';
+import { openSystemClockOrGuide, showAlarmErrorAlert } from '../services/alarmUiHelper';
 import { syncAllCoursesToCalendar } from '../services/calendarService';
 import {
   computeTermWeek,
@@ -251,38 +252,64 @@ export const ScheduleScreen: React.FC<Props> = ({
     }
     setBusyAction('alarm');
     try {
-      const { created, systemClockGroupsCount, replacedCount, skippedPast, failed, exactAlarmHint } =
-        await createWeeklyMorningWakeupAlarms(
-          courses,
-          selectedWeek,
-          settings.defaultWakeupMinutes,
-          settings,
-          alarms
-        );
+      const {
+        created,
+        systemClockGroupsCount,
+        systemEngine,
+        replacedCount,
+        skippedPast,
+        failed,
+        exactAlarmHint,
+        fallbackReason,
+      } = await createWeeklyMorningWakeupAlarms(
+        courses,
+        selectedWeek,
+        settings.defaultWakeupMinutes,
+        settings,
+        alarms
+      );
       if (created.length > 0) {
         onAlarmsAdded(created);
       }
       const dedupeNote = replacedCount > 0 ? `（已自动更新 ${replacedCount} 条旧记录）` : '';
       const failNote = failed > 0 ? `（另有 ${failed} 条创建失败）` : '';
       const hintNote = exactAlarmHint ? `\n\n${exactAlarmHint}` : '';
+      const fallbackNote =
+        Platform.OS === 'ios' && systemEngine !== 'ios_alarmkit' && fallbackReason
+          ? `\n\n说明：${fallbackReason}，已改用每周循环系统铃声提醒。`
+          : '';
       const sysMsg =
         Platform.OS === 'android' && systemClockGroupsCount > 0
           ? `已直接写入手机系统闹钟 ${systemClockGroupsCount} 组（同唤醒时间点已自动合并星期，首节课提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${failNote}。`
-          : created.length > 0
-            ? `已为第 ${selectedWeek} 周配置 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${
-                skippedPast > 0 ? `，已跳过 ${skippedPast} 个过去时段` : ''
-              }${failNote}。${hintNote}`
-            : `第 ${selectedWeek} 周的所有课程时间均已过去，请切换到未来周次后生成。`;
+          : Platform.OS === 'ios' && systemEngine === 'ios_alarmkit' && systemClockGroupsCount > 0
+            ? `已直接写入 iOS 原生系统级闹钟（AlarmKit）${systemClockGroupsCount} 条（每周循环、锁屏全屏响铃并穿透静音/专注模式，首节课提前 ${settings.defaultWakeupMinutes} 分钟）${dedupeNote}${failNote}。`
+            : created.length > 0
+              ? `已为第 ${selectedWeek} 周配置 ${created.length} 个每日首课起床闹钟（提前 ${settings.defaultWakeupMinutes} 分钟响铃）${dedupeNote}${
+                  skippedPast > 0 ? `，已跳过 ${skippedPast} 个过去时段` : ''
+                }${failNote}。${hintNote}${fallbackNote}`
+              : `第 ${selectedWeek} 周暂无排课，请切换到有课周次后生成。`;
 
-      Alert.alert('系统早起闹钟设置完成', sysMsg, [
-        { text: '好的', style: 'cancel' },
-        {
-          text: '打开系统闹钟查看',
-          onPress: () => void openNativeSystemClockApp(),
-        },
-      ]);
+      Alert.alert(
+        systemEngine === 'ios_alarmkit' ? 'iOS 系统早起闹钟已写入' : '系统早起闹钟设置完成',
+        sysMsg,
+        Platform.OS === 'ios'
+          ? [
+              { text: '好的', style: 'cancel' },
+              {
+                text: '系统权限设置',
+                onPress: () => void openAppSystemSettings(),
+              },
+            ]
+          : [
+              { text: '好的', style: 'cancel' },
+              {
+                text: '打开系统闹钟查看',
+                onPress: () => void openSystemClockOrGuide(false),
+              },
+            ]
+      );
     } catch (err) {
-      Alert.alert('设置系统闹钟失败', err instanceof Error ? err.message : String(err));
+      showAlarmErrorAlert('设置系统闹钟失败', err);
     } finally {
       setBusyAction(null);
     }
@@ -319,29 +346,40 @@ export const ScheduleScreen: React.FC<Props> = ({
       ? items.find((i, idx) => idx > 0 && i.isCurrentWeek) ?? null
       : null;
 
-    // Corner badge text & color:
-    // IMPORTANT: Non-current-week courses are NEVER conflicts (`撞课`) and must not look like alerts!
-    let cornerBadgeText: string | null = null;
-    let cornerBadgeBg = COLORS.oceanPrimary;
-    let cornerBadgeTextColor = COLORS.white;
+    // Normal-flow status indicators (ZERO absolute overlay & ZERO horizontal paddingRight squeezing!):
+    // - Urgent/multi-course badges (`同堂`, `撞课N`, couple `N节▾`) render as slim full-width top pills
+    //   above the course title so the title always keeps 100% of the card width.
+    // - Non-current-week companion hint (`含他周`) renders as a slim bottom footer pill (`marginTop: 'auto'`)
+    //   so current-week course name & room stay cleanly anchored at full width at the top.
+    // - Standalone non-current-week multi-course slots fold count directly into the prefix tag (`非本周·N门`).
+    let topBadgeText: string | null = null;
+    let topBadgeBg = COLORS.oceanPrimary;
+    let topBadgeTextColor = COLORS.white;
+    let bottomOtherWeekText: string | null = null;
+
     if (cluster.isSameCourseTogether && viewMode === 'couple') {
-      cornerBadgeText = cluster.currentWeekCount > 2 ? `同堂·${cluster.currentWeekCount}` : '💞同堂';
-      cornerBadgeBg = '#E11D48';
+      topBadgeText = cluster.currentWeekCount > 2 ? `同堂·${cluster.currentWeekCount}` : '💞同堂';
+      topBadgeBg = '#E11D48';
     } else if (cluster.hasSameWeekConflict) {
-      cornerBadgeText = `撞课${cluster.currentWeekCount}`;
-      cornerBadgeBg = COLORS.coral;
+      topBadgeText = `撞课${cluster.currentWeekCount}`;
+      topBadgeBg = COLORS.coral;
     } else if (viewMode === 'couple' && cluster.hasBothPartnersInWeek && totalInSlot > 2) {
-      cornerBadgeText = `${cluster.currentWeekCount}节▾`;
-      cornerBadgeBg = '#DB2777';
+      topBadgeText = `${cluster.currentWeekCount}节▾`;
+      topBadgeBg = '#DB2777';
     } else if (primary.isCurrentWeek && cluster.nonCurrentWeekCount > 0) {
-      // Subtle muted pill indicating another week's course also uses this slot (zero conflict styling)
-      cornerBadgeText = '含他周';
-      cornerBadgeBg = 'rgba(100, 116, 139, 0.16)';
-      cornerBadgeTextColor = '#475569';
-    } else if (!primary.isCurrentWeek && totalInSlot >= 2) {
-      cornerBadgeText = `他周${totalInSlot}门`;
-      cornerBadgeBg = '#94A3B8';
+      bottomOtherWeekText =
+        cluster.nonCurrentWeekCount > 1 ? `他周+${cluster.nonCurrentWeekCount}` : '含他周';
     }
+
+    const nameMaxLines = secondCurrentWeekItem
+      ? 2
+      : spanCount >= 3
+        ? 4
+        : spanCount === 2
+          ? topBadgeText
+            ? 2
+            : 3
+          : 2;
 
     return (
       <TouchableOpacity
@@ -362,11 +400,15 @@ export const ScheduleScreen: React.FC<Props> = ({
           },
         ]}
       >
-        {/* Top-right multi-course / couple / other-week badge */}
-        {cornerBadgeText && (
-          <View style={[styles.multiCornerBadge, { backgroundColor: cornerBadgeBg }]}>
-            <Text style={[styles.multiCornerBadgeText, { color: cornerBadgeTextColor }]}>
-              {cornerBadgeText}
+        {/* Slim normal-flow top status pill (never floats over or horizontally squeezes title) */}
+        {topBadgeText && (
+          <View style={[styles.inlineTopBadge, { backgroundColor: topBadgeBg }]}>
+            <Text
+              style={[styles.inlineTopBadgeText, { color: topBadgeTextColor }]}
+              numberOfLines={1}
+              maxFontSizeMultiplier={1.1}
+            >
+              {topBadgeText}
             </Text>
           </View>
         )}
@@ -374,25 +416,33 @@ export const ScheduleScreen: React.FC<Props> = ({
         {showDualPartnerRows && myTopItem && partnerTopItem ? (
           <View style={styles.dualPartnerWrap}>
             <View style={[styles.dualHalfBox, !myTopItem.isCurrentWeek && { opacity: 0.65 }]}>
-              <Text style={styles.dualMineTag} numberOfLines={1}>
+              <Text style={styles.dualMineTag} numberOfLines={1} maxFontSizeMultiplier={1.1}>
                 我{!myTopItem.isCurrentWeek ? '(非)' : ''}
               </Text>
-              <Text style={styles.dualMineName} numberOfLines={spanCount >= 3 ? 2 : 1}>
+              <Text
+                style={styles.dualMineName}
+                numberOfLines={spanCount >= 3 ? 2 : 1}
+                maxFontSizeMultiplier={1.1}
+              >
                 {myTopItem.course.name}
               </Text>
-              <Text style={styles.dualRoomText} numberOfLines={1}>
+              <Text style={styles.dualRoomText} numberOfLines={1} maxFontSizeMultiplier={1.1}>
                 @{myTopItem.course.location}
               </Text>
             </View>
             <View style={styles.dualDivider} />
             <View style={[styles.dualHalfBox, !partnerTopItem.isCurrentWeek && { opacity: 0.65 }]}>
-              <Text style={styles.dualPartnerTag} numberOfLines={1}>
+              <Text style={styles.dualPartnerTag} numberOfLines={1} maxFontSizeMultiplier={1.1}>
                 {partnerName}{!partnerTopItem.isCurrentWeek ? '(非)' : ''}
               </Text>
-              <Text style={styles.dualPartnerName} numberOfLines={spanCount >= 3 ? 2 : 1}>
+              <Text
+                style={styles.dualPartnerName}
+                numberOfLines={spanCount >= 3 ? 2 : 1}
+                maxFontSizeMultiplier={1.1}
+              >
                 {partnerTopItem.course.name}
               </Text>
-              <Text style={styles.dualRoomText} numberOfLines={1}>
+              <Text style={styles.dualRoomText} numberOfLines={1} maxFontSizeMultiplier={1.1}>
                 @{partnerTopItem.course.location}
               </Text>
             </View>
@@ -413,6 +463,7 @@ export const ScheduleScreen: React.FC<Props> = ({
                   },
                 ]}
                 numberOfLines={1}
+                maxFontSizeMultiplier={1.1}
               >
                 {viewMode === 'couple'
                   ? cluster.isSameCourseTogether
@@ -420,42 +471,68 @@ export const ScheduleScreen: React.FC<Props> = ({
                     : primary.owner === 'partner'
                       ? `${partnerName}${!primary.isCurrentWeek ? '·非本周' : ''}`
                       : `我${!primary.isCurrentWeek ? '·非本周' : ''}`
-                  : '[非本周]'}
+                  : totalInSlot >= 2
+                    ? `非本周·${totalInSlot}门`
+                    : '非本周'}
               </Text>
             )}
 
             <Text
-              style={[
-                styles.cardName,
-                { color: theme.text },
-                cornerBadgeText ? { paddingRight: 26 } : null,
-              ]}
-              numberOfLines={secondCurrentWeekItem ? 2 : 3}
+              style={[styles.cardName, { color: theme.text }]}
+              numberOfLines={nameMaxLines}
+              maxFontSizeMultiplier={1.15}
             >
               {primary.course.name}
             </Text>
 
-            <Text style={[styles.cardRoom, { color: theme.subtext }]} numberOfLines={1}>
+            <Text
+              style={[styles.cardRoom, { color: theme.subtext }]}
+              numberOfLines={spanCount >= 3 ? 2 : 1}
+              maxFontSizeMultiplier={1.1}
+            >
               @{primary.course.location}
             </Text>
 
             {!primary.isCurrentWeek && !secondCurrentWeekItem && (
-              <Text style={styles.nonWeekRangeText} numberOfLines={1}>
+              <Text style={styles.nonWeekRangeText} numberOfLines={1} maxFontSizeMultiplier={1.1}>
                 {primary.course.weekText}
               </Text>
             )}
 
-            {primary.isCurrentWeek && !secondCurrentWeekItem && spanCount >= 2 && (
-              <Text style={[styles.cardTeacher, { color: theme.subtext }]} numberOfLines={1}>
-                {primary.course.teacher}
-              </Text>
-            )}
+            {primary.isCurrentWeek &&
+              !secondCurrentWeekItem &&
+              (spanCount >= 3 || (spanCount >= 2 && !topBadgeText)) && (
+                <Text
+                  style={[styles.cardTeacher, { color: theme.subtext }]}
+                  numberOfLines={1}
+                  maxFontSizeMultiplier={1.1}
+                >
+                  {primary.course.teacher}
+                </Text>
+              )}
 
             {/* Preview strip ONLY when >= 2 courses are BOTH taught in the current selectedWeek */}
             {secondCurrentWeekItem && spanCount >= 2 && (
               <View style={styles.secondCourseStrip}>
-                <Text style={styles.secondCourseStripText} numberOfLines={1}>
+                <Text
+                  style={styles.secondCourseStripText}
+                  numberOfLines={1}
+                  maxFontSizeMultiplier={1.1}
+                >
                   +{secondCurrentWeekItem.course.name}
+                </Text>
+              </View>
+            )}
+
+            {/* Bottom slim indicator when another week's course shares this slot (zero squeeze on title!) */}
+            {bottomOtherWeekText && !secondCurrentWeekItem && (
+              <View style={styles.otherWeekFooterPill}>
+                <Text
+                  style={styles.otherWeekFooterText}
+                  numberOfLines={1}
+                  maxFontSizeMultiplier={1.05}
+                >
+                  {bottomOtherWeekText}
                 </Text>
               </View>
             )}
@@ -1320,7 +1397,8 @@ const styles = StyleSheet.create({
     position: 'absolute',
     borderRadius: 8,
     borderLeftWidth: 3,
-    padding: 4,
+    paddingHorizontal: 3.5,
+    paddingVertical: 3.5,
     overflow: 'hidden',
   },
   courseCardNonCurrent: {
@@ -1333,43 +1411,59 @@ const styles = StyleSheet.create({
     borderBottomWidth: 2.5,
     borderBottomColor: 'rgba(15, 23, 42, 0.16)',
   },
-  multiCornerBadge: {
-    position: 'absolute',
-    top: 2,
-    right: 2,
+  inlineTopBadge: {
+    alignSelf: 'flex-start',
+    maxWidth: '100%',
     paddingHorizontal: 4,
     paddingVertical: 1,
-    borderRadius: 5,
-    zIndex: 5,
+    borderRadius: 4,
+    marginBottom: 2,
   },
-  multiCornerBadgeText: {
-    fontSize: 8.5,
+  inlineTopBadgeText: {
+    fontSize: 8,
+    lineHeight: 10,
     fontWeight: '800',
     color: COLORS.white,
   },
+  otherWeekFooterPill: {
+    marginTop: 'auto',
+    alignSelf: 'stretch',
+    backgroundColor: 'rgba(100, 116, 139, 0.14)',
+    borderRadius: 4,
+    paddingHorizontal: 2,
+    paddingVertical: 1,
+  },
+  otherWeekFooterText: {
+    fontSize: 7.5,
+    lineHeight: 9.5,
+    fontWeight: '700',
+    color: '#475569',
+    textAlign: 'center',
+  },
   prefixTagText: {
     fontSize: 8.5,
+    lineHeight: 10.5,
     fontWeight: '800',
     marginBottom: 1,
   },
   cardName: {
     fontSize: 10.5,
     fontWeight: '700',
-    lineHeight: 13.5,
+    lineHeight: 13,
   },
   cardRoom: {
     fontSize: 9,
-    marginTop: 2,
-    lineHeight: 11.5,
+    marginTop: 1.5,
+    lineHeight: 11,
   },
   nonWeekRangeText: {
     fontSize: 8.5,
     color: '#64748B',
-    marginTop: 2,
+    marginTop: 1.5,
   },
   cardTeacher: {
     fontSize: 8.5,
-    marginTop: 2,
+    marginTop: 1.5,
     opacity: 0.85,
   },
   secondCourseStrip: {
@@ -1387,7 +1481,6 @@ const styles = StyleSheet.create({
   dualPartnerWrap: {
     flex: 1,
     justifyContent: 'space-between',
-    paddingTop: 10,
   },
   dualHalfBox: {
     flex: 1,
