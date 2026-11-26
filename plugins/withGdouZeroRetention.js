@@ -649,7 +649,7 @@ import WidgetKit
 import ActivityKit
 #endif
 #if canImport(PhotosUI)
-import PhotosUI
+@preconcurrency import PhotosUI
 #endif
 #if canImport(AlarmKit)
 import AlarmKit
@@ -1690,6 +1690,11 @@ final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDeleg
   private var continuation: CheckedContinuation<String?, Never>?
   private static var activeCoordinator: GdouIosPhotoPickerCoordinator?
 
+  static func presentPicker() async -> String? {
+    let coordinator = GdouIosPhotoPickerCoordinator()
+    return await coordinator.present()
+  }
+
   func present() async -> String? {
     await withCheckedContinuation { cont in
       self.continuation = cont
@@ -1698,7 +1703,7 @@ final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDeleg
         self.finish(with: nil)
         return
       }
-      var cfg = PHPickerConfiguration(photoLibrary: .shared())
+      var cfg = PHPickerConfiguration()
       cfg.selectionLimit = 1
       cfg.filter = .images
       let picker = PHPickerViewController(configuration: cfg)
@@ -1718,6 +1723,21 @@ final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDeleg
     return top
   }
 
+  nonisolated private static func persistPickedImage(_ object: Any?) -> String? {
+    guard let image = object as? UIImage,
+          let jpegData = image.jpegData(compressionQuality: 0.88),
+          let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+      return nil
+    }
+    let dir = docs.appendingPathComponent("gdou-wallpaper", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let target = dir.appendingPathComponent("custom-bg-\\(Int(Date().timeIntervalSince1970)).jpg")
+    if (try? jpegData.write(to: target, options: .atomic)) != nil {
+      return target.absoluteString
+    }
+    return nil
+  }
+
   private func finish(with uri: String?) {
     let cont = self.continuation
     self.continuation = nil
@@ -1725,35 +1745,21 @@ final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDeleg
     cont?.resume(returning: uri)
   }
 
-  nonisolated func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-    Task { @MainActor in
-      self.finish(with: nil)
-    }
+  func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+    self.finish(with: nil)
   }
 
-  nonisolated func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-    Task { @MainActor in
-      picker.dismiss(animated: true)
-      guard let provider = results.first?.itemProvider,
-            provider.canLoadObject(ofClass: UIImage.self) else {
-        self.finish(with: nil)
-        return
-      }
-      provider.loadObject(ofClass: UIImage.self) { object, _ in
-        var savedUri: String? = nil
-        if let image = object as? UIImage,
-           let jpegData = image.jpegData(compressionQuality: 0.88),
-           let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-          let dir = docs.appendingPathComponent("gdou-wallpaper", isDirectory: true)
-          try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-          let target = dir.appendingPathComponent("custom-bg-\\(Int(Date().timeIntervalSince1970)).jpg")
-          if (try? jpegData.write(to: target, options: .atomic)) != nil {
-            savedUri = target.absoluteString
-          }
-        }
-        Task { @MainActor in
-          self.finish(with: savedUri)
-        }
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    guard let provider = results.first?.itemProvider,
+          provider.canLoadObject(ofClass: UIImage.self) else {
+      self.finish(with: nil)
+      return
+    }
+    provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+      let savedUri = Self.persistPickedImage(object)
+      Task { @MainActor in
+        self?.finish(with: savedUri)
       }
     }
   }
@@ -1797,7 +1803,7 @@ enum GdouIosWidgetBridge {
       #if canImport(ActivityKit)
       if #available(iOS 16.2, *) {
         for activity in Activity<GdouScheduleActivityAttributes>.activities {
-          await activity.end(nil, dismissalPolicy: .immediate)
+          await activity.end(activity.content, dismissalPolicy: .immediate)
         }
         return encodeJSON(["ok": true, "active": false])
       }
@@ -1853,9 +1859,7 @@ enum GdouIosWidgetBridge {
 
     if path.hasSuffix("/pick-background") {
       #if canImport(PhotosUI)
-      let uri = await MainActor.run { () async -> String? in
-        await GdouIosPhotoPickerCoordinator().present()
-      }
+      let uri = await GdouIosPhotoPickerCoordinator.presentPicker()
       if let uri = uri {
         return encodeJSON(["ok": true, "uri": uri])
       }
@@ -2431,6 +2435,45 @@ public nonisolated struct GdouScheduleActivityAttributes: ActivityAttributes {
 #endif
 `;
 
+const IOS_WIDGET_ACTIVITY_ATTRIBUTES_SWIFT = `#if canImport(ActivityKit)
+import ActivityKit
+import Foundation
+
+public struct GdouScheduleActivityAttributes: ActivityAttributes {
+  public struct ContentState: Codable, Hashable, Sendable {
+    public var weekLabel: String
+    public var headline: String
+    public var room: String
+    public var timeSpan: String
+    public var subline: String
+    public var state: String
+
+    public init(
+      weekLabel: String,
+      headline: String,
+      room: String,
+      timeSpan: String,
+      subline: String,
+      state: String
+    ) {
+      self.weekLabel = weekLabel
+      self.headline = headline
+      self.room = room
+      self.timeSpan = timeSpan
+      self.subline = subline
+      self.state = state
+    }
+  }
+
+  public var termLabel: String
+
+  public init(termLabel: String) {
+    self.termLabel = termLabel
+  }
+}
+#endif
+`;
+
 function buildIosWidgetExtensionSwift(appGroupId) {
   return `import Foundation
 import SwiftUI
@@ -2553,7 +2596,7 @@ struct GdouScheduleWidgetEntryView: View {
                 .font(.caption2)
                 .foregroundColor(Color.white.opacity(0.85))
             } else {
-              ForEach(items.prefix(3), id: \\.self) { row in
+              ForEach(Array(items.prefix(3)), id: \\.self) { row in
                 HStack(spacing: 6) {
                   Text(row.time)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -2615,7 +2658,6 @@ struct GdouScheduleHomeWidget: Widget {
 }
 
 #if canImport(ActivityKit)
-@available(iOS 16.2, *)
 struct GdouScheduleLiveActivityWidget: Widget {
   var body: some WidgetConfiguration {
     ActivityConfiguration(for: GdouScheduleActivityAttributes.self) { context in
@@ -2687,9 +2729,7 @@ struct GdouScheduleWidgetBundle: WidgetBundle {
   var body: some Widget {
     GdouScheduleHomeWidget()
     #if canImport(ActivityKit)
-    if #available(iOS 16.2, *) {
-      GdouScheduleLiveActivityWidget()
-    }
+    GdouScheduleLiveActivityWidget()
     #endif
   }
 }
@@ -3060,7 +3100,7 @@ function withGdouIosNativeFiles(config) {
       );
       fs.writeFileSync(
         path.join(widgetDir, 'GdouWidgetActivityAttributes.swift'),
-        IOS_ACTIVITY_ATTRIBUTES_SWIFT,
+        IOS_WIDGET_ACTIVITY_ATTRIBUTES_SWIFT,
         'utf8'
       );
       fs.writeFileSync(
@@ -3134,7 +3174,22 @@ function withGdouIosXcodeSource(config) {
     );
 
     if (!hasWidgetTarget) {
+      // Ensure pbxproj object sections exist before addTarget so addTargetDependency
+      // and CopyFiles build phase are wired cleanly on fresh Expo prebuild projects.
+      if (!pbxProject.hash.project.objects.PBXTargetDependency) {
+        pbxProject.hash.project.objects.PBXTargetDependency = {};
+      }
+      if (!pbxProject.hash.project.objects.PBXContainerItemProxy) {
+        pbxProject.hash.project.objects.PBXContainerItemProxy = {};
+      }
+      if (!pbxProject.hash.project.objects.PBXCopyFilesBuildPhase) {
+        pbxProject.hash.project.objects.PBXCopyFilesBuildPhase = {};
+      }
+
       const widgetGroupKey = pbxProject.pbxCreateGroup(widgetTargetName, widgetTargetName);
+      if (pbxProject.hash.project.objects.PBXGroup?.[widgetGroupKey]) {
+        pbxProject.hash.project.objects.PBXGroup[widgetGroupKey].isa = 'PBXGroup';
+      }
       const rootProject = pbxProject.getFirstProject().firstProject;
       pbxProject.addToPbxGroup(widgetGroupKey, rootProject.mainGroup);
 
@@ -3151,16 +3206,40 @@ function withGdouIosXcodeSource(config) {
 
       pbxProject.addSourceFile(
         'GdouScheduleWidget.swift',
-        { target: widgetTarget.uuid },
+        { target: widgetTarget.uuid, lastKnownFileType: 'sourcecode.swift' },
         widgetGroupKey
       );
       pbxProject.addSourceFile(
         'GdouWidgetActivityAttributes.swift',
-        { target: widgetTarget.uuid },
+        { target: widgetTarget.uuid, lastKnownFileType: 'sourcecode.swift' },
         widgetGroupKey
       );
       pbxProject.addFile('Info.plist', widgetGroupKey);
       pbxProject.addFile('GdouScheduleWidgetExtension.entitlements', widgetGroupKey);
+
+      // Sanitize node-xcode undefined serialization quirks on PBXFileReference entries
+      // (explicitFileType = undefined causes xcodebuild to ignore Swift files).
+      const allFileRefs = pbxProject.pbxFileReferenceSection();
+      for (const ref of Object.values(allFileRefs)) {
+        if (!ref || typeof ref !== 'object') continue;
+        for (const k of ['explicitFileType', 'lastKnownFileType', 'fileEncoding']) {
+          if (ref[k] === undefined || ref[k] === 'undefined') {
+            delete ref[k];
+          }
+        }
+      }
+
+      // Add standard RemoveHeadersOnCopy attribute to the embedded .appex Copy Files build file
+      const allBuildFiles = pbxProject.pbxBuildFileSection();
+      for (const bf of Object.values(allBuildFiles)) {
+        if (!bf || typeof bf !== 'object') continue;
+        if (
+          typeof bf.fileRef_comment === 'string' &&
+          bf.fileRef_comment.includes(`${widgetTargetName}.appex`)
+        ) {
+          bf.settings = { ATTRIBUTES: ['RemoveHeadersOnCopy'] };
+        }
+      }
 
       const xcConfigLists = pbxProject.pbxXCConfigurationList();
       const buildConfigs = pbxProject.pbxXCBuildConfigurationSection();
@@ -3169,20 +3248,30 @@ function withGdouIosXcodeSource(config) {
         for (const cfgRef of targetConfigList.buildConfigurations) {
           const cfg = buildConfigs[cfgRef.value];
           if (!cfg || !cfg.buildSettings) continue;
+          cfg.buildSettings.SDKROOT = 'iphoneos';
           cfg.buildSettings.PRODUCT_BUNDLE_IDENTIFIER = `"${widgetBundleId}"`;
           cfg.buildSettings.INFOPLIST_FILE = `"${widgetTargetName}/Info.plist"`;
           cfg.buildSettings.CODE_SIGN_ENTITLEMENTS = `"${widgetTargetName}/GdouScheduleWidgetExtension.entitlements"`;
           cfg.buildSettings.SWIFT_VERSION = '5.0';
+          cfg.buildSettings.SWIFT_DEFAULT_ACTOR_ISOLATION = 'nonisolated';
           cfg.buildSettings.IPHONEOS_DEPLOYMENT_TARGET = '16.2';
           cfg.buildSettings.TARGETED_DEVICE_FAMILY = '"1,2"';
           cfg.buildSettings.SKIP_INSTALL = 'YES';
           cfg.buildSettings.GENERATE_INFOPLIST_FILE = 'NO';
           cfg.buildSettings.APPLICATION_EXTENSION_API_ONLY = 'YES';
+          cfg.buildSettings.ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = 'NO';
           cfg.buildSettings.CLANG_ENABLE_MODULES = 'YES';
+          cfg.buildSettings.CODE_SIGN_STYLE = 'Automatic';
           cfg.buildSettings.MARKETING_VERSION = `"${version}"`;
           cfg.buildSettings.CURRENT_PROJECT_VERSION = `"${buildNumber}"`;
           cfg.buildSettings.LD_RUNPATH_SEARCH_PATHS =
             '"$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"';
+          if (cfg.name === 'Release') {
+            cfg.buildSettings.SWIFT_OPTIMIZATION_LEVEL = '"-O"';
+            cfg.buildSettings.SWIFT_COMPILATION_MODE = 'wholemodule';
+          } else {
+            cfg.buildSettings.SWIFT_OPTIMIZATION_LEVEL = '"-Onone"';
+          }
         }
       }
     }

@@ -192,8 +192,18 @@ jobs:
             const xcodeproj = fs.readdirSync("ios").find((d) => d.endsWith(".xcodeproj"));
             const pbx = fs.readFileSync(path.join("ios", xcodeproj, "project.pbxproj"), "utf8");
             const phases = pbx.match(/\/\* Begin PBXSourcesBuildPhase section \*\/[\s\S]*?\/\* End PBXSourcesBuildPhase section \*\//);
-            if (!phases || !phases[0].includes("GdouEphemeralNetworking.swift")) {
-              console.error("ERROR: GdouEphemeralNetworking.swift is NOT compiled in PBXSourcesBuildPhase!");
+            for (const f of ["GdouEphemeralNetworking.swift", "GdouScheduleActivityAttributes.swift", "GdouScheduleWidget.swift", "GdouWidgetActivityAttributes.swift"]) {
+              if (!phases || !phases[0].includes(f)) {
+                console.error("ERROR: " + f + " is NOT compiled in PBXSourcesBuildPhase!");
+                process.exit(1);
+              }
+            }
+            if (!pbx.includes("PBXTargetDependency")) {
+              console.error("ERROR: Missing PBXTargetDependency for GdouScheduleWidgetExtension!");
+              process.exit(1);
+            }
+            if (pbx.includes("= undefined;")) {
+              console.error("ERROR: Found undefined property in project.pbxproj!");
               process.exit(1);
             }
           '
@@ -205,6 +215,7 @@ jobs:
       - name: Build iOS Release App (Unsigned)
         working-directory: ios
         run: |
+          set -o pipefail
           WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
           SCHEME_FILE=$(find *.xcodeproj/xcshareddata/xcschemes -maxdepth 1 -name "*.xcscheme" 2>/dev/null | head -n 1)
           if [ -n "$SCHEME_FILE" ]; then
@@ -213,7 +224,8 @@ jobs:
             SCHEME=$(basename "$WORKSPACE" .xcworkspace)
           fi
           echo "Building workspace=$WORKSPACE scheme=$SCHEME"
-          xcodebuild \
+          mkdir -p build
+          if ! xcodebuild \
             -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
@@ -224,7 +236,12 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            build
+            build 2>&1 | tee build/xcodebuild.log; then
+            grep -E "(^.*error:|fatal error:|\*\* BUILD FAILED \*\*)" build/xcodebuild.log | tail -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
 
       - name: Package .app into installable unsigned .ipa (ad-hoc signed for iOS 18 re-signing)
         working-directory: ios
