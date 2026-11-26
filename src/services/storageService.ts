@@ -1,5 +1,9 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createDefaultSettings, deriveCurrentTermParams } from '../constants/gdouTimetable';
+import {
+  createDefaultSettings,
+  DEFAULT_SCHEDULE_APPEARANCE,
+  deriveCurrentTermParams,
+} from '../constants/gdouTimetable';
 import { PersistedAppData } from '../types/models';
 import {
   findForbiddenCredentialKeys,
@@ -10,7 +14,7 @@ import {
 export { FORBIDDEN_CREDENTIAL_KEYS, findForbiddenCredentialKeys, sanitizeForZeroRetention };
 
 const STORAGE_KEY = '@gdou_schedule_data_v1';
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export function createInitialAppData(now: Date = new Date()): PersistedAppData {
   const term = deriveCurrentTermParams(now);
@@ -21,6 +25,10 @@ export function createInitialAppData(now: Date = new Date()): PersistedAppData {
     grades: [],
     alarms: [],
     coupleSchedule: null,
+    graduationAudit: null,
+    lastScheduleDiff: null,
+    emptyClassroomSnapshot: null,
+    campusSearchHistory: null,
     termLabel: term.label,
     academicYear: term.xnm,
     semesterCode: term.xqm,
@@ -49,18 +57,31 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
             updatedAtIso: String(rawCouple.updatedAtIso || new Date().toISOString()),
           }
         : null;
+    const mergedSettings = {
+      ...defaults.settings,
+      ...(parsed.settings ?? {}),
+      appearance: {
+        ...DEFAULT_SCHEDULE_APPEARANCE,
+        ...(parsed.settings?.appearance ?? {}),
+      },
+      calendarOverrides: Array.isArray(parsed.settings?.calendarOverrides)
+        ? parsed.settings.calendarOverrides
+        : [],
+    };
     return {
       ...defaults,
       ...parsed,
+      schemaVersion: SCHEMA_VERSION,
       courses: Array.isArray(parsed.courses) ? parsed.courses : [],
       exams: Array.isArray(parsed.exams) ? parsed.exams : [],
       grades: Array.isArray(parsed.grades) ? parsed.grades : [],
       alarms: Array.isArray(parsed.alarms) ? parsed.alarms : [],
       coupleSchedule,
-      settings: {
-        ...defaults.settings,
-        ...(parsed.settings ?? {}),
-      },
+      graduationAudit: parsed.graduationAudit ?? null,
+      lastScheduleDiff: parsed.lastScheduleDiff ?? null,
+      emptyClassroomSnapshot: parsed.emptyClassroomSnapshot ?? null,
+      campusSearchHistory: parsed.campusSearchHistory ?? null,
+      settings: mergedSettings,
     };
   } catch {
     return createInitialAppData();

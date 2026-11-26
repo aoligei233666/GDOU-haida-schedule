@@ -58,6 +58,10 @@ jobs:
         run: |
           grep -q "GdouEphemeralCookieJar" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q "GdouOtaBundle" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
+          grep -q "GdouScheduleWidgetProvider" android/app/src/main/java/cn/edu/gdou/schedule/GdouScheduleWidgetProvider.kt
+          grep -q "GdouOngoingNotificationHelper" android/app/src/main/java/cn/edu/gdou/schedule/GdouScheduleWidgetProvider.kt
+          grep -q "GdouMediaPickerActivity" android/app/src/main/java/cn/edu/gdou/schedule/GdouMediaPickerActivity.kt
+          grep -q "GdouScheduleWidgetProvider" android/app/src/main/AndroidManifest.xml
           grep -q "X-Gdou-Clear-Cookies-After" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q 'android:allowBackup="false"' android/app/src/main/AndroidManifest.xml
           grep -q 'android:usesCleartextTraffic="false"' android/app/src/main/AndroidManifest.xml
@@ -166,9 +170,12 @@ jobs:
           fi
           grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
           grep -q "GdouIosAlarmBridge" "$SWIFT_FILE"
+          grep -q "GdouIosWidgetBridge" "$SWIFT_FILE"
           grep -q "AlarmManager.shared" "$SWIFT_FILE"
           grep -q "GdouOtaBundle" "$SWIFT_FILE"
           grep -q "NSAlarmKitUsageDescription" ios/*/Info.plist
+          grep -q "NSSupportsLiveActivities" ios/*/Info.plist
+          grep -q "GdouScheduleWidgetBundle" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider" "$SWIFT_FILE"
           grep -q "readBodyStream" "$SWIFT_FILE"
           grep -q "if didRedirect {" "$SWIFT_FILE"
@@ -227,13 +234,19 @@ jobs:
             echo "ERROR: .app bundle not found"
             exit 1
           fi
-          # Bottom-up ad-hoc sign all embedded frameworks/dylibs first, then the main .app bundle,
+          # Bottom-up ad-hoc sign all embedded frameworks/dylibs and app extensions (.appex) first, then the main .app bundle,
           # so every Mach-O binary has a valid LC_CODE_SIGNATURE slot & _CodeSignature/CodeResources
           # for maximum compatibility with Feather / ESign / i4Tools / SideStore on iOS 18+.
           if [ -d "$APP_PATH/Frameworks" ]; then
             find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' fw; do
               echo "Ad-hoc signing embedded binary: $fw"
               codesign --force --sign - --timestamp=none "$fw"
+            done
+          fi
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            find "$APP_PATH/PlugIns" -maxdepth 1 -name "*.appex" -print0 | while IFS= read -r -d '' ext; do
+              echo "Ad-hoc signing embedded app extension: $ext"
+              codesign --force --sign - --timestamp=none "$ext"
             done
           fi
           codesign --force --sign - --timestamp=none "$APP_PATH"

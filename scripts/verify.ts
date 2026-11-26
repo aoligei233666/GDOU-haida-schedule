@@ -3,7 +3,11 @@ import appJson from '../app.json';
 import pkgLockJson from '../package-lock.json';
 import pkgJson from '../package.json';
 import {
+  buildCampusCourseSearchParams,
+  buildEmptyClassroomQueryParams,
+  buildZhengfangBitmask,
   ensureAuthLoginServiceParam,
+  extractSafeHostname,
   GDOU_AUTH_WFW_BASE,
   GDOU_JW_SSO_SERVICE,
   GDOU_JW_WFW_SSO_SERVICE,
@@ -44,14 +48,31 @@ import {
   MfaChallengeState,
   PreparedAuthSession,
   prepareGdouAuthSession,
+  probeGdouNetworkRoute,
   submitGdouMfaAndCompleteSync,
 } from '../src/services/gdouAuth';
+import {
+  buildGdouCalendarCountdowns,
+  buildTodayLiveSnapshot,
+  getCoursesForDate,
+  resolveEffectiveScheduleDate,
+} from '../src/services/academicCalendar';
+import {
+  buildLocalEstimatedGraduationAudit,
+  parseEmptyClassroomOptionsHtml,
+  parseZfCampusCourseSearchResponse,
+  parseZfEmptyClassroomsResponse,
+  parseZfGraduationAuditResponse,
+} from '../src/services/campusToolsParser';
 import {
   computeGpaSummary,
   computeScoreDistribution,
   computeTermBreakdowns,
   parseZfGradesResponse,
+  parseZfGradeSubScoresResponse,
 } from '../src/services/gradeParser';
+import { computeScheduleDiff } from '../src/services/scheduleDiff';
+import { buildSchedulePosterHtml } from '../src/services/schedulePosterBuilder';
 import { buildGdouIcsContent, foldIcsLine } from '../src/services/icsBuilder';
 import {
   getCourseOccurrences,
@@ -211,6 +232,7 @@ async function run() {
     }) as typeof fetch;
 
     let timedOutCaught = false;
+    let timedOutHostIncluded = false;
     try {
       await fetchWithTimeout(
         'https://authserver.gdou.edu.cn/test',
@@ -224,9 +246,20 @@ async function run() {
         { timeoutMs: 40 }
       );
     } catch (err) {
-      timedOutCaught = (err instanceof Error ? err.message : '').includes('请求超时');
+      const m = err instanceof Error ? err.message : '';
+      timedOutCaught = m.includes('请求超时');
+      timedOutHostIncluded = m.includes('authserver.gdou.edu.cn');
     }
     assert.ok(timedOutCaught, 'fetchWithTimeout must abort hanging requests');
+    assert.ok(timedOutHostIncluded, 'fetchWithTimeout error must include safe target hostname');
+    let jwTimeoutGuided = false;
+    try {
+      await fetchWithTimeout('https://jw.gdou.edu.cn/sso/jziotlogin?ticket=SECRET', {}, { timeoutMs: 30 });
+    } catch (err) {
+      const m = err instanceof Error ? err.message : '';
+      jwTimeoutGuided = m.includes('校外微门户') && !m.includes('SECRET');
+    }
+    assert.ok(jwTimeoutGuided, 'Bare jw timeout must guide to 校外微门户 without leaking ticket');
     assert.equal(
       Object.keys(observedHeaders[0] || {}).some((k) => k.toLowerCase().startsWith('x-gdou-')),
       false,
@@ -330,10 +363,25 @@ async function run() {
       'Off-campus bare jw.gdou.edu.cn callback must be wrapped inside wfw'
     );
     assert.equal(
+      healWfwWrongSsoUrl('https://jw.gdou.edu.cn:443/sso/jziotlogin?ticket=ST-333', true),
+      'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-333',
+      'Off-campus bare jw.gdou.edu.cn:443 callback must strip default port and wrap inside wfw'
+    );
+    assert.equal(
+      healWfwWrongSsoUrl('https://jw.gdou.edu.cn?ticket=ST-444', true),
+      'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/?ticket=ST-444',
+      'Off-campus bare jw.gdou.edu.cn?query callback must normalize leading slash inside wfw'
+    );
+    assert.equal(
       healWfwWrongSsoUrl('https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-222', false),
       null,
       'Campus direct mode must leave jw.gdou.edu.cn untouched'
     );
+    assert.equal(
+      extractSafeHostname('https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=ST-SECRET'),
+      'wfw.gdou.edu.cn'
+    );
+    assert.equal(extractSafeHostname('not-a-valid-url'), '');
     assert.equal(
       ensureAuthLoginServiceParam(
         'https://authserver.gdou.edu.cn/authserver/login',
@@ -556,6 +604,72 @@ async function run() {
       }
       assert.equal(logoutCalledDuringMfaHandoff, true, 'Must log out after Step 2 completes');
     }
+
+    // 3f. Fast 1-hop netcheck route probe + unreachable jw.gdou.edu.cn auto-fallback to wfw + explicit routePref
+    const probeHits: string[] = [];
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      probeHits.push(url);
+      if (url.includes('netcheck.gdou.edu.cn')) {
+        return {
+          ok: false,
+          status: 302,
+          url,
+          headers: new Headers({ location: 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn' }),
+          text: async () => '',
+        } as unknown as Response;
+      }
+      throw new Error('Unexpected fetch during fast wfw netcheck: ' + url);
+    }) as typeof fetch;
+    const fastWfwProbe = await probeGdouNetworkRoute({ timeoutMs: 2000 });
+    assert.equal(fastWfwProbe.isWebVpn, true, '302 to wfw must immediately resolve isWebVpn=true');
+    assert.equal(probeHits.length, 1, 'Fast 1-hop wfw netcheck must not follow extra redirects');
+
+    // Misclassified carrier IP: netcheck says campus jw, but direct jw TCP fails -> must auto-fallback to wfw!
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('netcheck.gdou.edu.cn')) {
+        return {
+          ok: false,
+          status: 302,
+          url,
+          headers: new Headers({ location: 'https://jw.gdou.edu.cn/sso/jziotlogin' }),
+          text: async () => '',
+        } as unknown as Response;
+      }
+      if (url.includes('jw.gdou.edu.cn')) {
+        throw new Error('TCP SYN timeout');
+      }
+      return makeMockResponse(200, 'ok', url);
+    }) as typeof fetch;
+    const misclassifiedProbe = await probeGdouNetworkRoute({ timeoutMs: 2000 });
+    assert.equal(
+      misclassifiedProbe.isWebVpn,
+      true,
+      'Unreachable bare jw.gdou.edu.cn must override netcheck and fall back to wfw'
+    );
+
+    // Explicit routePref='wfw' skips netcheck completely
+    let netcheckTouched = false;
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('netcheck.gdou.edu.cn')) {
+        netcheckTouched = true;
+        throw new Error('netcheck should be skipped when routePref=wfw');
+      }
+      if (url.startsWith('https://authserver.gdou.edu.cn/authserver/login')) {
+        return makeMockResponse(
+          200,
+          '<input id="pwdEncryptSalt" value="DirectWfwSalt123"/><input name="execution" value="e9s1"/>',
+          url
+        );
+      }
+      return makeMockResponse(200, 'ok', url);
+    }) as typeof fetch;
+    const forcedWfwSession = await prepareGdouAuthSession({ routePref: 'wfw' });
+    assert.equal(netcheckTouched, false, 'Explicit routePref=wfw must skip netcheck');
+    assert.equal(forcedWfwSession.isWebVpn, true);
+    assert.equal(forcedWfwSession.pwdEncryptSalt, 'DirectWfwSalt123');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -931,6 +1045,13 @@ async function run() {
     pluginSrc.includes('GdouOtaBundle') && pluginSrc.includes('resolveBundleURL'),
     'Native plugin must include GdouOtaBundle for iOS & Android in-app GitHub hot-updates'
   );
+  assert.ok(
+    pluginSrc.includes('gdouConnectionPool') &&
+      pluginSrc.includes('retryOnConnectionFailure(true)') &&
+      pluginSrc.includes('hasWfwSession') &&
+      pluginSrc.includes('X-Gdou-Direct-Probe'),
+    'Native plugin must configure short-TTL OkHttp ConnectionPool, retryOnConnectionFailure, hasWfwSession guard & X-Gdou-Direct-Probe stripping'
+  );
   const modalSrc = nodeFs.readFileSync(
     nodePath.join(process.cwd(), 'src', 'components', 'EphemeralSyncModal.tsx'),
     'utf8'
@@ -940,8 +1061,11 @@ async function run() {
     'EphemeralSyncModal must NOT mutate WebView source prop during onShouldStartLoadWithRequest (causes iOS 302 race)'
   );
   assert.ok(
-    modalSrc.includes('injectedJavaScriptBeforeContentLoaded={preloadedWebViewJs}'),
-    'EphemeralSyncModal must pass document-start preload script to WebView'
+    modalSrc.includes('injectedJavaScriptBeforeContentLoaded={preloadedWebViewJs}') &&
+      modalSrc.includes('onLoadStart={') &&
+      modalSrc.includes('onHttpError={') &&
+      modalSrc.includes('handleSelectDirectRoute'),
+    'EphemeralSyncModal must pass document-start preload script, Direct Mode route selector, onLoadStart bare-jw slip guard & onHttpError handler'
   );
 
   console.log('8b) Testing v1.4.0 multi-course overlap clustering, non-current-week view, Couple Schedule & OTA updater...');
@@ -1219,6 +1343,205 @@ async function run() {
   }
 
   console.log(`   OK: Calendar legacy guard, updater, v1.4.0 overlap/couple/OTA checks, single-source version v${appJson.expo.version} & config plugin verified.`);
+
+  console.log('8c) Testing empty classrooms, graduation audit & sub-score source labels, diff alerts, campus search, calendar makeup, HD poster & native widgets...');
+  // 1. Empty classrooms bitmask, options HTML & rooms JSON parser
+  assert.equal(buildZhengfangBitmask([1, 2]), 3);
+  assert.equal(buildZhengfangBitmask([9, 10]), 768);
+  const ecQuery = buildEmptyClassroomQueryParams({
+    xnm: '2026',
+    xqm: '3',
+    campusId: '1',
+    buildingId: 'ZH',
+    week: 5,
+    dayOfWeek: 3,
+    sections: [1, 2],
+    minSeats: 60,
+  });
+  assert.equal(ecQuery.zcd, '16');
+  assert.equal(ecQuery.jcd, '3');
+  assert.equal(ecQuery.qszws, '60');
+  const ecOpts = parseEmptyClassroomOptionsHtml(
+    '<select id="xqh_id"><option value="">全部</option><option value="1">湖光校区</option><option value="4">阳江校区</option></select>' +
+      '<select id="lh"><option value="ZH">钟海楼</option><option value="ZL">主教学楼</option></select>' +
+      '<select id="cdlb_id"><option value="01">多媒体教室</option></select>'
+  );
+  assert.equal(ecOpts.campuses.length, 2);
+  assert.equal(ecOpts.buildings[0]?.name, '钟海楼');
+  const parsedRooms = parseZfEmptyClassroomsResponse({
+    items: [
+      { cdbh: 'ZH02018', cdmc: '钟海楼02018', jxlmc: '钟海楼', xqmc: '湖光校区', cdlbmc: '多媒体教室', zws: '120' },
+      { cdbh: 'ZL402', cdmc: '主教学楼402', xqmc: '湖光校区', cdlbmc: '普通教室', zws: '80' },
+    ],
+  });
+  assert.equal(parsedRooms.length, 2);
+  assert.equal(parsedRooms.find((r) => r.roomCode === 'ZH02018')?.seats, 120);
+
+  // 2. Graduation curriculum audit (explicit source attribution for official vs local estimate)
+  const officialAudit = parseZfGraduationAuditResponse({
+    items: [
+      { xfyqmc: '毕业总学分要求', yqzdxf: '165', yhxf: '120', zxxf: '18', zymc: '软件工程' },
+      { xfyqmc: '通识教育必修课', yqzdxf: '42', yhxf: '42', zxxf: '0', ytgms: '14' },
+      { xfyqmc: '专业核心课', yqzdxf: '58', yhxf: '40', zxxf: '12', ytgms: '11' },
+    ],
+  });
+  assert.ok(Boolean(officialAudit), 'Official curriculum audit must parse');
+  assert.equal(officialAudit?.source, 'official_zf_curriculum');
+  assert.ok(officialAudit?.sourceLabel.includes('正方教务'), 'Official audit must label 正方教务 source');
+  assert.equal(officialAudit?.totalRequiredCredits, 165);
+  assert.equal(officialAudit?.totalRemainingCredits, 45);
+  const localEstAudit = buildLocalEstimatedGraduationAudit(parsedGrades);
+  assert.equal(localEstAudit.source, 'local_grade_estimate');
+  assert.ok(localEstAudit.sourceLabel.includes('本地已修成绩'), 'Fallback audit must honestly label local estimate');
+
+  // 3. Grade sub-scores (平时分 / 实验 / 期末卷面占比) HTML & JSON parsing
+  const subFromHtml = parseZfGradeSubScoresResponse(
+    '<table id="subtab"><tr><td>【 平时(30%) 】</td><td>94</td></tr><tr><td>【 期末(70%) 】</td><td>86</td></tr></table>'
+  );
+  assert.equal(subFromHtml.length, 2);
+  assert.equal(subFromHtml[0]?.itemName, '平时');
+  assert.equal(subFromHtml[0]?.weightText, '30%');
+  assert.equal(subFromHtml[0]?.scoreText, '94');
+  const subFromJson = parseZfGradeSubScoresResponse({
+    items: [
+      { xmblmc: '平时成绩(30%)', xmcj: '95' },
+      { xmblmc: '实验成绩(20%)', xmcj: '90' },
+      { xmblmc: '期末成绩(50%)', xmcj: '88' },
+    ],
+  });
+  assert.equal(subFromJson.length, 3);
+  assert.equal(subFromJson[2]?.weightText, '50%');
+
+  // 4. Schedule diff engine (room_changed, time_changed, added, removed; ignores manual/audit)
+  const diffBase = sampleForCluster.courses.slice(0, 3);
+  const diffNext = [
+    { ...diffBase[0], location: '海博楼105' }, // room_changed
+    { ...diffBase[1], dayOfWeek: 4, startSection: 7, endSection: 8 }, // time_changed
+    // diffBase[2] removed
+    { ...diffBase[0], id: 'new-c', name: '海洋遥感概论', code: 'HY409', dayOfWeek: 5, startSection: 1, endSection: 2 },
+    { ...diffBase[0], id: 'audit-ignore', name: '旁听课', isManual: true, isAudit: true },
+  ];
+  const diffReport = computeScheduleDiff(diffBase, diffNext, '2026-2027学年 第1学期');
+  assert.ok(Boolean(diffReport), 'Schedule diff must detect changes');
+  assert.ok(diffReport?.entries.some((e) => e.kind === 'room_changed' && e.afterText === '海博楼105'));
+  assert.ok(diffReport?.entries.some((e) => e.kind === 'time_changed'));
+  assert.ok(diffReport?.entries.some((e) => e.kind === 'removed'));
+  assert.ok(diffReport?.entries.some((e) => e.kind === 'added' && e.courseName === '海洋遥感概论'));
+  assert.equal(
+    diffReport?.entries.some((e) => e.courseName === '旁听课'),
+    false,
+    'Manual/audit courses must be ignored by official diff engine'
+  );
+  assert.equal(computeScheduleDiff([], diffNext, '2026-2027学年 第1学期'), null, 'First sync must not emit diff');
+
+  // 5. Campus-wide / teacher / class course search parser
+  const campusSearchParams = buildCampusCourseSearchParams({
+    xnm: '2026',
+    xqm: '3',
+    keyword: '海洋',
+    teacher: '陈海明',
+  });
+  assert.equal(campusSearchParams.kcmc, '海洋');
+  assert.equal(campusSearchParams.jsxm, '陈海明');
+  const campusFound = parseZfCampusCourseSearchResponse({
+    items: [
+      {
+        kcmc: '海洋物理概论',
+        kch: 'HY2201',
+        jsxm: '陈海明',
+        sksj: '星期一第1-2节{1-16周};星期三第5-6节{2-16周(双)}',
+        jxdd: '钟海楼02018;科技楼305',
+        xqmc: '湖光校区',
+        xf: '3.0',
+        jxbmc: '海洋2401',
+      },
+    ],
+  });
+  assert.equal(campusFound.length, 2, 'Multi-segment sksj campus course must split into 2 scheduled slots');
+  assert.equal(campusFound[0]?.isAudit, true);
+  assert.equal(campusFound[1]?.dayOfWeek, 3);
+  assert.equal(campusFound[1]?.location, '科技楼305');
+
+  // 6. GDOU Academic Calendar & Holiday / Makeup-Day mapping
+  const holResolved = resolveEffectiveScheduleDate(new Date('2026-10-01T09:00:00'), '2026-08-31', 20);
+  assert.equal(holResolved.isHoliday, true, '2026-10-01 National Day must resolve as holiday');
+  const holCourses = getCoursesForDate(sampleForCluster.courses, new Date('2026-10-01T09:00:00'), {
+    ...settings,
+    termStartDate: '2026-08-31',
+  });
+  assert.equal(holCourses.courses.length, 0, 'Holiday must suspend regular classes');
+  const makeupResolved = resolveEffectiveScheduleDate(new Date('2026-10-10T09:00:00'), '2026-08-31', 20);
+  assert.equal(makeupResolved.isMakeup, true, '2026-10-10 makeup day must resolve as makeup');
+  assert.equal(makeupResolved.effectiveDayOfWeek, 3, '2026-10-10 makeup maps to Wednesday');
+  const makeupCourses = getCoursesForDate(sampleForCluster.courses, new Date('2026-10-10T09:00:00'), {
+    ...settings,
+    termStartDate: '2026-08-31',
+  });
+  assert.ok(makeupCourses.courses.length > 0, 'Makeup day must load Wednesday courses');
+  const todayLiveSnap = buildTodayLiveSnapshot(sampleForCluster.courses, { ...settings, termStartDate: '2026-08-31' }, new Date('2026-09-07T08:30:00'));
+  assert.equal(todayLiveSnap.state, 'ongoing', '08:30 Monday during 08:10-09:45 class must report ongoing');
+  const calCountdowns = buildGdouCalendarCountdowns('2026-08-31', 20, sampleForCluster.exams, [], new Date('2026-09-10T09:00:00'));
+  assert.ok(calCountdowns.countdowns.length >= 2);
+
+  // 7. HD Schedule Poster HTML generator & WebView auxiliary jobs syntax validation
+  const posterHtml = buildSchedulePosterHtml({
+    courses: sampleForCluster.courses,
+    coupleSchedule: null,
+    selectedWeek: 1,
+    termLabel: sampleForCluster.termLabel,
+    viewMode: 'mine',
+    settings,
+  });
+  assert.ok(posterHtml.includes('width="1240"') && posterHtml.includes('POSTER_READY'));
+  new Function(
+    buildIncognitoWebViewSyncScript(undefined, 'verify-bridge-nonce', 'https://wfw.gdou.edu.cn/', {
+      kind: 'empty_classroom',
+      params: {
+        xnm: '2026',
+        xqm: '3',
+        campusId: '1',
+        buildingId: '',
+        roomTypeId: '',
+        week: 1,
+        dayOfWeek: 1,
+        sections: [1, 2],
+      },
+    })
+  );
+  new Function(
+    buildIncognitoWebViewSyncScript(undefined, 'verify-bridge-nonce', 'https://wfw.gdou.edu.cn/', {
+      kind: 'campus_search',
+      query: { xnm: '2026', xqm: '3', keyword: '高等数学' },
+    })
+  );
+
+  // 8. Zero-retention check on all new persisted objects + native plugin Widget/Ongoing/Dynamic Island/SAF assertions
+  assert.deepEqual(
+    findForbiddenCredentialKeys({
+      graduationAudit: officialAudit,
+      lastScheduleDiff: diffReport,
+      emptyClassroomSnapshot: { rooms: parsedRooms, params: ecQuery },
+      campusSearchHistory: { courses: campusFound },
+    }),
+    [],
+    'All new persisted structures must contain ZERO forbidden credential keys or values'
+  );
+  assert.ok(
+    pluginSrc.includes('GdouScheduleWidgetProvider') &&
+      pluginSrc.includes('GdouOngoingNotificationHelper') &&
+      pluginSrc.includes('GdouMediaPickerActivity') &&
+      pluginSrc.includes('GdouMediaSaver') &&
+      pluginSrc.includes('GdouScheduleActivityAttributes') &&
+      pluginSrc.includes('GdouScheduleWidgetBundle') &&
+      pluginSrc.includes('DynamicIsland') &&
+      pluginSrc.includes('NSSupportsLiveActivities') &&
+      pluginSrc.includes('GdouIosWidgetBridge') &&
+      pluginSrc.includes('PHPickerViewController') &&
+      pluginSrc.includes('com.apple.security.application-groups') &&
+      pluginSrc.includes('GdouScheduleWidgetExtension'),
+    'Native plugin must contain Android AppWidget, Ongoing Notification, Zero-Permission SAF Picker/MediaStore, iOS WidgetKit, Dynamic Island & PHPicker'
+  );
+  console.log('   OK: All 9 new feature engines, source attributions, zero-retention & native widget plugins verified.');
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

@@ -16,8 +16,10 @@ import {
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import {
   ensureAuthLoginServiceParam,
+  extractSafeHostname,
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
+  GDOU_AUTH_WFW_BASE,
   GDOU_JW_SSO_SERVICE,
   GDOU_WFW_ORIGIN,
   healWfwWrongSsoUrl,
@@ -26,10 +28,20 @@ import {
   normalizeWfwAuthUrl,
   upgradeGdouHttpToHttps,
 } from '../constants/gdouEndpoints';
-import { deriveCurrentTermParams, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
+import { deriveCurrentTermParams } from '../constants/gdouTimetable';
 import { generateSecureHex, purgeEphemeralCredentials } from '../services/cryptoAes';
 import { parseZfExamResponse } from '../services/examParser';
 import {
+  buildLocalEstimatedGraduationAudit,
+  OFFICIAL_CAMPUS_COURSE_SOURCE_LABEL,
+  OFFICIAL_EMPTY_ROOM_SOURCE_LABEL,
+  parseEmptyClassroomOptionsHtml,
+  parseZfCampusCourseSearchResponse,
+  parseZfEmptyClassroomsResponse,
+  parseZfGraduationAuditResponse,
+} from '../services/campusToolsParser';
+import {
+  AuxiliarySyncJob,
   buildIncognitoWebViewPreloadScript,
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
@@ -39,6 +51,7 @@ import {
   fetchGdouCaptchaImage,
   fetchWfwSubAuthCaptchaImage,
   flushNativeEphemeralCookies,
+  GdouRoutePref,
   isAccountLockedMessage,
   logoutEphemeralSession,
   MfaChallengeState,
@@ -50,26 +63,40 @@ import {
   SyncResult,
   WfwSubAuthState,
 } from '../services/gdouAuth';
-import { parseZfGradesResponse } from '../services/gradeParser';
-import { parseZfPeriodTimesResponse, parseZfScheduleResponse } from '../services/scheduleParser';
+import {
+  OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
+  parseZfGradesResponse,
+  parseZfGradeSubScoresResponse,
+} from '../services/gradeParser';
+import {
+  getTodayDayOfWeek,
+  parseZfPeriodTimesResponse,
+  parseZfScheduleResponse,
+} from '../services/scheduleParser';
 import { COLORS } from '../theme/colors';
-import { EphemeralCredentials, LogoutVerificationDetails } from '../types/models';
+import {
+  EmptyClassroomSnapshot,
+  EphemeralCredentials,
+  LogoutVerificationDetails,
+} from '../types/models';
 
 interface Props {
   visible: boolean;
   onClose: () => void;
   onSyncSuccess: (result: SyncResult) => void;
   customHeaderTitle?: string;
+  syncJob?: AuxiliarySyncJob;
 }
 
 type AuthMode = 'direct' | 'webview';
-type WebViewRoutePref = 'auto' | 'wfw' | 'campus';
+type WebViewRoutePref = GdouRoutePref;
 
 export const EphemeralSyncModal: React.FC<Props> = ({
   visible,
   onClose,
   onSyncSuccess,
   customHeaderTitle,
+  syncJob,
 }) => {
   const [mode, setMode] = useState<AuthMode>('direct');
   const [username, setUsername] = useState('');
@@ -105,7 +132,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const [xnmOverride, setXnmOverride] = useState('');
   const [xqmOverride, setXqmOverride] = useState('');
 
-  // WebView ephemeral state + route detection + zero-race HTTPS/wfw redirect upgrade
+  // WebView + Direct shared route preference & zero-race HTTPS/wfw redirect upgrade
   const [webViewKey, setWebViewKey] = useState(0);
   const [webViewProgress, setWebViewProgress] = useState(0);
   const [webViewRoutePref, setWebViewRoutePref] = useState<WebViewRoutePref>('auto');
@@ -121,12 +148,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const captchaSessionKeyRef = useRef<string>('');
   const activeAbortRef = useRef<AbortController | null>(null);
   const bridgeTokenRef = useRef<string>(bridgeToken);
+  const routePrefRef = useRef<GdouRoutePref>(webViewRoutePref);
   const autoReinitCountRef = useRef<number>(0);
   const webViewCompletingRef = useRef<boolean>(false);
   const lastRedirectRewriteRef = useRef<{ url: string; ts: number }>({ url: '', ts: 0 });
   const webViewCurrentUrlRef = useRef<string>('');
   const pendingWebViewRedirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   bridgeTokenRef.current = bridgeToken;
+  routePrefRef.current = webViewRoutePref;
 
   const MAX_AUTO_REINIT = 2;
 
@@ -139,6 +168,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
 
   const scheduleWebViewLocationReplace = (targetUrl: string) => {
     clearPendingWebViewRedirectTimer();
+    const delayMs = Platform.OS === 'android' ? 40 : 120;
     pendingWebViewRedirectTimerRef.current = setTimeout(() => {
       pendingWebViewRedirectTimerRef.current = null;
       try {
@@ -148,7 +178,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
       } catch {
         // Ignore if WebView already unmounted
       }
-    }, 120);
+    }, delayMs);
   };
 
   const abortActiveRequests = () => {
@@ -257,14 +287,29 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   }, [visible, mode]);
 
   const ensureWebViewRouteProbed = async () => {
+    if (routePrefRef.current === 'wfw') {
+      setProbedWebViewIsVpn(true);
+      setWebViewStatus('第 1 步（校外微门户）：请完成海大统一身份认证');
+      return;
+    }
+    if (routePrefRef.current === 'campus') {
+      setProbedWebViewIsVpn(false);
+      setWebViewStatus('第 1 步（校园网直连）：请完成海大统一身份认证');
+      return;
+    }
     if (session !== null) {
       setProbedWebViewIsVpn(session.isWebVpn);
+      setWebViewStatus(
+        session.isWebVpn
+          ? '第 1 步（校外微门户）：请完成海大统一身份认证'
+          : '第 1 步（校园网直连）：请完成海大统一身份认证'
+      );
       return;
     }
     setProbingWebViewRoute(true);
     const ac = createFreshAbortController();
     try {
-      const res = await probeGdouNetworkRoute({ signal: ac.signal, timeoutMs: 10_000 });
+      const res = await probeGdouNetworkRoute({ signal: ac.signal, timeoutMs: 8_000 });
       setProbedWebViewIsVpn(res.isWebVpn);
       setWebViewStatus(
         res.isWebVpn
@@ -283,8 +328,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const initDirectSession = async (
     autoCheckUsername?: string,
     preserveError = false,
-    forceFetchCaptcha = false
+    forceFetchCaptcha = false,
+    overrideRoutePref?: GdouRoutePref
   ) => {
+    const effectivePref = overrideRoutePref ?? routePrefRef.current;
     const ac = createFreshAbortController();
     setPreparing(true);
     if (!preserveError) {
@@ -295,7 +342,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     setCaptcha('');
     captchaSessionKeyRef.current = '';
     try {
-      const prepared = await prepareGdouAuthSession({ signal: ac.signal });
+      const prepared = await prepareGdouAuthSession({
+        signal: ac.signal,
+        routePref: effectivePref,
+      });
       setSession(prepared);
       setProbedWebViewIsVpn(prepared.isWebVpn);
       const targetUser = (autoCheckUsername ?? '').trim();
@@ -331,15 +381,26 @@ export const EphemeralSyncModal: React.FC<Props> = ({
       return prepared;
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return null;
+      const errMsg = err instanceof Error ? err.message : String(err);
       setErrorText(
-        `无法连接海大教务入口 (${GDOU_ENTRY_URL})：${
-          err instanceof Error ? err.message : String(err)
-        }`
+        errMsg.includes('超时') || errMsg.includes('HTTP 403')
+          ? errMsg
+          : `无法连接海大教务入口：${errMsg}`
       );
       return null;
     } finally {
       setPreparing(false);
     }
+  };
+
+  const handleSelectDirectRoute = (nextPref: GdouRoutePref) => {
+    if (syncing) return;
+    routePrefRef.current = nextPref;
+    setWebViewRoutePref(nextPref);
+    autoReinitCountRef.current = 0;
+    setSession(null);
+    setErrorText(null);
+    void initDirectSession(username, false, false, nextPref);
   };
 
   useEffect(() => {
@@ -488,7 +549,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
         (step) => setStatusLog((prev) => [...prev, step]),
-        { signal: syncAc.signal }
+        { signal: syncAc.signal, job: syncJob }
       );
 
       if (outcome.status === 'mfa_required') {
@@ -496,6 +557,18 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         setMfaChallenge(outcome.mfa);
         setMfaType(outcome.mfa.defaultReAuthType);
         setMfaHint('海大统一认证检测到新设备登录，请选择「企业微信验证码」或「短信验证码」点击获取');
+        return;
+      }
+
+      if (outcome.status === 'wfw_subauth_required') {
+        wipeFormInputs(false);
+        setMfaChallenge(null);
+        setWfwSubAuth(outcome.subAuth);
+        setSubAuthPassword('');
+        setSubAuthCaptcha('');
+        setShowSubAuthPassword(false);
+        setErrorText(null);
+        setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 80);
         return;
       }
 
@@ -510,6 +583,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         return;
       }
       if (isAccountLockedMessage(msg)) {
+        setSession(null);
+        return;
+      }
+      // On network timeout or HTTP 403, clear stale session immediately so user can switch route or retry without another 30s stall
+      if (msg.includes('超时') || msg.includes('HTTP 403')) {
         setSession(null);
         return;
       }
@@ -569,7 +647,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
         (step) => setStatusLog((prev) => [...prev, step]),
-        { signal: ac.signal }
+        { signal: ac.signal, job: syncJob }
       );
       if (outcome.status === 'mfa_required') {
         setWfwSubAuth(null);
@@ -663,7 +741,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
         (step) => setStatusLog((prev) => [...prev, step]),
-        { signal: ac.signal }
+        { signal: ac.signal, job: syncJob }
       );
       if (outcome.status === 'mfa_required') {
         setWfwSubAuth(null);
@@ -671,6 +749,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         setMfaType(outcome.mfa.defaultReAuthType);
         setMfaCode('');
         setMfaHint(null);
+        setErrorText(null);
+        setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 80);
+        return;
+      }
+      if (outcome.status === 'wfw_subauth_required') {
+        setMfaChallenge(null);
+        setWfwSubAuth(outcome.subAuth);
+        setSubAuthPassword('');
+        setSubAuthCaptcha('');
+        setShowSubAuthPassword(false);
         setErrorText(null);
         setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 80);
         return;
@@ -700,6 +788,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     try {
       const data = JSON.parse(event.nativeEvent.data) as {
         type: string;
+        jobKind?: string;
         bridgeToken?: string;
         message?: string;
         xnm?: string;
@@ -709,6 +798,11 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         periodTimesRaw?: unknown;
         examRaw?: unknown;
         gradeRaw?: unknown;
+        gradeSubScoresRaw?: Record<string, string>;
+        curriculumRaw?: unknown;
+        emptyClassroomOptionsHtml?: string;
+        emptyClassroomRaw?: unknown;
+        campusSearchRaw?: unknown;
         storageCleaned?: boolean;
         logoutDetails?: LogoutVerificationDetails;
       };
@@ -735,10 +829,26 @@ export const EphemeralSyncModal: React.FC<Props> = ({
 
         void (async () => {
           try {
+            const nowIso = new Date().toISOString();
             const parsedSchedule = parseZfScheduleResponse(data.scheduleRaw);
             const parsedPeriods = parseZfPeriodTimesResponse(data.periodTimesRaw);
             const parsedExams = parseZfExamResponse(data.examRaw);
-            const parsedGrades = parseZfGradesResponse(data.gradeRaw);
+            const baseGrades = parseZfGradesResponse(data.gradeRaw);
+            const rawSubMap = data.gradeSubScoresRaw || {};
+            const parsedGrades = baseGrades.map((g) => {
+              const rawDetail = g.jxbId ? rawSubMap[g.jxbId] : undefined;
+              if (!rawDetail) return g;
+              const subs = parseZfGradeSubScoresResponse(rawDetail);
+              if (subs.length === 0) return g;
+              return {
+                ...g,
+                subScores: subs,
+                subScoreSource: 'official_zf_detail' as const,
+                subScoreSourceLabel: OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
+                subScoreSyncedAtIso: nowIso,
+              };
+            });
+
             const derived = deriveCurrentTermParams();
             const xnm = data.xnm || derived.xnm;
             const xqm = data.xqm || derived.xqm;
@@ -747,6 +857,56 @@ export const EphemeralSyncModal: React.FC<Props> = ({
             const fallbackLabel = Number.isFinite(yearNum)
               ? `${yearNum}-${yearNum + 1}学年 ${semText}`
               : derived.label;
+
+            const isAuxJob = syncJob && syncJob.kind !== 'full_sync';
+            const graduationAudit = !isAuxJob
+              ? (data.curriculumRaw ? parseZfGraduationAuditResponse(data.curriculumRaw, nowIso) : null) ??
+                buildLocalEstimatedGraduationAudit(parsedGrades, nowIso)
+              : undefined;
+
+            const parsedRoomOptions = data.emptyClassroomOptionsHtml
+              ? parseEmptyClassroomOptionsHtml(data.emptyClassroomOptionsHtml)
+              : undefined;
+            const parsedRooms = data.emptyClassroomRaw
+              ? parseZfEmptyClassroomsResponse(data.emptyClassroomRaw)
+              : [];
+            let emptyClassroomSnapshot: EmptyClassroomSnapshot | undefined;
+            if (syncJob?.kind === 'empty_classroom') {
+              emptyClassroomSnapshot = {
+                queriedAtIso: nowIso,
+                sourceLabel: OFFICIAL_EMPTY_ROOM_SOURCE_LABEL,
+                params: { ...syncJob.params, xnm, xqm },
+                rooms: parsedRooms,
+                filterOptions: parsedRoomOptions,
+              };
+            } else if (parsedRooms.length > 0) {
+              emptyClassroomSnapshot = {
+                queriedAtIso: nowIso,
+                sourceLabel: OFFICIAL_EMPTY_ROOM_SOURCE_LABEL,
+                params: {
+                  xnm,
+                  xqm,
+                  campusId: parsedSchedule.campusId || '',
+                  buildingId: '',
+                  roomTypeId: '',
+                  week: 1,
+                  dayOfWeek: getTodayDayOfWeek(),
+                  sections: [1, 2],
+                },
+                rooms: parsedRooms,
+                filterOptions: parsedRoomOptions,
+              };
+            }
+
+            const campusSearchResult =
+              syncJob?.kind === 'campus_search'
+                ? {
+                    queriedAtIso: nowIso,
+                    sourceLabel: OFFICIAL_CAMPUS_COURSE_SOURCE_LABEL,
+                    query: { ...syncJob.query, xnm, xqm },
+                    courses: parseZfCampusCourseSearchResponse(data.campusSearchRaw),
+                  }
+                : undefined;
 
             // Await WebView storage + native cookie flush BEFORE unmounting modal
             wipeFormInputs(false);
@@ -788,11 +948,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({
               grades: parsedGrades,
               syncedPeriods: parsedPeriods.length >= 8 ? parsedPeriods : undefined,
               detectedCampus: parsedSchedule.campusName,
+              graduationAudit,
+              emptyClassroomSnapshot,
+              campusSearchResult,
               termLabel: parsedSchedule.termLabel || fallbackLabel,
               academicYear: xnm,
               semesterCode: xqm,
               receipt: {
-                syncedAtIso: new Date().toISOString(),
+                syncedAtIso: nowIso,
                 mode: 'webview',
                 networkRoute: data.isWebVpn === false ? 'campus-direct' : 'wfw-webvpn',
                 termLabel: parsedSchedule.termLabel || fallbackLabel,
@@ -899,14 +1062,25 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           ? { xnm: xnmOverride.trim() || undefined, xqm: xqmOverride.trim() || undefined }
           : undefined,
         bridgeToken,
-        expectedWebViewServiceUrl
+        expectedWebViewServiceUrl,
+        syncJob
       ),
-    [xnmOverride, xqmOverride, bridgeToken, expectedWebViewServiceUrl]
+    [xnmOverride, xqmOverride, bridgeToken, expectedWebViewServiceUrl, syncJob]
   );
 
   const reloadWebView = (nextPref?: WebViewRoutePref) => {
     clearPendingWebViewRedirectTimer();
-    if (nextPref) setWebViewRoutePref(nextPref);
+    if (nextPref) {
+      routePrefRef.current = nextPref;
+      setWebViewRoutePref(nextPref);
+      if (nextPref === 'wfw') {
+        setWebViewStatus('第 1 步（校外微门户）：请完成海大统一身份认证');
+      } else if (nextPref === 'campus') {
+        setWebViewStatus('第 1 步（校园网直连）：请完成海大统一身份认证');
+      } else {
+        setWebViewStatus('第 1 步：请完成海大统一身份认证（自动探测通道）');
+      }
+    }
     setErrorText(null);
     lastRedirectRewriteRef.current = { url: '', ts: 0 };
     webViewCurrentUrlRef.current = '';
@@ -994,12 +1168,53 @@ export const EphemeralSyncModal: React.FC<Props> = ({
             contentContainerStyle={styles.formContent}
             keyboardShouldPersistTaps="handled"
           >
+            {/* Route selector for Direct Mode (Auto / Off-campus WebVPN / Campus Direct) */}
+            {!mfaChallenge && !wfwSubAuth && (
+              <View style={styles.directRouteBar}>
+                {(
+                  [
+                    {
+                      key: 'auto',
+                      label:
+                        probedWebViewIsVpn === false
+                          ? '自动(校内)'
+                          : probedWebViewIsVpn === true
+                            ? '自动(校外)'
+                            : '自动探测',
+                    },
+                    { key: 'wfw', label: '校外微门户' },
+                    { key: 'campus', label: '校园网直连' },
+                  ] as { key: GdouRoutePref; label: string }[]
+                ).map((item) => {
+                  const active = webViewRoutePref === item.key;
+                  return (
+                    <TouchableOpacity
+                      key={item.key}
+                      style={[styles.routePill, active && styles.routePillActive]}
+                      disabled={syncing}
+                      onPress={() => handleSelectDirectRoute(item.key)}
+                    >
+                      <Text style={[styles.routePillText, active && styles.routePillTextActive]}>
+                        {item.label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
+
             {/* Connection Route Pill */}
             <View style={styles.routeCard}>
               {preparing ? (
                 <View style={styles.rowCenter}>
                   <ActivityIndicator size="small" color={COLORS.oceanPrimary} />
-                  <Text style={styles.routeText}>正在自动探测校内直连 / 校外微门户通道...</Text>
+                  <Text style={styles.routeText}>
+                    {webViewRoutePref === 'wfw'
+                      ? '正在直连海大校外微门户通道 (wfw.gdou.edu.cn)...'
+                      : webViewRoutePref === 'campus'
+                        ? '正在连接海大校园网直连通道 (jw.gdou.edu.cn)...'
+                        : '正在自动探测校内直连 / 校外微门户通道...'}
+                  </Text>
                 </View>
               ) : session ? (
                 <View style={styles.rowCenter}>
@@ -1009,6 +1224,16 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                       ? '已接入海大认证中心与校外微门户通道 (wfw.gdou.edu.cn)'
                       : '已接入海大校园网直连通道 (authserver.gdou.edu.cn)'}
                   </Text>
+                  <TouchableOpacity
+                    onPress={() => {
+                      autoReinitCountRef.current = 0;
+                      void initDirectSession(username);
+                    }}
+                    disabled={syncing}
+                    hitSlop={8}
+                  >
+                    <Ionicons name="refresh" size={16} color={COLORS.textMuted} />
+                  </TouchableOpacity>
                 </View>
               ) : (
                 <TouchableOpacity
@@ -1370,7 +1595,15 @@ export const EphemeralSyncModal: React.FC<Props> = ({
             <View style={styles.webViewRouteBar}>
               {(
                 [
-                  { key: 'auto', label: probedWebViewIsVpn === false ? '自动(校内)' : '自动探测' },
+                  {
+                    key: 'auto',
+                    label:
+                      probedWebViewIsVpn === false
+                        ? '自动(校内)'
+                        : probedWebViewIsVpn === true
+                          ? '自动(校外)'
+                          : '自动探测',
+                  },
                   { key: 'wfw', label: '校外微门户' },
                   { key: 'campus', label: '校园网直连' },
                 ] as { key: WebViewRoutePref; label: string }[]
@@ -1515,6 +1748,34 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   );
                   return true;
                 }}
+                onLoadStart={({ nativeEvent }) => {
+                  const startUrl = nativeEvent?.url || '';
+                  if (!startUrl) return;
+                  webViewCurrentUrlRef.current = startUrl;
+                  // Android WebView `shouldOverrideUrlLoading` has a 250ms JS-lock timeout.
+                  // If a bare `jw.gdou.edu.cn` or cleartext redirect slips through during off-campus login,
+                  // intercept immediately onLoadStart instead of waiting 30s for ERR_CONNECTION_TIMED_OUT.
+                  const upgraded = upgradeGdouHttpToHttps(startUrl);
+                  const afterUpgrade = upgraded ?? startUrl;
+                  const healed = healWfwWrongSsoUrl(afterUpgrade, !useCampusWebView);
+                  const target = healed ?? upgraded;
+                  if (target) {
+                    const nowTs = Date.now();
+                    if (
+                      lastRedirectRewriteRef.current.url !== target ||
+                      nowTs - lastRedirectRewriteRef.current.ts > 1000
+                    ) {
+                      lastRedirectRewriteRef.current = { url: target, ts: nowTs };
+                      setErrorText(null);
+                      try {
+                        webViewRef.current?.stopLoading();
+                      } catch {
+                        // Ignore if already stopped
+                      }
+                      scheduleWebViewLocationReplace(target);
+                    }
+                  }
+                }}
                 onNavigationStateChange={(navState) => {
                   if (navState?.url) {
                     webViewCurrentUrlRef.current = navState.url;
@@ -1526,17 +1787,87 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                     event.preventDefault();
                     return;
                   }
-                  const upgraded = upgradeGdouHttpToHttps(url || '');
-                  if (upgraded) {
+                  const rawUrl = url || '';
+                  const upgraded = upgradeGdouHttpToHttps(rawUrl);
+                  const afterUpgrade = upgraded ?? rawUrl;
+                  const isTimeoutErr =
+                    code === -8 ||
+                    code === -1001 ||
+                    /TIMED?_?OUT|TIMEOUT|ERR_CONNECTION_TIMED_OUT|ERR_ADDRESS_UNREACHABLE/i.test(
+                      description || ''
+                    );
+                  const healed = healWfwWrongSsoUrl(afterUpgrade, !useCampusWebView || isTimeoutErr);
+                  const recoveryTarget = healed ?? upgraded;
+                  if (recoveryTarget) {
                     event.preventDefault();
-                    setErrorText(null);
-                    scheduleWebViewLocationReplace(upgraded);
+                    const nowTs = Date.now();
+                    if (
+                      lastRedirectRewriteRef.current.url !== recoveryTarget ||
+                      nowTs - lastRedirectRewriteRef.current.ts > 1500
+                    ) {
+                      lastRedirectRewriteRef.current = { url: recoveryTarget, ts: nowTs };
+                      setErrorText(null);
+                      if (healed && useCampusWebView) {
+                        setWebViewStatus('校园网直连超时，已自动切入校外微门户继续登录...');
+                      }
+                      scheduleWebViewLocationReplace(recoveryTarget);
+                    }
                     return;
                   }
                   event.preventDefault();
+                  const host = extractSafeHostname(rawUrl);
+                  if (isTimeoutErr) {
+                    setErrorText(
+                      `连接 ${host || '海大教务入口'} 超时（${
+                        description || `错误码 ${code}`
+                      }）。若开启 VPN/代理请先关闭，或点上方「校外微门户」/ 右上角刷新重试`
+                    );
+                    return;
+                  }
                   setErrorText(
-                    `无痕网页加载异常（${description || `错误码 ${code}`}），请点右上角刷新或切换上方网络通道`
+                    `无痕网页加载异常（${host ? `${host}: ` : ''}${
+                      description || `错误码 ${code}`
+                    }），请点右上角刷新或切换上方网络通道`
                   );
+                }}
+                onHttpError={({ nativeEvent }) => {
+                  const { url, statusCode } = nativeEvent;
+                  const rawUrl = url || '';
+                  if (statusCode === 404 && rawUrl.includes('wfw.gdou.edu.cn')) {
+                    const healed = healWfwWrongSsoUrl(rawUrl, !useCampusWebView);
+                    const recoveryTarget =
+                      healed ??
+                      (rawUrl.includes('/authserver/')
+                        ? `${GDOU_AUTH_WFW_BASE}/authserver/login?service=${encodeURIComponent(
+                            GDOU_JW_SSO_SERVICE
+                          )}`
+                        : null);
+                    if (recoveryTarget) {
+                      const nowTs = Date.now();
+                      if (
+                        lastRedirectRewriteRef.current.url !== recoveryTarget ||
+                        nowTs - lastRedirectRewriteRef.current.ts > 3000
+                      ) {
+                        lastRedirectRewriteRef.current = { url: recoveryTarget, ts: nowTs };
+                        setErrorText(null);
+                        setWebViewStatus('检测到微门户路径失效(404)，正在自动修复跳转...');
+                        scheduleWebViewLocationReplace(recoveryTarget);
+                      }
+                      return;
+                    }
+                  }
+                  if (statusCode === 403) {
+                    setErrorText(
+                      '海大入口返回 HTTP 403，请关闭手机 VPN / 代理或切换 4G/5G 流量后点击右上角刷新重试'
+                    );
+                    return;
+                  }
+                  if (statusCode >= 500) {
+                    const host = extractSafeHostname(rawUrl);
+                    setErrorText(
+                      `海大服务器（${host || '教务入口'}）返回 HTTP ${statusCode}，请稍候点击右上角刷新重试`
+                    );
+                  }
                 }}
                 onLoadProgress={({ nativeEvent }) => {
                   setWebViewProgress(nativeEvent.progress);
@@ -1646,6 +1977,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 10,
     paddingBottom: 36,
+  },
+  directRouteBar: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 8,
   },
   routeCard: {
     backgroundColor: COLORS.surface,

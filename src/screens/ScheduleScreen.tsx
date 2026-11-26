@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Image,
   Platform,
   ScrollView,
   StyleSheet,
@@ -10,13 +11,25 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
+import { AcademicCalendarModal } from '../components/AcademicCalendarModal';
+import { CampusCourseSearchModal } from '../components/CampusCourseSearchModal';
 import { CoupleScheduleModal } from '../components/CoupleScheduleModal';
 import { CourseDetailModal } from '../components/CourseDetailModal';
+import { EmptyClassroomModal } from '../components/EmptyClassroomModal';
 import { ManualCourseModal } from '../components/ManualCourseModal';
+import { ScheduleAppearanceModal } from '../components/ScheduleAppearanceModal';
+import { ScheduleDiffModal } from '../components/ScheduleDiffModal';
+import { SchedulePosterModal } from '../components/SchedulePosterModal';
 import {
   DAY_LABELS,
+  DEFAULT_SCHEDULE_APPEARANCE,
   getActivePeriods,
+  WALLPAPER_PRESETS,
 } from '../constants/gdouTimetable';
+import {
+  getCoursesForDate,
+  resolveEffectiveScheduleDate,
+} from '../services/academicCalendar';
 import {
   createWeeklyMorningWakeupAlarms,
   openAppSystemSettings,
@@ -40,8 +53,14 @@ import { COLORS, COURSE_PALETTE } from '../theme/colors';
 import {
   AlarmRule,
   AppSettings,
+  CampusCourseSearchQuery,
+  CampusCourseSearchResult,
   CoupleScheduleProfile,
   CourseItem,
+  EmptyClassroomQueryParams,
+  EmptyClassroomSnapshot,
+  ExamItem,
+  ScheduleDiffReport,
   ScheduleViewMode,
 } from '../types/models';
 
@@ -72,10 +91,16 @@ const COUPLE_TOGETHER_THEME = {
 
 interface Props {
   courses: CourseItem[];
+  exams: ExamItem[];
   coupleSchedule: CoupleScheduleProfile | null;
   alarms: AlarmRule[];
   termLabel: string;
+  academicYear: string;
+  semesterCode: string;
   settings: AppSettings;
+  lastScheduleDiff: ScheduleDiffReport | null;
+  emptyClassroomSnapshot: EmptyClassroomSnapshot | null;
+  campusSearchHistory: CampusCourseSearchResult | null;
   onOpenSync: () => void;
   onOpenPartnerSync: (partnerNickname: string) => void;
   onLoadSampleData: () => void;
@@ -84,14 +109,23 @@ interface Props {
   onSaveCoupleSchedule: (profile: CoupleScheduleProfile | null) => void;
   onAddManualCourse: (course: CourseItem) => void;
   onDeleteManualCourse: (courseId: string) => void;
+  onDismissScheduleDiff: () => void;
+  onRequestEmptyClassroomQuery: (params: EmptyClassroomQueryParams) => void;
+  onRequestCampusCourseSearch: (query: CampusCourseSearchQuery) => void;
 }
 
 export const ScheduleScreen: React.FC<Props> = ({
   courses,
+  exams,
   coupleSchedule,
   alarms,
   termLabel,
+  academicYear,
+  semesterCode,
   settings,
+  lastScheduleDiff,
+  emptyClassroomSnapshot,
+  campusSearchHistory,
   onOpenSync,
   onOpenPartnerSync,
   onLoadSampleData,
@@ -100,6 +134,9 @@ export const ScheduleScreen: React.FC<Props> = ({
   onSaveCoupleSchedule,
   onAddManualCourse,
   onDeleteManualCourse,
+  onDismissScheduleDiff,
+  onRequestEmptyClassroomQuery,
+  onRequestCampusCourseSearch,
 }) => {
   const { width: screenWidth } = useWindowDimensions();
   const currentWeek = useMemo(
@@ -110,6 +147,12 @@ export const ScheduleScreen: React.FC<Props> = ({
   const [viewMode, setViewMode] = useState<ScheduleViewMode>('mine');
   const [activeModalCourses, setActiveModalCourses] = useState<CourseItem[]>([]);
   const [coupleModalOpen, setCoupleModalOpen] = useState(false);
+  const [emptyRoomModalOpen, setEmptyRoomModalOpen] = useState(false);
+  const [campusSearchModalOpen, setCampusSearchModalOpen] = useState(false);
+  const [calendarModalOpen, setCalendarModalOpen] = useState(false);
+  const [diffModalOpen, setDiffModalOpen] = useState(false);
+  const [appearanceModalOpen, setAppearanceModalOpen] = useState(false);
+  const [posterModalOpen, setPosterModalOpen] = useState(false);
   const [manualModalState, setManualModalState] = useState<{
     visible: boolean;
     dayOfWeek: number;
@@ -152,6 +195,51 @@ export const ScheduleScreen: React.FC<Props> = ({
     [settings.termStartDate, selectedWeek]
   );
 
+  const weekResolutions = useMemo(
+    () =>
+      weekDates.map((dt) =>
+        resolveEffectiveScheduleDate(
+          dt,
+          settings.termStartDate,
+          settings.totalWeeks,
+          settings.calendarOverrides
+        )
+      ),
+    [weekDates, settings.termStartDate, settings.totalWeeks, settings.calendarOverrides]
+  );
+
+  const appearance = settings.appearance ?? DEFAULT_SCHEDULE_APPEARANCE;
+  const activeWallpaperPreset = useMemo(
+    () =>
+      WALLPAPER_PRESETS.find((p) => p.key === appearance.wallpaperPreset) ?? WALLPAPER_PRESETS[0],
+    [appearance.wallpaperPreset]
+  );
+  const hasCustomPhotoBg =
+    appearance.wallpaperPreset === 'custom_photo' && Boolean(appearance.customBackgroundUri);
+
+  // Apply holiday/makeup-day overrides when projecting courses onto the displayed week grid
+  const effectiveWeekMyCourses = useMemo(() => {
+    const out: CourseItem[] = [];
+    for (let dIdx = 0; dIdx < 7; dIdx++) {
+      const res = weekResolutions[dIdx];
+      const colDay = dIdx + 1;
+      if (res.isHoliday) continue;
+      const targetDay = res.effectiveDayOfWeek;
+      const targetWeek = res.effectiveWeek;
+      for (const c of courses) {
+        if (!isCourseSchedulable(c) || c.dayOfWeek !== targetDay) continue;
+        if (res.isMakeup) {
+          if (c.weeks.includes(targetWeek)) {
+            out.push({ ...c, id: `${c.id}-makeup-${colDay}`, dayOfWeek: colDay, weeks: [selectedWeek] });
+          }
+        } else {
+          out.push(c);
+        }
+      }
+    }
+    return out;
+  }, [courses, weekResolutions, selectedWeek]);
+
   const weekCourses = useMemo(
     () => courses.filter((c) => isCourseSchedulable(c) && c.weeks.includes(selectedWeek)),
     [courses, selectedWeek]
@@ -160,13 +248,13 @@ export const ScheduleScreen: React.FC<Props> = ({
   const clusters = useMemo(
     () =>
       buildTimetableClusters({
-        myCourses: courses,
+        myCourses: effectiveWeekMyCourses,
         partnerCourses,
         selectedWeek,
         showNonCurrentWeek,
         viewMode,
       }),
-    [courses, partnerCourses, selectedWeek, showNonCurrentWeek, viewMode]
+    [effectiveWeekMyCourses, partnerCourses, selectedWeek, showNonCurrentWeek, viewMode]
   );
 
   const coupleInsights = useMemo(() => {
@@ -186,16 +274,18 @@ export const ScheduleScreen: React.FC<Props> = ({
     [courses]
   );
 
-  const todayCourses = useMemo(() => {
+  const todayResolvedData = useMemo(() => {
     const base = viewMode === 'partner' ? partnerCourses : courses;
-    return base
-      .filter(
-        (c) =>
-          isCourseSchedulable(c) && c.weeks.includes(currentWeek) && c.dayOfWeek === todayDow
-      )
-      .sort((a, b) => a.startSection - b.startSection)
-      .map((c) => ({ ...c, ownerTag: viewMode === 'partner' ? ('partner' as const) : ('mine' as const) }));
-  }, [courses, partnerCourses, viewMode, currentWeek, todayDow]);
+    const res = getCoursesForDate(base, new Date(), settings);
+    return {
+      resolved: res.resolved,
+      courses: res.courses.map((c) => ({
+        ...c,
+        ownerTag: viewMode === 'partner' ? ('partner' as const) : ('mine' as const),
+      })),
+    };
+  }, [courses, partnerCourses, viewMode, settings]);
+  const todayCourses = todayResolvedData.courses;
 
   const handleToggleNonCurrentWeek = () => {
     onUpdateSettings({
@@ -397,6 +487,7 @@ export const ScheduleScreen: React.FC<Props> = ({
             height,
             backgroundColor: theme.bg,
             borderLeftColor: theme.border,
+            opacity: primary.isCurrentWeek ? appearance.cardOpacity ?? 0.94 : 0.72,
           },
         ]}
       >
@@ -449,31 +540,37 @@ export const ScheduleScreen: React.FC<Props> = ({
           </View>
         ) : (
           <>
-            {/* Owner / Non-current-week prefix tag */}
-            {(!primary.isCurrentWeek || viewMode === 'couple') && (
+            {/* Owner / Audit / Non-current-week prefix tag */}
+            {(!primary.isCurrentWeek || viewMode === 'couple' || primary.course.isAudit) && (
               <Text
                 style={[
                   styles.prefixTagText,
                   {
-                    color: !primary.isCurrentWeek
-                      ? '#64748B'
-                      : primary.owner === 'partner'
-                        ? '#BE185D'
-                        : '#0369A1',
+                    color: primary.course.isAudit
+                      ? '#7C3AED'
+                      : !primary.isCurrentWeek
+                        ? '#64748B'
+                        : primary.owner === 'partner'
+                          ? '#BE185D'
+                          : '#0369A1',
                   },
                 ]}
                 numberOfLines={1}
                 maxFontSizeMultiplier={1.1}
               >
-                {viewMode === 'couple'
-                  ? cluster.isSameCourseTogether
-                    ? '我+TA'
-                    : primary.owner === 'partner'
-                      ? `${partnerName}${!primary.isCurrentWeek ? '·非本周' : ''}`
-                      : `我${!primary.isCurrentWeek ? '·非本周' : ''}`
-                  : totalInSlot >= 2
-                    ? `非本周·${totalInSlot}门`
-                    : '非本周'}
+                {primary.course.isAudit
+                  ? !primary.isCurrentWeek
+                    ? '旁听·非本周'
+                    : '旁听'
+                  : viewMode === 'couple'
+                    ? cluster.isSameCourseTogether
+                      ? '我+TA'
+                      : primary.owner === 'partner'
+                        ? `${partnerName}${!primary.isCurrentWeek ? '·非本周' : ''}`
+                        : `我${!primary.isCurrentWeek ? '·非本周' : ''}`
+                    : totalInSlot >= 2
+                      ? `非本周·${totalInSlot}门`
+                      : '非本周'}
               </Text>
             )}
 
@@ -683,30 +780,66 @@ export const ScheduleScreen: React.FC<Props> = ({
           </TouchableOpacity>
         </View>
 
-        {/* Quick Action Pills */}
-        <View style={styles.quickRow}>
+        {/* Quick Action & Campus Tools Strip */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.quickRowScroll}
+        >
           <TouchableOpacity
-            style={styles.quickPill}
+            style={styles.quickToolPill}
+            onPress={() => setEmptyRoomModalOpen(true)}
+          >
+            <Ionicons name="business-outline" size={14} color={COLORS.white} />
+            <Text style={styles.quickPillText}>空教室</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.quickToolPill}
+            onPress={() => setCampusSearchModalOpen(true)}
+          >
+            <Ionicons name="search-outline" size={14} color={COLORS.white} />
+            <Text style={styles.quickPillText}>蹭课搜课</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.quickToolPill}
+            onPress={() => setCalendarModalOpen(true)}
+          >
+            <Ionicons name="calendar-number-outline" size={14} color={COLORS.white} />
+            <Text style={styles.quickPillText}>校历调休</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.quickToolPill}
+            onPress={() => setAppearanceModalOpen(true)}
+          >
+            <Ionicons name="color-palette-outline" size={14} color={COLORS.white} />
+            <Text style={styles.quickPillText}>换肤导图</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.quickToolPill}
             onPress={handleQuickCalendarSync}
             disabled={busyAction !== null}
           >
             <Ionicons name="calendar-outline" size={14} color={COLORS.white} />
             <Text style={styles.quickPillText}>
-              {busyAction === 'calendar' ? '写入中...' : '全学期导入日历'}
+              {busyAction === 'calendar' ? '写入中...' : '导入日历'}
             </Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={styles.quickPill}
+            style={styles.quickToolPill}
             onPress={handleQuickWakeupAlarms}
             disabled={busyAction !== null}
           >
             <Ionicons name="alarm-outline" size={14} color={COLORS.white} />
             <Text style={styles.quickPillText}>
-              {busyAction === 'alarm' ? '写入中...' : '一键本周系统早起闹钟'}
+              {busyAction === 'alarm' ? '写入中...' : '本周闹钟'}
             </Text>
           </TouchableOpacity>
-        </View>
+        </ScrollView>
       </View>
 
       {!hasAnyCourses ? (
@@ -768,6 +901,25 @@ export const ScheduleScreen: React.FC<Props> = ({
             </TouchableOpacity>
           )}
 
+          {/* Schedule Change Diff Alert Banner */}
+          {viewMode === 'mine' &&
+            lastScheduleDiff &&
+            !lastScheduleDiff.dismissed &&
+            lastScheduleDiff.entries.length > 0 && (
+              <TouchableOpacity
+                style={styles.diffBanner}
+                activeOpacity={0.85}
+                onPress={() => setDiffModalOpen(true)}
+              >
+                <Ionicons name="notifications-circle" size={18} color="#B45309" />
+                <Text style={styles.diffBannerText} numberOfLines={1}>
+                  检测到 {lastScheduleDiff.entries.length} 处课表变动（
+                  {lastScheduleDiff.entries[0]?.courseName} 等）· 点击查看详情
+                </Text>
+                <Ionicons name="chevron-forward" size={16} color="#B45309" />
+              </TouchableOpacity>
+            )}
+
           {/* Unparsed courses explicit warning banner */}
           {viewMode === 'mine' && unparsedCourses.length > 0 && (
             <View style={styles.unparsedBanner}>
@@ -780,157 +932,238 @@ export const ScheduleScreen: React.FC<Props> = ({
             </View>
           )}
 
-          {/* Today's Spotlight */}
-          {viewMode !== 'couple' && todayCourses.length > 0 && (
-            <View style={styles.todayBanner}>
-              <View style={styles.todayBadge}>
-                <Text style={styles.todayBadgeText}>
-                  {viewMode === 'partner' ? `${partnerName}今日` : '今日'} {todayCourses.length} 节
-                </Text>
+          {/* Today's Spotlight (honors holiday & makeup overrides) */}
+          {viewMode !== 'couple' &&
+            (todayCourses.length > 0 || todayResolvedData.resolved.badgeText) && (
+              <View style={styles.todayBanner}>
+                <TouchableOpacity
+                  style={[
+                    styles.todayBadge,
+                    todayResolvedData.resolved.isHoliday && { backgroundColor: '#DC2626' },
+                    todayResolvedData.resolved.isMakeup && { backgroundColor: '#D97706' },
+                  ]}
+                  onPress={() => setCalendarModalOpen(true)}
+                >
+                  <Text style={styles.todayBadgeText}>
+                    {todayResolvedData.resolved.badgeText
+                      ? todayResolvedData.resolved.badgeText
+                      : `${viewMode === 'partner' ? `${partnerName}今日` : '今日'} ${todayCourses.length} 节`}
+                  </Text>
+                </TouchableOpacity>
+                {todayResolvedData.resolved.isHoliday ? (
+                  <Text style={styles.todayHolidayText} numberOfLines={1}>
+                    法定节假日停课中 · 点击左侧标签查看校历调休
+                  </Text>
+                ) : (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                    {todayCourses.map((c) => {
+                      const span = getCourseTimeSpan(c, periods);
+                      const overlappingToday = todayCourses.filter(
+                        (other) =>
+                          other.startSection <= c.endSection && c.startSection <= other.endSection
+                      );
+                      return (
+                        <TouchableOpacity
+                          key={c.id}
+                          style={styles.todayChip}
+                          onPress={() => setActiveModalCourses(overlappingToday)}
+                        >
+                          <Text style={styles.todayChipTitle} numberOfLines={1}>
+                            {span.startText} {c.name}
+                          </Text>
+                          <Text style={styles.todayChipSub} numberOfLines={1}>
+                            {c.location}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </ScrollView>
+                )}
               </View>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                {todayCourses.map((c) => {
-                  const span = getCourseTimeSpan(c, periods);
-                  const overlappingToday = todayCourses.filter(
-                    (other) =>
-                      other.startSection <= c.endSection && c.startSection <= other.endSection
-                  );
-                  return (
-                    <TouchableOpacity
-                      key={c.id}
-                      style={styles.todayChip}
-                      onPress={() => setActiveModalCourses(overlappingToday)}
-                    >
-                      <Text style={styles.todayChipTitle} numberOfLines={1}>
-                        {span.startText} {c.name}
-                      </Text>
-                      <Text style={styles.todayChipSub} numberOfLines={1}>
-                        {c.location}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
-            </View>
-          )}
+            )}
 
-          {/* Weekday Header Row */}
-          <View style={styles.dayHeaderRow}>
+          {/* Weekday Header Row (shows holiday / makeup-day badges) */}
+          <View
+            style={[
+              styles.dayHeaderRow,
+              activeWallpaperPreset.isDark &&
+                !hasCustomPhotoBg && { backgroundColor: '#0F172A', borderBottomColor: '#1E293B' },
+            ]}
+          >
             <View style={{ width: TIME_COL_WIDTH, alignItems: 'center', justifyContent: 'center' }}>
-              <Text style={styles.monthLabel}>
+              <Text
+                style={[
+                  styles.monthLabel,
+                  activeWallpaperPreset.isDark && !hasCustomPhotoBg && { color: '#94A3B8' },
+                ]}
+              >
                 {weekDates[0].getMonth() + 1}月
               </Text>
             </View>
             {DAY_LABELS.map((label, idx) => {
               const isToday = selectedWeek === currentWeek && idx + 1 === todayDow;
+              const res = weekResolutions[idx];
               return (
-                <View
+                <TouchableOpacity
                   key={label}
+                  activeOpacity={0.8}
+                  onPress={() => setCalendarModalOpen(true)}
                   style={[
                     styles.dayHeaderCell,
                     { width: colWidth },
                     isToday && styles.dayHeaderCellToday,
+                    res.isHoliday && !isToday && { backgroundColor: '#FEF2F2', borderRadius: 6 },
+                    res.isMakeup && !isToday && { backgroundColor: '#FFFBEB', borderRadius: 6 },
                   ]}
                 >
-                  <Text style={[styles.dayHeaderText, isToday && styles.dayHeaderTextToday]}>
+                  <Text
+                    style={[
+                      styles.dayHeaderText,
+                      activeWallpaperPreset.isDark && !hasCustomPhotoBg && { color: '#F8FAFC' },
+                      isToday && styles.dayHeaderTextToday,
+                      res.isHoliday && !isToday && { color: '#DC2626' },
+                      res.isMakeup && !isToday && { color: '#D97706' },
+                    ]}
+                  >
                     周{label}
                   </Text>
-                  <Text style={[styles.dayDateText, isToday && styles.dayDateTextToday]}>
-                    {formatShortDate(weekDates[idx])}
+                  <Text
+                    style={[
+                      styles.dayDateText,
+                      isToday && styles.dayDateTextToday,
+                      res.isHoliday && !isToday && { color: '#DC2626', fontWeight: '700' },
+                      res.isMakeup && !isToday && { color: '#B45309', fontWeight: '700' },
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {res.badgeText ? res.badgeText.slice(0, 5) : formatShortDate(weekDates[idx])}
                   </Text>
-                </View>
+                </TouchableOpacity>
               );
             })}
           </View>
 
-          {/* Timetable Grid */}
-          <ScrollView style={styles.gridScroll} contentContainerStyle={{ paddingBottom: 24 }}>
-            <View style={styles.gridBody}>
-              {/* Left Period Column */}
-              <View style={{ width: TIME_COL_WIDTH }}>
-                {Array.from({ length: visibleSections }, (_, i) => {
-                  const sec = i + 1;
-                  const p = periods.find((item) => item.section === sec);
-                  return (
-                    <View key={sec} style={styles.timeCell}>
-                      <Text style={styles.sectionNum}>{sec}</Text>
-                      <Text style={styles.sectionTime}>{p?.start ?? ''}</Text>
-                      {p?.end ? <Text style={styles.sectionEndTime}>{p.end}</Text> : null}
-                    </View>
-                  );
-                })}
-              </View>
-
-              {/* 7-Day Columns */}
-              <View style={[styles.columnsWrap, { height: visibleSections * ROW_HEIGHT }]}>
-                {/* Interactive Empty Grid Cells (tap any slot to add custom course) */}
-                {Array.from({ length: visibleSections }, (_, sIdx) => (
-                  <View
-                    key={`row-${sIdx}`}
-                    style={[
-                      styles.gridRowLine,
-                      { top: sIdx * ROW_HEIGHT, height: ROW_HEIGHT, flexDirection: 'row' },
-                    ]}
-                  >
-                    {Array.from({ length: 7 }, (__, dIdx) => (
-                      <TouchableOpacity
-                        key={`empty-${dIdx}-${sIdx}`}
-                        activeOpacity={0.5}
-                        style={{
-                          width: colWidth,
-                          height: ROW_HEIGHT,
-                          borderRightWidth: StyleSheet.hairlineWidth,
-                          borderRightColor: COLORS.borderLight,
-                        }}
-                        onPress={() => {
-                          const startSec = sIdx + 1;
-                          const endSec = Math.min(visibleSections, startSec + 1);
-                          setManualModalState({
-                            visible: true,
-                            dayOfWeek: dIdx + 1,
-                            startSection: startSec,
-                            endSection: endSec,
-                          });
-                        }}
-                      />
-                    ))}
-                  </View>
-                ))}
-
-                {/* Couple Mode Shared Free Slot Hints */}
-                {viewMode === 'couple' &&
-                  coupleInsights &&
-                  settings.highlightCoupleFreeSlots !== false &&
-                  coupleInsights.sharedFreeBlocks.map((free) => {
-                    // Skip drawing free hint if a non-current-week course is occupying that spot
-                    const occupiedByNonCurrent = clusters.some(
-                      (cl) =>
-                        cl.dayOfWeek === free.dayOfWeek &&
-                        cl.startSection <= free.endSection &&
-                        cl.endSection >= free.startSection
-                    );
-                    if (occupiedByNonCurrent) return null;
-                    const top = (free.startSection - 1) * ROW_HEIGHT + 3;
-                    const height = (free.endSection - free.startSection + 1) * ROW_HEIGHT - 6;
-                    const left = (free.dayOfWeek - 1) * colWidth + 3;
-                    const width = colWidth - 6;
+          {/* Timetable Grid with Custom Wallpaper / Preset Background */}
+          <View
+            style={[
+              styles.gridContainerWrap,
+              { backgroundColor: activeWallpaperPreset.bgColor },
+            ]}
+          >
+            {hasCustomPhotoBg && appearance.customBackgroundUri && (
+              <>
+                <Image
+                  source={{ uri: appearance.customBackgroundUri }}
+                  style={StyleSheet.absoluteFill}
+                  resizeMode="cover"
+                />
+                <View
+                  pointerEvents="none"
+                  style={[
+                    StyleSheet.absoluteFill,
+                    {
+                      backgroundColor: activeWallpaperPreset.isDark
+                        ? `rgba(15, 23, 42, ${appearance.backgroundDimOpacity ?? 0.25})`
+                        : `rgba(255, 255, 255, ${appearance.backgroundDimOpacity ?? 0.25})`,
+                    },
+                  ]}
+                />
+              </>
+            )}
+            <ScrollView style={styles.gridScroll} contentContainerStyle={{ paddingBottom: 24 }}>
+              <View style={styles.gridBody}>
+                {/* Left Period Column */}
+                <View style={{ width: TIME_COL_WIDTH }}>
+                  {Array.from({ length: visibleSections }, (_, i) => {
+                    const sec = i + 1;
+                    const p = periods.find((item) => item.section === sec);
                     return (
-                      <View
-                        key={`free-${free.dayOfWeek}-${free.startSection}`}
-                        pointerEvents="none"
-                        style={[styles.coupleFreeCard, { top, left, width, height }]}
-                      >
-                        <Text style={styles.coupleFreeText}>♡ 共同没课</Text>
-                        <Text style={styles.coupleFreeSub}>{free.startText}</Text>
+                      <View key={sec} style={styles.timeCell}>
+                        <Text
+                          style={[
+                            styles.sectionNum,
+                            activeWallpaperPreset.isDark && !hasCustomPhotoBg && { color: '#E2E8F0' },
+                          ]}
+                        >
+                          {sec}
+                        </Text>
+                        <Text style={styles.sectionTime}>{p?.start ?? ''}</Text>
+                        {p?.end ? <Text style={styles.sectionEndTime}>{p.end}</Text> : null}
                       </View>
                     );
                   })}
+                </View>
 
-                {/* Clustered Course Cards */}
-                {clusters.map(renderClusterCard)}
+                {/* 7-Day Columns */}
+                <View style={[styles.columnsWrap, { height: visibleSections * ROW_HEIGHT }]}>
+                  {/* Interactive Empty Grid Cells (tap any slot to add custom course) */}
+                  {Array.from({ length: visibleSections }, (_, sIdx) => (
+                    <View
+                      key={`row-${sIdx}`}
+                      style={[
+                        styles.gridRowLine,
+                        { top: sIdx * ROW_HEIGHT, height: ROW_HEIGHT, flexDirection: 'row' },
+                      ]}
+                    >
+                      {Array.from({ length: 7 }, (__, dIdx) => (
+                        <TouchableOpacity
+                          key={`empty-${dIdx}-${sIdx}`}
+                          activeOpacity={0.5}
+                          style={{
+                            width: colWidth,
+                            height: ROW_HEIGHT,
+                            borderRightWidth: StyleSheet.hairlineWidth,
+                            borderRightColor: COLORS.borderLight,
+                          }}
+                          onPress={() => {
+                            const startSec = sIdx + 1;
+                            const endSec = Math.min(visibleSections, startSec + 1);
+                            setManualModalState({
+                              visible: true,
+                              dayOfWeek: dIdx + 1,
+                              startSection: startSec,
+                              endSection: endSec,
+                            });
+                          }}
+                        />
+                      ))}
+                    </View>
+                  ))}
+
+                  {/* Couple Mode Shared Free Slot Hints */}
+                  {viewMode === 'couple' &&
+                    coupleInsights &&
+                    settings.highlightCoupleFreeSlots !== false &&
+                    coupleInsights.sharedFreeBlocks.map((free) => {
+                      const occupiedByNonCurrent = clusters.some(
+                        (cl) =>
+                          cl.dayOfWeek === free.dayOfWeek &&
+                          cl.startSection <= free.endSection &&
+                          cl.endSection >= free.startSection
+                      );
+                      if (occupiedByNonCurrent) return null;
+                      const top = (free.startSection - 1) * ROW_HEIGHT + 3;
+                      const height = (free.endSection - free.startSection + 1) * ROW_HEIGHT - 6;
+                      const left = (free.dayOfWeek - 1) * colWidth + 3;
+                      const width = colWidth - 6;
+                      return (
+                        <View
+                          key={`free-${free.dayOfWeek}-${free.startSection}`}
+                          pointerEvents="none"
+                          style={[styles.coupleFreeCard, { top, left, width, height }]}
+                        >
+                          <Text style={styles.coupleFreeText}>♡ 共同没课</Text>
+                          <Text style={styles.coupleFreeSub}>{free.startText}</Text>
+                        </View>
+                      );
+                    })}
+
+                  {/* Clustered Course Cards */}
+                  {clusters.map(renderClusterCard)}
+                </View>
               </View>
-            </View>
-          </ScrollView>
+            </ScrollView>
+          </View>
         </>
       )}
 
@@ -978,6 +1211,72 @@ export const ScheduleScreen: React.FC<Props> = ({
         }}
         onUpdateSettings={onUpdateSettings}
         onOpenPartnerEphemeralSync={onOpenPartnerSync}
+      />
+
+      <EmptyClassroomModal
+        visible={emptyRoomModalOpen}
+        snapshot={emptyClassroomSnapshot}
+        courses={courses}
+        coupleSchedule={coupleSchedule}
+        academicYear={academicYear}
+        semesterCode={semesterCode}
+        currentWeek={currentWeek}
+        settings={settings}
+        onClose={() => setEmptyRoomModalOpen(false)}
+        onRequestLiveQuery={(params) => {
+          setEmptyRoomModalOpen(false);
+          setTimeout(() => onRequestEmptyClassroomQuery(params), 120);
+        }}
+      />
+
+      <CampusCourseSearchModal
+        visible={campusSearchModalOpen}
+        lastResult={campusSearchHistory}
+        myCourses={courses}
+        academicYear={academicYear}
+        semesterCode={semesterCode}
+        onClose={() => setCampusSearchModalOpen(false)}
+        onRequestLiveSearch={(query) => {
+          setCampusSearchModalOpen(false);
+          setTimeout(() => onRequestCampusCourseSearch(query), 120);
+        }}
+        onAddAuditCourse={onAddManualCourse}
+      />
+
+      <AcademicCalendarModal
+        visible={calendarModalOpen}
+        termLabel={termLabel}
+        exams={exams}
+        settings={settings}
+        onUpdateSettings={onUpdateSettings}
+        onJumpToWeek={(w) => setSelectedWeek(w)}
+        onClose={() => setCalendarModalOpen(false)}
+      />
+
+      <ScheduleDiffModal
+        visible={diffModalOpen}
+        report={lastScheduleDiff}
+        onDismissReport={onDismissScheduleDiff}
+        onClose={() => setDiffModalOpen(false)}
+      />
+
+      <ScheduleAppearanceModal
+        visible={appearanceModalOpen}
+        settings={settings}
+        onUpdateSettings={onUpdateSettings}
+        onOpenPosterExport={() => setPosterModalOpen(true)}
+        onClose={() => setAppearanceModalOpen(false)}
+      />
+
+      <SchedulePosterModal
+        visible={posterModalOpen}
+        courses={courses}
+        coupleSchedule={coupleSchedule}
+        selectedWeek={selectedWeek}
+        termLabel={termLabel}
+        viewMode={viewMode}
+        settings={settings}
+        onClose={() => setPosterModalOpen(false)}
       />
     </View>
   );
@@ -1516,5 +1815,47 @@ const styles = StyleSheet.create({
   dualRoomText: {
     fontSize: 8,
     color: '#64748B',
+  },
+  quickRowScroll: {
+    flexDirection: 'row',
+    gap: 7,
+    marginTop: 9,
+    paddingRight: 8,
+  },
+  quickToolPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 9,
+  },
+  diffBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: COLORS.amberLight,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderBottomWidth: 1,
+    borderBottomColor: '#FDE68A',
+  },
+  diffBannerText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#92400E',
+  },
+  todayHolidayText: {
+    flex: 1,
+    fontSize: 12,
+    color: '#B91C1C',
+    fontWeight: '600',
+    marginLeft: 8,
+  },
+  gridContainerWrap: {
+    flex: 1,
+    position: 'relative',
   },
 });

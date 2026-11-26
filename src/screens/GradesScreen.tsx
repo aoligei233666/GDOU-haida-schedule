@@ -8,16 +8,21 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { computeGpaSummary } from '../services/gradeParser';
+import { buildLocalEstimatedGraduationAudit } from '../services/campusToolsParser';
+import {
+  computeGpaSummary,
+  OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
+} from '../services/gradeParser';
 import { COLORS } from '../theme/colors';
-import { GradeItem, ScoreTierBucket } from '../types/models';
+import { GradeItem, GraduationAuditReport, ScoreTierBucket } from '../types/models';
 
 interface Props {
   grades: GradeItem[];
+  graduationAudit: GraduationAuditReport | null;
   onOpenSync: () => void;
 }
 
-type ViewTab = 'overview' | 'details';
+type ViewTab = 'overview' | 'audit' | 'details';
 type SortMode = 'term' | 'gpa' | 'credit';
 
 const TIER_COLORS: Record<ScoreTierBucket['key'], { bar: string; bg: string; text: string }> = {
@@ -35,15 +40,21 @@ function getGpaColor(gpa: number): { bg: string; text: string } {
   return { bg: COLORS.dangerLight, text: COLORS.danger };
 }
 
-export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
+export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenSync }) => {
   const [viewTab, setViewTab] = useState<ViewTab>('overview');
   const [selectedTerm, setSelectedTerm] = useState<string>('ALL');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [sortMode, setSortMode] = useState<SortMode>('term');
   const [onlyFailed, setOnlyFailed] = useState<boolean>(false);
+  const [expandedGradeId, setExpandedGradeId] = useState<string | null>(null);
 
   const overallSummary = useMemo(() => computeGpaSummary(grades), [grades]);
+  const effectiveAudit = useMemo<GraduationAuditReport | null>(() => {
+    if (graduationAudit) return graduationAudit;
+    if (grades.length > 0) return buildLocalEstimatedGraduationAudit(grades);
+    return null;
+  }, [graduationAudit, grades]);
 
   const terms = useMemo(() => overallSummary.byTerm.map((t) => t.termKey), [overallSummary.byTerm]);
 
@@ -174,8 +185,8 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
         </View>
       </View>
 
-      {/* Segmented View Toggle: Overview vs Details */}
-      {grades.length > 0 && (
+      {/* Segmented View Toggle: Overview vs Curriculum Audit vs Details */}
+      {(grades.length > 0 || graduationAudit) && (
         <View style={styles.segmentWrap}>
           <TouchableOpacity
             style={[styles.segmentBtn, viewTab === 'overview' && styles.segmentBtnActive]}
@@ -183,11 +194,25 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
           >
             <Ionicons
               name="stats-chart"
-              size={15}
+              size={14}
               color={viewTab === 'overview' ? COLORS.white : COLORS.textSecondary}
             />
             <Text style={[styles.segmentText, viewTab === 'overview' && styles.segmentTextActive]}>
-              成绩学分总览
+              成绩总览
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.segmentBtn, viewTab === 'audit' && styles.segmentBtnActive]}
+            onPress={() => setViewTab('audit')}
+          >
+            <Ionicons
+              name="school-outline"
+              size={15}
+              color={viewTab === 'audit' ? COLORS.white : COLORS.textSecondary}
+            />
+            <Text style={[styles.segmentText, viewTab === 'audit' && styles.segmentTextActive]}>
+              培养方案
             </Text>
           </TouchableOpacity>
 
@@ -197,28 +222,239 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
           >
             <Ionicons
               name="list"
-              size={16}
+              size={15}
               color={viewTab === 'details' ? COLORS.white : COLORS.textSecondary}
             />
             <Text style={[styles.segmentText, viewTab === 'details' && styles.segmentTextActive]}>
-              课程成绩明细 ({grades.length})
+              成绩明细 ({grades.length})
             </Text>
           </TouchableOpacity>
         </View>
       )}
 
-      {grades.length === 0 ? (
+      {grades.length === 0 && !graduationAudit ? (
         <ScrollView contentContainerStyle={styles.content}>
           <View style={styles.emptyBox}>
             <Ionicons name="ribbon-outline" size={48} color={COLORS.textMuted} />
             <Text style={styles.emptyTitle}>暂无成绩与学分数据</Text>
             <Text style={styles.emptyDesc}>
-              点击右上角「教务同步」登录海大教务系统，即可一次性拉取全部学期的成绩单，自动生成分学期 GPA 趋势、学分结构与成绩分布总览（账号密码用完即删）。
+              点击右上角「教务同步」登录海大教务系统，即可一次性拉取全部学期的成绩单、分项明细（平时分/卷面占比）与培养方案毕业学分进度（账号密码用完即删）。
             </Text>
             <TouchableOpacity style={styles.emptyBtn} onPress={onOpenSync}>
               <Ionicons name="cloud-download-outline" size={18} color={COLORS.white} />
               <Text style={styles.emptyBtnText}>立即无痕同步成绩与学分</Text>
             </TouchableOpacity>
+          </View>
+        </ScrollView>
+      ) : viewTab === 'audit' && effectiveAudit ? (
+        /* ==================== GRADUATION CREDIT / CURRICULUM AUDIT ==================== */
+        <ScrollView contentContainerStyle={styles.content}>
+          <View
+            style={[
+              styles.sourceCard,
+              effectiveAudit.source === 'official_zf_curriculum'
+                ? styles.sourceCardOfficial
+                : styles.sourceCardEstimate,
+            ]}
+          >
+            <Ionicons
+              name={
+                effectiveAudit.source === 'official_zf_curriculum'
+                  ? 'shield-checkmark'
+                  : 'information-circle'
+              }
+              size={18}
+              color={
+                effectiveAudit.source === 'official_zf_curriculum' ? '#065F46' : '#B45309'
+              }
+            />
+            <View style={{ flex: 1 }}>
+              <Text
+                style={[
+                  styles.sourceCardTitle,
+                  effectiveAudit.source === 'official_zf_curriculum'
+                    ? { color: '#065F46' }
+                    : { color: '#92400E' },
+                ]}
+              >
+                {effectiveAudit.sourceLabel}
+              </Text>
+              <Text style={styles.sourceCardSub}>
+                {effectiveAudit.programTitle ? `培养方案：${effectiveAudit.programTitle} · ` : ''}
+                同步时间：
+                {new Date(effectiveAudit.syncedAtIso).toLocaleString('zh-CN', {
+                  month: '2-digit',
+                  day: '2-digit',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="school-outline" size={18} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>毕业学分进度核对</Text>
+              <Text style={styles.cardHeaderRight}>
+                {effectiveAudit.totalRequiredCredits !== null
+                  ? `${effectiveAudit.totalEarnedCredits} / ${effectiveAudit.totalRequiredCredits} 学分`
+                  : `已获 ${effectiveAudit.totalEarnedCredits} 学分`}
+              </Text>
+            </View>
+
+            <View style={styles.creditSummaryRow}>
+              <View style={styles.creditStatPill}>
+                <Text style={styles.creditStatVal}>
+                  {effectiveAudit.totalRequiredCredits !== null
+                    ? effectiveAudit.totalRequiredCredits
+                    : '--'}
+                </Text>
+                <Text style={styles.creditStatLbl}>方案要求学分</Text>
+              </View>
+              <View style={styles.creditStatPill}>
+                <Text style={[styles.creditStatVal, { color: COLORS.emerald }]}>
+                  {effectiveAudit.totalEarnedCredits}
+                </Text>
+                <Text style={styles.creditStatLbl}>已获学分</Text>
+              </View>
+              <View style={styles.creditStatPill}>
+                <Text style={[styles.creditStatVal, { color: COLORS.oceanPrimary }]}>
+                  {effectiveAudit.totalInProgressCredits}
+                </Text>
+                <Text style={styles.creditStatLbl}>在修学分</Text>
+              </View>
+              <View style={styles.creditStatPill}>
+                <Text
+                  style={[
+                    styles.creditStatVal,
+                    {
+                      color:
+                        (effectiveAudit.totalRemainingCredits ?? 0) > 0
+                          ? COLORS.coral
+                          : COLORS.emerald,
+                    },
+                  ]}
+                >
+                  {effectiveAudit.totalRemainingCredits !== null
+                    ? effectiveAudit.totalRemainingCredits
+                    : '--'}
+                </Text>
+                <Text style={styles.creditStatLbl}>尚缺学分</Text>
+              </View>
+            </View>
+
+            {effectiveAudit.totalRequiredCredits !== null &&
+              effectiveAudit.totalRequiredCredits > 0 && (
+                <View style={{ marginTop: 10 }}>
+                  <View style={styles.barLabelRow}>
+                    <Text style={styles.subSectionHint}>总体毕业学分完成率</Text>
+                    <Text style={styles.barValue}>
+                      {Math.min(
+                        100,
+                        Math.round(
+                          (effectiveAudit.totalEarnedCredits /
+                            effectiveAudit.totalRequiredCredits) *
+                            100
+                        )
+                      )}
+                      %
+                    </Text>
+                  </View>
+                  <View style={styles.progressTrack}>
+                    <View
+                      style={[
+                        styles.progressFill,
+                        {
+                          width: `${Math.min(
+                            100,
+                            Math.round(
+                              (effectiveAudit.totalEarnedCredits /
+                                effectiveAudit.totalRequiredCredits) *
+                                100
+                            )
+                          )}%`,
+                          backgroundColor: COLORS.oceanPrimary,
+                        },
+                      ]}
+                    />
+                  </View>
+                </View>
+              )}
+          </View>
+
+          <View style={styles.card}>
+            <View style={styles.cardHeader}>
+              <Ionicons name="layers-outline" size={18} color={COLORS.oceanPrimary} />
+              <Text style={styles.cardTitle}>各模块修读进度（{effectiveAudit.modules.length} 项）</Text>
+            </View>
+
+            {effectiveAudit.modules.map((mod) => {
+              const pct =
+                mod.requiredCredits && mod.requiredCredits > 0
+                  ? Math.min(100, Math.round((mod.earnedCredits / mod.requiredCredits) * 100))
+                  : 100;
+              const satisfied =
+                mod.requiredCredits !== null && mod.earnedCredits >= mod.requiredCredits;
+              return (
+                <View key={mod.id} style={styles.auditModRow}>
+                  <View style={styles.barLabelRow}>
+                    <Text style={styles.auditModName} numberOfLines={1}>
+                      {mod.name}
+                    </Text>
+                    <View
+                      style={[
+                        styles.auditStatusPill,
+                        satisfied
+                          ? { backgroundColor: COLORS.emeraldLight }
+                          : mod.remainingCredits !== null && mod.remainingCredits > 0
+                            ? { backgroundColor: COLORS.amberLight }
+                            : { backgroundColor: COLORS.oceanLight },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.auditStatusText,
+                          satisfied
+                            ? { color: '#065F46' }
+                            : mod.remainingCredits !== null && mod.remainingCredits > 0
+                              ? { color: '#B45309' }
+                              : { color: COLORS.oceanDeep },
+                        ]}
+                      >
+                        {satisfied
+                          ? '已修满'
+                          : mod.remainingCredits !== null
+                            ? `差 ${mod.remainingCredits} 分`
+                            : mod.statusText || '已修汇总'}
+                      </Text>
+                    </View>
+                  </View>
+                  <Text style={styles.auditModMeta}>
+                    已获 {mod.earnedCredits} 分
+                    {mod.requiredCredits !== null ? ` / 要求 ${mod.requiredCredits} 分` : ''}
+                    {mod.inProgressCredits > 0 ? ` · 在修 ${mod.inProgressCredits} 分` : ''}
+                    {mod.completedCourses > 0 ? ` · 通过 ${mod.completedCourses} 门` : ''}
+                    {mod.failedCourses > 0 ? ` · 挂科 ${mod.failedCourses} 门` : ''}
+                  </Text>
+                  {mod.requiredCredits !== null && (
+                    <View style={[styles.progressTrack, { marginTop: 5 }]}>
+                      <View
+                        style={[
+                          styles.progressFill,
+                          {
+                            width: `${Math.max(4, pct)}%`,
+                            backgroundColor: satisfied ? COLORS.emerald : COLORS.oceanPrimary,
+                          },
+                        ]}
+                      />
+                    </View>
+                  )}
+                </View>
+              );
+            })}
+
+            {effectiveAudit.note && <Text style={styles.auditFootnote}>{effectiveAudit.note}</Text>}
           </View>
         </ScrollView>
       ) : viewTab === 'overview' ? (
@@ -652,9 +888,16 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
                     : item.gpa >= 3.0
                       ? { bg: COLORS.oceanLight, color: COLORS.oceanPrimary }
                       : { bg: COLORS.amberLight, color: COLORS.amber };
+                const isExpanded = expandedGradeId === item.id;
+                const hasSubScores = Boolean(item.subScores && item.subScores.length > 0);
 
                 return (
-                  <View key={item.id} style={styles.gradeCard}>
+                  <TouchableOpacity
+                    key={item.id}
+                    activeOpacity={0.85}
+                    onPress={() => setExpandedGradeId(isExpanded ? null : item.id)}
+                    style={styles.gradeCard}
+                  >
                     <View style={styles.gradeMain}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.courseName}>{item.courseName}</Text>
@@ -671,6 +914,13 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
                               {item.gpaEstimated ? ' (估算)' : ''}
                             </Text>
                           </View>
+                          {hasSubScores && (
+                            <View style={[styles.tag, { backgroundColor: COLORS.emeraldLight }]}>
+                              <Text style={[styles.tagText, { color: '#065F46' }]}>
+                                分项明细▾
+                              </Text>
+                            </View>
+                          )}
                           {item.examNature && item.examNature !== '正常考试' && (
                             <View style={[styles.tag, { backgroundColor: COLORS.coralLight }]}>
                               <Text style={[styles.tagText, { color: COLORS.coral }]}>
@@ -683,6 +933,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
                           {item.termKey}
                           {item.courseCode ? ` · 代码 ${item.courseCode}` : ''}
                           {item.teacher ? ` · ${item.teacher}` : ''}
+                          {' · 点击查看平时/期末分项'}
                         </Text>
                       </View>
 
@@ -695,7 +946,58 @@ export const GradesScreen: React.FC<Props> = ({ grades, onOpenSync }) => {
                         </Text>
                       </View>
                     </View>
-                  </View>
+
+                    {isExpanded && (
+                      <View style={styles.subScoreBox}>
+                        {hasSubScores && item.subScores ? (
+                          <>
+                            <View style={styles.subScoreSourceRow}>
+                              <Ionicons name="shield-checkmark-outline" size={13} color="#065F46" />
+                              <Text style={styles.subScoreSourceText}>
+                                {item.subScoreSourceLabel || OFFICIAL_GRADE_DETAIL_SOURCE_LABEL}
+                              </Text>
+                            </View>
+                            <View style={styles.subScoreHeader}>
+                              <Text style={[styles.subScoreCol, { flex: 1.5 }]}>考核分项</Text>
+                              <Text style={[styles.subScoreCol, { flex: 0.9, textAlign: 'center' }]}>
+                                占比
+                              </Text>
+                              <Text style={[styles.subScoreCol, { flex: 0.9, textAlign: 'right' }]}>
+                                成绩
+                              </Text>
+                            </View>
+                            {item.subScores.map((sub, sIdx) => (
+                              <View key={`${item.id}-sub-${sIdx}`} style={styles.subScoreRow}>
+                                <Text style={[styles.subScoreVal, { flex: 1.5 }]}>
+                                  {sub.itemName}
+                                </Text>
+                                <Text
+                                  style={[
+                                    styles.subScoreVal,
+                                    { flex: 0.9, textAlign: 'center', color: COLORS.oceanPrimary },
+                                  ]}
+                                >
+                                  {sub.weightText}
+                                </Text>
+                                <Text
+                                  style={[
+                                    styles.subScoreVal,
+                                    { flex: 0.9, textAlign: 'right', fontWeight: '700' },
+                                  ]}
+                                >
+                                  {sub.scoreText}
+                                </Text>
+                              </View>
+                            ))}
+                          </>
+                        ) : (
+                          <Text style={styles.subScoreEmpty}>
+                            来源说明：广东海洋大学正方教务未返回该课程的平时分/卷面占比明细（可能教务未公开该课程分项或属于较早学期；点右上角「教务同步」可尝试拉取最新学期分项明细）。
+                          </Text>
+                        )}
+                      </View>
+                    )}
+                  </TouchableOpacity>
                 );
               })
             )}
@@ -1275,5 +1577,111 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
     marginTop: 2,
+  },
+  sourceCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    padding: 11,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 10,
+  },
+  sourceCardOfficial: {
+    backgroundColor: COLORS.emeraldLight,
+    borderColor: '#A7F3D0',
+  },
+  sourceCardEstimate: {
+    backgroundColor: COLORS.amberLight,
+    borderColor: '#FDE68A',
+  },
+  sourceCardTitle: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    lineHeight: 17,
+  },
+  sourceCardSub: {
+    fontSize: 11,
+    color: COLORS.textSecondary,
+    marginTop: 3,
+  },
+  auditModRow: {
+    paddingVertical: 9,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLORS.borderLight,
+  },
+  auditModName: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    flex: 1,
+    paddingRight: 8,
+  },
+  auditStatusPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 2.5,
+    borderRadius: 6,
+  },
+  auditStatusText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  auditModMeta: {
+    fontSize: 11.5,
+    color: COLORS.textSecondary,
+    marginTop: 3,
+  },
+  auditFootnote: {
+    fontSize: 11.5,
+    color: COLORS.textMuted,
+    marginTop: 10,
+    lineHeight: 17,
+  },
+  subScoreBox: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: COLORS.border,
+    gap: 5,
+  },
+  subScoreSourceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: COLORS.emeraldLight,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 7,
+    marginBottom: 4,
+  },
+  subScoreSourceText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#065F46',
+    flex: 1,
+  },
+  subScoreHeader: {
+    flexDirection: 'row',
+    paddingBottom: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLORS.borderLight,
+  },
+  subScoreCol: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.textMuted,
+  },
+  subScoreRow: {
+    flexDirection: 'row',
+    paddingVertical: 3,
+  },
+  subScoreVal: {
+    fontSize: 12.5,
+    color: COLORS.textPrimary,
+  },
+  subScoreEmpty: {
+    fontSize: 11.5,
+    color: COLORS.textMuted,
+    lineHeight: 17,
   },
 });

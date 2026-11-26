@@ -6,6 +6,7 @@ const {
   withAppBuildGradle,
   withAppDelegate,
   withDangerousMod,
+  withEntitlementsPlist,
   withGradleProperties,
   withInfoPlist,
   withMainApplication,
@@ -43,6 +44,7 @@ import com.facebook.react.modules.network.OkHttpClientProvider
 
 import expo.modules.ApplicationLifecycleDispatcher
 import expo.modules.ExpoReactHostFactory
+import okhttp3.ConnectionPool
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
@@ -80,6 +82,13 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
   fun clearAll() {
     store.clear()
     purgeWebViewStorage()
+  }
+
+  fun hasWfwSession(): Boolean {
+    val now = System.currentTimeMillis()
+    return store.values.any {
+      it.name.equals("WFWSESSID", ignoreCase = true) && it.expiresAt > now && it.value.isNotEmpty()
+    }
   }
 
   private fun purgeWebViewStorage() {
@@ -393,14 +402,18 @@ class MainApplication : Application(), ReactApplication {
     ApplicationLifecycleDispatcher.onApplicationCreate(this)
   }
 
+  private val gdouConnectionPool = ConnectionPool(5, 15, TimeUnit.SECONDS)
+
   private fun configureGdouOkHttpClient() {
     OkHttpClientProvider.setOkHttpClientFactory {
-      // Cache-free builder (zero disk HTTP cache for ephemeral zero-retention auth) with bounded timeouts
+      // Cache-free builder (zero disk HTTP cache for ephemeral zero-retention auth) with short mobile NAT pool & bounded timeouts
       OkHttpClientProvider.createClientBuilder()
         .cache(null)
+        .connectionPool(gdouConnectionPool)
+        .retryOnConnectionFailure(true)
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
         .cookieJar(ephemeralCookieJar)
         .addInterceptor { chain ->
           val orig = chain.request()
@@ -436,25 +449,70 @@ class MainApplication : Application(), ReactApplication {
               .body(respJson.toResponseBody(null))
               .build()
           }
+          if (orig.url.host.equals("gdou-widget-internal.local", ignoreCase = true)) {
+            val buf = Buffer()
+            try {
+              orig.body?.writeTo(buf)
+            } catch (_: Throwable) {}
+            val respJson = GdouWidgetBridge.handleRequest(
+              applicationContext,
+              orig.url.encodedPath,
+              buf.readUtf8()
+            )
+            return@addInterceptor Response.Builder()
+              .request(orig)
+              .protocol(Protocol.HTTP_1_1)
+              .code(200)
+              .message("OK")
+              .header("Content-Type", "application/json")
+              .body(respJson.toResponseBody(null))
+              .build()
+          }
           val resetBefore = orig.header("X-Gdou-Reset-Cookies-Before") == "1"
           val clearAfter = orig.header("X-Gdou-Clear-Cookies-After") == "1"
+          val isDirectProbe = orig.header("X-Gdou-Direct-Probe") == "1"
           if (resetBefore) {
             ephemeralCookieJar.clearAll()
+            gdouConnectionPool.evictAll()
             if (BuildConfig.DEBUG) {
               Log.i("GdouHttp", "RESET_COOKIES before \${orig.method} \${orig.url.host}\${orig.url.encodedPath}")
             }
           }
           // Unconditionally strip ALL internal X-Gdou-* headers regardless of value
           val reqBuilder = orig.newBuilder()
-          var strippedAny = false
+          var modified = false
           for (i in 0 until orig.headers.size) {
             val hName = orig.headers.name(i)
             if (hName.startsWith("X-Gdou-", ignoreCase = true)) {
               reqBuilder.removeHeader(hName)
-              strippedAny = true
+              modified = true
             }
           }
-          val cleanedReq = if (strippedAny) reqBuilder.build() else orig
+          // Upgrade cleartext http://*.gdou.edu.cn BEFORE ConnectInterceptor so usesCleartextTraffic=false never blocks
+          var targetUrl = orig.url
+          if (
+            targetUrl.scheme.equals("http", ignoreCase = true) &&
+            (targetUrl.host.equals("gdou.edu.cn", ignoreCase = true) ||
+              targetUrl.host.endsWith(".gdou.edu.cn", ignoreCase = true))
+          ) {
+            targetUrl = targetUrl.newBuilder().scheme("https").port(443).build()
+            reqBuilder.url(targetUrl)
+            modified = true
+          }
+          // Guard off-campus wfw sessions: never send bare TCP SYN to campus-only jw.gdou.edu.cn (causes 20s timeout)
+          if (
+            !isDirectProbe &&
+            ephemeralCookieJar.hasWfwSession() &&
+            targetUrl.host.equals("jw.gdou.edu.cn", ignoreCase = true)
+          ) {
+            val suffix = targetUrl.encodedPath + (targetUrl.encodedQuery?.let { "?\$it" } ?: "")
+            val wrapped = "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\$suffix".toHttpUrlOrNull()
+            if (wrapped != null) {
+              reqBuilder.url(wrapped)
+              modified = true
+            }
+          }
+          val cleanedReq = if (modified) reqBuilder.build() else orig
           try {
             chain.proceed(cleanedReq)
           } finally {
@@ -483,9 +541,9 @@ class MainApplication : Application(), ReactApplication {
           val builder = resp.newBuilder()
 
           // Upgrade cleartext http://*.gdou.edu.cn redirects to https:// and heal off-campus wfw redirects
-          val loc = resp.header("Location")
+          val loc = resp.header("Location")?.trim()
           var rewrittenLoc: String? = null
-          if (loc != null) {
+          if (!loc.isNullOrEmpty()) {
             val parsedLoc = loc.toHttpUrlOrNull()
             val isGdouHttpLoc = parsedLoc != null &&
               parsedLoc.scheme.equals("http", ignoreCase = true) &&
@@ -496,30 +554,38 @@ class MainApplication : Application(), ReactApplication {
             } else {
               loc
             }
+            val isNetcheck = effectiveReq.url.host.equals("netcheck.gdou.edu.cn", ignoreCase = true)
             val isOnWfw = effectiveReq.url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
+            val isWfwActive = isOnWfw || (!isNetcheck && ephemeralCookieJar.hasWfwSession())
             val isInWfwProxiedPath = isOnWfw && effectiveReq.url.encodedPath.startsWith("/https://", ignoreCase = true)
             val wrongWfwSsoRe = Regex(
-              "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn)?(?:/https?://authserver\\\\.gdou\\\\.edu\\\\.cn)?/sso/jziotlogin([?#].*)?\$",
+              "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?)?(?:/https?://authserver\\\\.gdou\\\\.edu\\\\.cn)?/sso/jziotlogin([?#].*)?\$",
               RegexOption.IGNORE_CASE
             )
             val bareJwLocRe = Regex(
-              "^https?://jw\\\\.gdou\\\\.edu\\\\.cn(/.*)?\$",
+              "^https?://jw\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?([/?#].*)?\$",
               RegexOption.IGNORE_CASE
             )
             val bareAuthLocRe = Regex(
-              "^https?://authserver\\\\.gdou\\\\.edu\\\\.cn(/.*)?\$",
+              "^https?://authserver\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?([/?#].*)?\$",
               RegexOption.IGNORE_CASE
             )
             val wrongSsoMatch = if (isOnWfw) wrongWfwSsoRe.matchEntire(upgradedCandidate) else null
-            val bareJwMatch = if (isOnWfw) bareJwLocRe.matchEntire(upgradedCandidate) else null
+            val bareJwMatch = if (isWfwActive) bareJwLocRe.matchEntire(upgradedCandidate) else null
             val bareAuthMatch = if (isInWfwProxiedPath) bareAuthLocRe.matchEntire(upgradedCandidate) else null
             rewrittenLoc = when {
               wrongSsoMatch != null ->
                 "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin\${wrongSsoMatch.groupValues[1]}"
-              bareJwMatch != null ->
-                "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\${bareJwMatch.groupValues[1]}"
-              bareAuthMatch != null ->
-                "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn\${bareAuthMatch.groupValues[1]}"
+              bareJwMatch != null -> {
+                val rest = bareJwMatch.groupValues[1]
+                val normRest = if (rest.isNotEmpty() && !rest.startsWith("/")) "/\$rest" else rest
+                "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\$normRest"
+              }
+              bareAuthMatch != null -> {
+                val rest = bareAuthMatch.groupValues[1]
+                val normRest = if (rest.isNotEmpty() && !rest.startsWith("/")) "/\$rest" else rest
+                "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn\$normRest"
+              }
               loc.startsWith("/authserver", ignoreCase = true) &&
                 reqUrl.contains("wfw.gdou.edu.cn/https://authserver.gdou.edu.cn", ignoreCase = true) ->
                 "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn\$loc"
@@ -576,9 +642,17 @@ import Foundation
 import React
 import UIKit
 import WebKit
+#if canImport(WidgetKit)
+import WidgetKit
+#endif
+#if canImport(ActivityKit)
+import ActivityKit
+#endif
+#if canImport(PhotosUI)
+import PhotosUI
+#endif
 #if canImport(AlarmKit)
 import AlarmKit
-import ActivityKit
 import SwiftUI
 #endif
 
@@ -1032,6 +1106,19 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
     purgeSystemStores()
   }
 
+  func hasWfwSession() -> Bool {
+    let now = Date()
+    lock.lock()
+    defer { lock.unlock() }
+    for cookie in cookiesByKey.values {
+      if cookie.name.caseInsensitiveCompare("WFWSESSID") == .orderedSame && !cookie.value.isEmpty {
+        let notExpired = cookie.expiresDate.map { $0 > now } ?? true
+        if notExpired { return true }
+      }
+    }
+    return false
+  }
+
   func purgeSystemStores() {
     if let sharedCookies = HTTPCookieStorage.shared.cookies {
       for cookie in sharedCookies {
@@ -1181,6 +1268,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
   private static let handledKey = "GdouEphemeralURLProtocolHandled"
   private static let resetHeader = "X-Gdou-Reset-Cookies-Before"
   private static let clearHeader = "X-Gdou-Clear-Cookies-After"
+  private static let directProbeHeader = "X-Gdou-Direct-Probe"
 
   private var innerSession: URLSession?
   private var innerTask: URLSessionDataTask?
@@ -1235,20 +1323,36 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       }
     }
 
-    for jwPrefix in ["https://jw.gdou.edu.cn", "http://jw.gdou.edu.cn"] {
+    for jwPrefix in [
+      "https://jw.gdou.edu.cn:443",
+      "https://jw.gdou.edu.cn",
+      "http://jw.gdou.edu.cn:80",
+      "http://jw.gdou.edu.cn",
+    ] {
       if lower.hasPrefix(jwPrefix) {
         let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: jwPrefix.count)
         let suffix = String(trimmed[suffixStart...])
-        return URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" + suffix)
+        if suffix.isEmpty || suffix.hasPrefix("/") || suffix.hasPrefix("?") || suffix.hasPrefix("#") {
+          let normSuffix = (!suffix.isEmpty && !suffix.hasPrefix("/")) ? ("/" + suffix) : suffix
+          return URL(string: "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn" + normSuffix)
+        }
       }
     }
 
     if isInWfwProxiedPath {
-      for authPrefix in ["https://authserver.gdou.edu.cn", "http://authserver.gdou.edu.cn"] {
+      for authPrefix in [
+        "https://authserver.gdou.edu.cn:443",
+        "https://authserver.gdou.edu.cn",
+        "http://authserver.gdou.edu.cn:80",
+        "http://authserver.gdou.edu.cn",
+      ] {
         if lower.hasPrefix(authPrefix) {
           let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: authPrefix.count)
           let suffix = String(trimmed[suffixStart...])
-          return URL(string: "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn" + suffix)
+          if suffix.isEmpty || suffix.hasPrefix("/") || suffix.hasPrefix("?") || suffix.hasPrefix("#") {
+            let normSuffix = (!suffix.isEmpty && !suffix.hasPrefix("/")) ? ("/" + suffix) : suffix
+            return URL(string: "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn" + normSuffix)
+          }
         }
       }
     }
@@ -1334,12 +1438,39 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       }
       return
     }
+    if initialUrl.host?.lowercased() == "gdou-widget-internal.local" {
+      let path = initialUrl.path
+      let reqBodyData: Data
+      if let directBody = request.httpBody {
+        reqBodyData = directBody
+      } else if let stream = request.httpBodyStream {
+        reqBodyData = Self.readBodyStream(stream, maxBytes: 8 * 1024 * 1024)
+      } else {
+        reqBodyData = Data()
+      }
+      self.alarmTask = Task { [weak self] in
+        let respData = await GdouIosWidgetBridge.handleRequest(path: path, bodyData: reqBodyData)
+        guard !Task.isCancelled, let self = self else { return }
+        if let resp = HTTPURLResponse(
+          url: initialUrl,
+          statusCode: 200,
+          httpVersion: "HTTP/1.1",
+          headerFields: ["Content-Type": "application/json"]
+        ) {
+          self.client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+          self.client?.urlProtocol(self, didLoad: respData)
+          self.client?.urlProtocolDidFinishLoading(self)
+        }
+      }
+      return
+    }
     let mutable = ((request as NSURLRequest).mutableCopy() as? NSMutableURLRequest) ?? NSMutableURLRequest(url: initialUrl)
     URLProtocol.setProperty(true, forKey: Self.handledKey, in: mutable)
 
     shouldFollowRedirects = (URLProtocol.property(forKey: "shouldFollowRedirects", in: request) as? Bool) ?? true
     let resetBefore = mutable.value(forHTTPHeaderField: Self.resetHeader) == "1"
     clearAfter = mutable.value(forHTTPHeaderField: Self.clearHeader) == "1"
+    let isDirectProbe = mutable.value(forHTTPHeaderField: Self.directProbeHeader) == "1"
 
     if resetBefore {
       GdouEphemeralCookieStore.shared.clearAll()
@@ -1353,6 +1484,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     }
     mutable.setValue(nil, forHTTPHeaderField: Self.resetHeader)
     mutable.setValue(nil, forHTTPHeaderField: Self.clearHeader)
+    mutable.setValue(nil, forHTTPHeaderField: Self.directProbeHeader)
 
     // Materialize httpBodyStream -> httpBody so POST forms keep explicit Content-Length (never chunked)
     if mutable.httpBody == nil, let stream = mutable.httpBodyStream {
@@ -1364,13 +1496,14 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       }
     }
 
-    // Upgrade cleartext http://*.gdou.edu.cn/ to https:// and heal wrong wfw SSO paths
+    // Upgrade cleartext http://*.gdou.edu.cn/ to https:// and heal wrong wfw SSO paths / bare off-campus jw URLs
     if let curUrl = mutable.url {
       if let upgraded = Self.upgradeGdouHttpUrl(curUrl) {
         mutable.url = upgraded
       }
       let curIsWfw = (mutable.url?.host ?? "").lowercased() == "wfw.gdou.edu.cn"
-      if let healed = Self.healWfwRedirectUrl(mutable.url?.absoluteString ?? "", isOnWfw: curIsWfw) {
+      let shouldGuardWfw = curIsWfw || (!isDirectProbe && GdouEphemeralCookieStore.shared.hasWfwSession())
+      if let healed = Self.healWfwRedirectUrl(mutable.url?.absoluteString ?? "", isOnWfw: shouldGuardWfw) {
         mutable.url = healed
       }
     }
@@ -1395,8 +1528,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     config.httpCookieStorage = nil
     config.httpShouldSetCookies = false
     config.httpCookieAcceptPolicy = .never
-    config.timeoutIntervalForRequest = 25
-    config.timeoutIntervalForResource = 45
+    config.timeoutIntervalForRequest = 35
+    config.timeoutIntervalForResource = 60
 
     let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     self.innerSession = session
@@ -1448,7 +1581,8 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       task.originalRequest?.url?.absoluteString ??
       ""
     let lowerSource = sourceUrlStr.lowercased()
-    let isOnWfw = lowerSource.contains("wfw.gdou.edu.cn")
+    let isNetcheck = lowerSource.contains("netcheck.gdou.edu.cn")
+    let isOnWfw = lowerSource.contains("wfw.gdou.edu.cn") || (!isNetcheck && GdouEphemeralCookieStore.shared.hasWfwSession())
     let isInWfwProxiedPath = lowerSource.contains("wfw.gdou.edu.cn/https://")
 
     if let loc = rawLoc {
@@ -1550,6 +1684,191 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
   }
 }
 
+#if canImport(PhotosUI)
+@MainActor
+final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
+  private var continuation: CheckedContinuation<String?, Never>?
+  private static var activeCoordinator: GdouIosPhotoPickerCoordinator?
+
+  func present() async -> String? {
+    await withCheckedContinuation { cont in
+      self.continuation = cont
+      Self.activeCoordinator = self
+      guard let rootVc = Self.topViewController() else {
+        self.finish(with: nil)
+        return
+      }
+      var cfg = PHPickerConfiguration(photoLibrary: .shared())
+      cfg.selectionLimit = 1
+      cfg.filter = .images
+      let picker = PHPickerViewController(configuration: cfg)
+      picker.delegate = self
+      picker.presentationController?.delegate = self
+      rootVc.present(picker, animated: true)
+    }
+  }
+
+  private static func topViewController() -> UIViewController? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let keyWindow = scenes.flatMap(\\.windows).first(where: \\.isKeyWindow) ?? scenes.first?.windows.first
+    var top = keyWindow?.rootViewController
+    while let presented = top?.presentedViewController {
+      top = presented
+    }
+    return top
+  }
+
+  private func finish(with uri: String?) {
+    let cont = self.continuation
+    self.continuation = nil
+    Self.activeCoordinator = nil
+    cont?.resume(returning: uri)
+  }
+
+  nonisolated func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+    Task { @MainActor in
+      self.finish(with: nil)
+    }
+  }
+
+  nonisolated func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    Task { @MainActor in
+      picker.dismiss(animated: true)
+      guard let provider = results.first?.itemProvider,
+            provider.canLoadObject(ofClass: UIImage.self) else {
+        self.finish(with: nil)
+        return
+      }
+      provider.loadObject(ofClass: UIImage.self) { object, _ in
+        var savedUri: String? = nil
+        if let image = object as? UIImage,
+           let jpegData = image.jpegData(compressionQuality: 0.88),
+           let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+          let dir = docs.appendingPathComponent("gdou-wallpaper", isDirectory: true)
+          try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+          let target = dir.appendingPathComponent("custom-bg-\\(Int(Date().timeIntervalSince1970)).jpg")
+          if (try? jpegData.write(to: target, options: .atomic)) != nil {
+            savedUri = target.absoluteString
+          }
+        }
+        Task { @MainActor in
+          self.finish(with: savedUri)
+        }
+      }
+    }
+  }
+}
+#endif
+
+/// Native iOS bridge for WidgetKit App Group sync, Dynamic Island / Live Activity (ActivityKit),
+/// and zero-permission PHPicker custom schedule background selection.
+enum GdouIosWidgetBridge {
+  private static let storageKey = "gdou_widget_payload_v1"
+
+  private static func appGroupSuiteName() -> String {
+    let bid = Bundle.main.bundleIdentifier ?? "cn.edu.gdou.schedule"
+    return "group.\\(bid)"
+  }
+
+  private static func encodeJSON(_ obj: [String: Any]) -> Data {
+    if let data = try? JSONSerialization.data(withJSONObject: obj, options: []) {
+      return data
+    }
+    return Data("{\\"ok\\":false,\\"error\\":\\"JSON encode failed\\"}".utf8)
+  }
+
+  static func handleRequest(path: String, bodyData: Data) async -> Data {
+    if path.hasSuffix("/sync-widget") {
+      guard let rawJson = String(data: bodyData, encoding: .utf8), !rawJson.isEmpty else {
+        return encodeJSON(["ok": false, "error": "Empty widget payload"])
+      }
+      let suite = appGroupSuiteName()
+      if let sharedDefaults = UserDefaults(suiteName: suite) {
+        sharedDefaults.set(rawJson, forKey: storageKey)
+      }
+      UserDefaults.standard.set(rawJson, forKey: storageKey)
+      #if canImport(WidgetKit)
+      WidgetCenter.shared.reloadAllTimelines()
+      #endif
+      return encodeJSON(["ok": true, "suite": suite])
+    }
+
+    if path.hasSuffix("/live-activity/stop") {
+      #if canImport(ActivityKit)
+      if #available(iOS 16.2, *) {
+        for activity in Activity<GdouScheduleActivityAttributes>.activities {
+          await activity.end(nil, dismissalPolicy: .immediate)
+        }
+        return encodeJSON(["ok": true, "active": false])
+      }
+      #endif
+      return encodeJSON(["ok": true, "active": false])
+    }
+
+    if path.hasSuffix("/live-activity/upsert") {
+      #if canImport(ActivityKit)
+      if #available(iOS 16.2, *) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+          return encodeJSON(["ok": false, "error": "系统未开启实时活动权限，请在设置中允许海大课表开启实时活动"])
+        }
+        guard let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any] else {
+          return encodeJSON(["ok": false, "error": "Invalid Live Activity JSON"])
+        }
+        let termLabel = (obj["termLabel"] as? String) ?? "海大课表"
+        let weekNum = (obj["week"] as? Int) ?? 1
+        let weekdayLabel = (obj["weekdayLabel"] as? String) ?? ""
+        let headline = (obj["headline"] as? String) ?? "今日课表"
+        let room = (obj["activeCourseRoom"] as? String) ?? ""
+        let timeSpan = (obj["activeCourseTime"] as? String) ?? ""
+        let subline = (obj["subline"] as? String) ?? ""
+        let stateStr = (obj["state"] as? String) ?? "upcoming"
+
+        let contentState = GdouScheduleActivityAttributes.ContentState(
+          weekLabel: "第\\(weekNum)周 \\(weekdayLabel)",
+          headline: headline,
+          room: room,
+          timeSpan: timeSpan,
+          subline: subline,
+          state: stateStr
+        )
+        let content = ActivityContent(state: contentState, staleDate: Date().addingTimeInterval(3600))
+        if let existing = Activity<GdouScheduleActivityAttributes>.activities.first {
+          await existing.update(content)
+          return encodeJSON(["ok": true, "active": true, "updated": true])
+        }
+        do {
+          _ = try Activity.request(
+            attributes: GdouScheduleActivityAttributes(termLabel: termLabel),
+            content: content,
+            pushType: nil
+          )
+          return encodeJSON(["ok": true, "active": true, "created": true])
+        } catch {
+          return encodeJSON(["ok": false, "error": error.localizedDescription])
+        }
+      }
+      #endif
+      return encodeJSON(["ok": false, "error": "当前 iOS 版本低于 16.2，不支持灵动岛实时活动"])
+    }
+
+    if path.hasSuffix("/pick-background") {
+      #if canImport(PhotosUI)
+      let uri = await MainActor.run { () async -> String? in
+        await GdouIosPhotoPickerCoordinator().present()
+      }
+      if let uri = uri {
+        return encodeJSON(["ok": true, "uri": uri])
+      }
+      return encodeJSON(["ok": false, "cancelled": true])
+      #else
+      return encodeJSON(["ok": false, "error": "PhotosUI unavailable"])
+      #endif
+    }
+
+    return encodeJSON(["ok": false, "error": "Unknown widget bridge path: \\(path)"])
+  }
+}
+
 @objc public final class GdouEphemeralNetworking: NSObject {
   private static func makeEphemeralSessionConfiguration() -> URLSessionConfiguration {
     let config = URLSessionConfiguration.ephemeral
@@ -1597,7 +1916,9 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
         let allowedProtocolControl =
           isHttpProtocol &&
           val == "1" &&
-          (lower == "x-gdou-reset-cookies-before" || lower == "x-gdou-clear-cookies-after")
+          (lower == "x-gdou-reset-cookies-before" ||
+            lower == "x-gdou-clear-cookies-after" ||
+            lower == "x-gdou-direct-probe")
         if !allowedProtocolControl {
           mutable?.setValue(nil, forHTTPHeaderField: key)
           modified = true
@@ -1626,6 +1947,802 @@ const PROGUARD_RULES = `# GDOU Schedule R8 / ProGuard keep rules
 -dontwarn org.openjsse.**
 `;
 
+const ANDROID_WIDGET_PROVIDER_KT = `package cn.edu.gdou.schedule
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProvider
+import android.content.ComponentName
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.util.Base64
+import android.util.Log
+import android.widget.RemoteViews
+import org.json.JSONArray
+import org.json.JSONObject
+
+object GdouWidgetStore {
+  private const val PREF_NAME = "gdou_widget_prefs"
+  private const val KEY_PAYLOAD = "widget_payload_v1"
+
+  fun savePayload(context: Context, jsonStr: String) {
+    context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+      .edit()
+      .putString(KEY_PAYLOAD, jsonStr)
+      .apply()
+  }
+
+  fun readPayload(context: Context): JSONObject? {
+    val raw = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+      .getString(KEY_PAYLOAD, null) ?: return null
+    return try {
+      JSONObject(raw)
+    } catch (_: Throwable) {
+      null
+    }
+  }
+}
+
+class GdouScheduleWidgetProvider : AppWidgetProvider() {
+  override fun onUpdate(
+    context: Context,
+    appWidgetManager: AppWidgetManager,
+    appWidgetIds: IntArray
+  ) {
+    for (widgetId in appWidgetIds) {
+      updateSingleWidget(context, appWidgetManager, widgetId)
+    }
+  }
+
+  companion object {
+    fun updateAllWidgets(context: Context) {
+      try {
+        val manager = AppWidgetManager.getInstance(context)
+        val ids = manager.getAppWidgetIds(
+          ComponentName(context, GdouScheduleWidgetProvider::class.java)
+        )
+        for (id in ids) {
+          updateSingleWidget(context, manager, id)
+        }
+      } catch (err: Throwable) {
+        Log.w("GdouWidget", "updateAllWidgets failed: \${err.message}")
+      }
+    }
+
+    private fun updateSingleWidget(
+      context: Context,
+      manager: AppWidgetManager,
+      widgetId: Int
+    ) {
+      val views = RemoteViews(context.packageName, R.layout.gdou_widget_schedule)
+      val payload = GdouWidgetStore.readPayload(context)
+
+      if (payload != null) {
+        val week = payload.optInt("week", 1)
+        val weekday = payload.optString("weekdayLabel", "")
+        val badge = payload.optString("overrideBadge", "")
+        val header = if (badge.isNotEmpty() && badge != "null") {
+          "海大课表 · 第\${week}周 \$weekday · \$badge"
+        } else {
+          "海大课表 · 第\${week}周 \$weekday"
+        }
+        val headline = payload.optString("headline", "今日课表")
+        val subline = payload.optString("subline", "打开海大课表同步最新安排")
+        val nextExam = payload.optString("nextExamTitle", "")
+        val nextExamCd = payload.optString("nextExamCountdown", "")
+
+        views.setTextViewText(R.id.widget_header_title, header)
+        views.setTextViewText(R.id.widget_headline, headline)
+        views.setTextViewText(
+          R.id.widget_subline,
+          if (nextExam.isNotEmpty() && nextExamCd.isNotEmpty()) {
+            "\$subline  |  考:\$nextExam(\$nextExamCd)"
+          } else {
+            subline
+          }
+        )
+
+        val items = payload.optJSONArray("todayItems") ?: JSONArray()
+        val sb = StringBuilder()
+        val limit = minOf(items.length(), 4)
+        for (i in 0 until limit) {
+          val it = items.optJSONObject(i) ?: continue
+          val t = it.optString("time", "")
+          val n = it.optString("name", "")
+          val loc = it.optString("location", "")
+          if (sb.isNotEmpty()) sb.append("\\n")
+          sb.append("\$t  \$n  @\$loc")
+        }
+        views.setTextViewText(
+          R.id.widget_items_list,
+          if (sb.isNotEmpty()) sb.toString() else "今日暂无排课，祝学习顺利！"
+        )
+      }
+
+      val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+        ?: Intent(context, MainActivity::class.java)
+      launchIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+      val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+      } else {
+        PendingIntent.FLAG_UPDATE_CURRENT
+      }
+      val pendingIntent = PendingIntent.getActivity(context, 42018, launchIntent, flags)
+      views.setOnClickPendingIntent(R.id.widget_root, pendingIntent)
+
+      manager.updateAppWidget(widgetId, views)
+    }
+  }
+}
+
+object GdouOngoingNotificationHelper {
+  private const val CHANNEL_ID = "gdou-today-ongoing"
+  private const val NOTIF_ID = 42019
+
+  fun update(context: Context, enabled: Boolean, payload: JSONObject?): Boolean {
+    return try {
+      val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        ?: return false
+      if (!enabled || payload == null) {
+        nm.cancel(NOTIF_ID)
+        return true
+      }
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val channel = NotificationChannel(
+          CHANNEL_ID,
+          "海大课表 · 通知栏常驻今日课表",
+          NotificationManager.IMPORTANCE_LOW
+        ).apply {
+          description = "静默常驻展示当前/下一节海大课程与教室号"
+          setShowBadge(false)
+          enableVibration(false)
+          setSound(null, null)
+        }
+        nm.createNotificationChannel(channel)
+      }
+
+      val week = payload.optInt("week", 1)
+      val weekday = payload.optString("weekdayLabel", "")
+      val headline = payload.optString("headline", "海大课表 · 今日课程")
+      val subline = payload.optString("subline", "")
+      val items = payload.optJSONArray("todayItems") ?: JSONArray()
+      val bigText = StringBuilder(subline)
+      for (i in 0 until minOf(items.length(), 6)) {
+        val it = items.optJSONObject(i) ?: continue
+        bigText.append("\\n• ").append(it.optString("time", ""))
+          .append(" ").append(it.optString("name", ""))
+          .append(" @").append(it.optString("location", ""))
+      }
+
+      val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+        ?: Intent(context, MainActivity::class.java)
+      launchIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+      val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+      } else {
+        PendingIntent.FLAG_UPDATE_CURRENT
+      }
+      val pi = PendingIntent.getActivity(context, NOTIF_ID, launchIntent, flags)
+
+      val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Notification.Builder(context, CHANNEL_ID)
+      } else {
+        @Suppress("DEPRECATION")
+        Notification.Builder(context)
+      }
+      val notif = builder
+        .setSmallIcon(context.applicationInfo.icon)
+        .setContentTitle("第\${week}周\$weekday · \$headline")
+        .setContentText(subline)
+        .setStyle(Notification.BigTextStyle().bigText(bigText.toString()))
+        .setOngoing(true)
+        .setOnlyAlertOnce(true)
+        .setContentIntent(pi)
+        .build()
+
+      nm.notify(NOTIF_ID, notif)
+      true
+    } catch (err: Throwable) {
+      Log.w("GdouOngoing", "Ongoing notification update failed: \${err.message}")
+      false
+    }
+  }
+}
+
+object GdouMediaSaver {
+  fun saveBase64Png(context: Context, fileName: String, base64Data: String): String {
+    return try {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        return JSONObject().put("ok", false).put("error", "Android 10 以下请使用分享按钮保存").toString()
+      }
+      val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+      val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+        put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/海大课表")
+        put(MediaStore.Images.Media.IS_PENDING, 1)
+      }
+      val resolver = context.contentResolver
+      val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        ?: return JSONObject().put("ok", false).put("error", "无法创建相册图片条目").toString()
+      resolver.openOutputStream(uri)?.use { out ->
+        out.write(bytes)
+        out.flush()
+      }
+      values.clear()
+      values.put(MediaStore.Images.Media.IS_PENDING, 0)
+      resolver.update(uri, values, null, null)
+      JSONObject().put("ok", true).put("uri", uri.toString()).toString()
+    } catch (err: Throwable) {
+      JSONObject().put("ok", false).put("error", err.message ?: err.javaClass.simpleName).toString()
+    }
+  }
+}
+
+object GdouWidgetBridge {
+  fun handleRequest(context: Context, path: String, bodyText: String): String {
+    return try {
+      when {
+        path.endsWith("/sync-widget") -> {
+          GdouWidgetStore.savePayload(context, bodyText)
+          GdouScheduleWidgetProvider.updateAllWidgets(context)
+          JSONObject().put("ok", true).toString()
+        }
+        path.endsWith("/ongoing-notification") -> {
+          val obj = if (bodyText.isNotBlank()) JSONObject(bodyText) else JSONObject()
+          val enabled = obj.optBoolean("enabled", false)
+          val payload = obj.optJSONObject("payload")
+          val ok = GdouOngoingNotificationHelper.update(context, enabled, payload)
+          JSONObject().put("ok", ok).toString()
+        }
+        path.endsWith("/pick-background") -> {
+          GdouMediaPickerActivity.pickImageBlocking(context)
+        }
+        path.endsWith("/save-image") -> {
+          val obj = JSONObject(bodyText)
+          val fileName = obj.optString("fileName", "haida-schedule.png")
+          val b64 = obj.optString("base64", "")
+          GdouMediaSaver.saveBase64Png(context, fileName, b64)
+        }
+        else -> JSONObject().put("ok", false).put("error", "Unknown widget bridge path: \$path").toString()
+      }
+    } catch (err: Throwable) {
+      JSONObject().put("ok", false).put("error", err.message ?: err.javaClass.simpleName).toString()
+    }
+  }
+}
+`;
+
+const ANDROID_MEDIA_PICKER_KT = `package cn.edu.gdou.schedule
+
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+/**
+ * Zero-permission Android SAF image picker proxy Activity (ACTION_OPEN_DOCUMENT).
+ * Requires ZERO READ_EXTERNAL_STORAGE / READ_MEDIA_IMAGES permissions.
+ */
+class GdouMediaPickerActivity : Activity() {
+  companion object {
+    private const val REQ_CODE_PICK = 42021
+    @Volatile
+    private var pendingLatch: CountDownLatch? = null
+    @Volatile
+    private var pendingResultJson: String = """{"ok":false,"cancelled":true}"""
+
+    fun pickImageBlocking(context: Context): String {
+      val latch = CountDownLatch(1)
+      pendingResultJson = """{"ok":false,"cancelled":true}"""
+      pendingLatch = latch
+      val intent = Intent(context, GdouMediaPickerActivity::class.java).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      context.startActivity(intent)
+      latch.await(90, TimeUnit.SECONDS)
+      pendingLatch = null
+      return pendingResultJson
+    }
+  }
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    try {
+      val pickIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE)
+        type = "image/*"
+      }
+      @Suppress("DEPRECATION")
+      startActivityForResult(pickIntent, REQ_CODE_PICK)
+    } catch (err: Throwable) {
+      pendingResultJson = JSONObject()
+        .put("ok", false)
+        .put("error", err.message ?: "无法调起系统相册")
+        .toString()
+      pendingLatch?.countDown()
+      finish()
+    }
+  }
+
+  @Deprecated("Deprecated in Java")
+  override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    super.onActivityResult(requestCode, resultCode, data)
+    if (requestCode == REQ_CODE_PICK) {
+      val pickedUri = if (resultCode == RESULT_OK) data?.data else null
+      if (pickedUri != null) {
+        try {
+          val dir = File(filesDir, "gdou-wallpaper")
+          if (!dir.exists()) dir.mkdirs()
+          val outFile = File(dir, "custom-bg-\${System.currentTimeMillis()}.jpg")
+          contentResolver.openInputStream(pickedUri)?.use { input ->
+            outFile.outputStream().use { output ->
+              input.copyTo(output)
+            }
+          }
+          pendingResultJson = JSONObject()
+            .put("ok", true)
+            .put("uri", "file://" + outFile.absolutePath)
+            .toString()
+        } catch (err: Throwable) {
+          pendingResultJson = JSONObject()
+            .put("ok", false)
+            .put("error", err.message ?: "复制背景图失败")
+            .toString()
+        }
+      } else {
+        pendingResultJson = JSONObject().put("ok", false).put("cancelled", true).toString()
+      }
+      pendingLatch?.countDown()
+      finish()
+    }
+  }
+}
+`;
+
+const ANDROID_WIDGET_BG_XML = `<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient
+        android:angle="135"
+        android:startColor="#003B90"
+        android:endColor="#0284C7" />
+    <corners android:radius="18dp" />
+</shape>
+`;
+
+const ANDROID_WIDGET_LAYOUT_XML = `<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="@drawable/gdou_widget_bg">
+
+    <TextView
+        android:id="@+id/widget_header_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="海大课表 · 今日课程"
+        android:textColor="#BAE6FD"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/widget_headline"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="打开海大课表同步课表"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/widget_subline"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="点击进入海大课表查看全部安排"
+        android:textColor="#E0F2FE"
+        android:textSize="11sp"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/widget_items_list"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="6dp"
+        android:text="支持桌面直看今日课表与考试倒计时"
+        android:textColor="#F8FAFC"
+        android:textSize="11.5sp"
+        android:lineSpacingExtra="2dp"
+        android:maxLines="4"
+        android:ellipsize="end" />
+</LinearLayout>
+`;
+
+const ANDROID_WIDGET_INFO_XML = `<?xml version="1.0" encoding="utf-8"?>
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="110dp"
+    android:targetCellWidth="4"
+    android:targetCellHeight="2"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/gdou_widget_schedule"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />
+`;
+
+const IOS_ACTIVITY_ATTRIBUTES_SWIFT = `#if canImport(ActivityKit)
+import ActivityKit
+import Foundation
+
+@available(iOS 16.1, *)
+public nonisolated struct GdouScheduleActivityAttributes: ActivityAttributes {
+  public nonisolated struct ContentState: Codable, Hashable, Sendable {
+    public var weekLabel: String
+    public var headline: String
+    public var room: String
+    public var timeSpan: String
+    public var subline: String
+    public var state: String
+
+    public init(
+      weekLabel: String,
+      headline: String,
+      room: String,
+      timeSpan: String,
+      subline: String,
+      state: String
+    ) {
+      self.weekLabel = weekLabel
+      self.headline = headline
+      self.room = room
+      self.timeSpan = timeSpan
+      self.subline = subline
+      self.state = state
+    }
+  }
+
+  public var termLabel: String
+
+  public init(termLabel: String) {
+    self.termLabel = termLabel
+  }
+}
+#endif
+`;
+
+function buildIosWidgetExtensionSwift(appGroupId) {
+  return `import Foundation
+import SwiftUI
+import WidgetKit
+#if canImport(ActivityKit)
+import ActivityKit
+#endif
+
+struct GdouWidgetCourseRow: Codable, Hashable {
+  let name: String
+  let location: String
+  let time: String
+  let sectionText: String
+  let status: String
+}
+
+struct GdouWidgetPayload: Codable {
+  let updatedAtIso: String?
+  let termLabel: String?
+  let dateStr: String?
+  let week: Int?
+  let weekdayLabel: String?
+  let overrideBadge: String?
+  let state: String?
+  let headline: String?
+  let subline: String?
+  let activeCourseName: String?
+  let activeCourseRoom: String?
+  let activeCourseTime: String?
+  let todayItems: [GdouWidgetCourseRow]?
+  let nextExamTitle: String?
+  let nextExamCountdown: String?
+}
+
+struct GdouScheduleEntry: TimelineEntry {
+  let date: Date
+  let payload: GdouWidgetPayload?
+}
+
+struct GdouScheduleProvider: TimelineProvider {
+  private let groupSuite = "${appGroupId}"
+  private let storageKey = "gdou_widget_payload_v1"
+
+  private func loadPayload() -> GdouWidgetPayload? {
+    let raw =
+      UserDefaults(suiteName: groupSuite)?.string(forKey: storageKey) ??
+      UserDefaults.standard.string(forKey: storageKey)
+    guard let raw = raw, let data = raw.data(using: .utf8) else { return nil }
+    return try? JSONDecoder().decode(GdouWidgetPayload.self, from: data)
+  }
+
+  func placeholder(in context: Context) -> GdouScheduleEntry {
+    GdouScheduleEntry(date: Date(), payload: nil)
+  }
+
+  func getSnapshot(in context: Context, completion: @escaping (GdouScheduleEntry) -> Void) {
+    completion(GdouScheduleEntry(date: Date(), payload: loadPayload()))
+  }
+
+  func getTimeline(in context: Context, completion: @escaping (Timeline<GdouScheduleEntry>) -> Void) {
+    let now = Date()
+    let entry = GdouScheduleEntry(date: now, payload: loadPayload())
+    let refresh = Calendar.current.date(byAdding: .minute, value: 30, to: now) ?? now.addingTimeInterval(1800)
+    completion(Timeline(entries: [entry], policy: .after(refresh)))
+  }
+}
+
+struct GdouScheduleWidgetEntryView: View {
+  var entry: GdouScheduleProvider.Entry
+  @Environment(\\.widgetFamily) var family
+
+  var body: some View {
+    let p = entry.payload
+    let week = p?.week ?? 1
+    let weekday = p?.weekdayLabel ?? ""
+    let headline = p?.headline ?? "海大课表"
+    let subline = p?.subline ?? "打开 App 同步今日课表"
+    let items = p?.todayItems ?? []
+
+    Group {
+      if family == .accessoryRectangular {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("海大 第\\(week)周 \\(weekday)")
+            .font(.caption2).bold()
+          Text(headline)
+            .font(.caption).bold().lineLimit(1)
+          Text(p?.activeCourseRoom?.isEmpty == false ? "@\\(p!.activeCourseRoom!)" : subline)
+            .font(.caption2).lineLimit(1)
+        }
+      } else {
+        VStack(alignment: .leading, spacing: 5) {
+          HStack {
+            Text("海大课表 · 第\\(week)周 \\(weekday)")
+              .font(.caption2).bold()
+              .foregroundColor(Color(red: 0.73, green: 0.90, blue: 0.99))
+            Spacer()
+            if let badge = p?.overrideBadge, !badge.isEmpty {
+              Text(badge)
+                .font(.system(size: 9, weight: .bold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.orange.opacity(0.85))
+                .foregroundColor(.white)
+                .cornerRadius(4)
+            }
+          }
+          Text(headline)
+            .font(.subheadline).bold()
+            .foregroundColor(.white)
+            .lineLimit(1)
+          Text(subline)
+            .font(.caption2)
+            .foregroundColor(Color.white.opacity(0.86))
+            .lineLimit(1)
+
+          if family == .systemMedium {
+            Divider().background(Color.white.opacity(0.22))
+            if items.isEmpty {
+              Text("今日暂无排课，适合去自习或休息")
+                .font(.caption2)
+                .foregroundColor(Color.white.opacity(0.85))
+            } else {
+              ForEach(items.prefix(3), id: \\.self) { row in
+                HStack(spacing: 6) {
+                  Text(row.time)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Color(red: 0.73, green: 0.90, blue: 0.99))
+                  Text(row.name)
+                    .font(.caption2).bold()
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                  Spacer()
+                  Text(row.location)
+                    .font(.caption2)
+                    .foregroundColor(Color.white.opacity(0.82))
+                    .lineLimit(1)
+                }
+              }
+            }
+          } else if let room = p?.activeCourseRoom, !room.isEmpty {
+            Spacer(minLength: 2)
+            Text("@\\(room)")
+              .font(.caption).bold()
+              .foregroundColor(Color(red: 0.73, green: 0.90, blue: 0.99))
+              .lineLimit(1)
+          }
+          Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+          LinearGradient(
+            colors: [
+              Color(red: 0.0, green: 0.23, blue: 0.56),
+              Color(red: 0.01, green: 0.52, blue: 0.78),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+          )
+        )
+      }
+    }
+  }
+}
+
+struct GdouScheduleHomeWidget: Widget {
+  let kind: String = "GdouScheduleHomeWidget"
+
+  var body: some WidgetConfiguration {
+    StaticConfiguration(kind: kind, provider: GdouScheduleProvider()) { entry in
+      if #available(iOS 17.0, *) {
+        GdouScheduleWidgetEntryView(entry: entry)
+          .containerBackground(.clear, for: .widget)
+      } else {
+        GdouScheduleWidgetEntryView(entry: entry)
+      }
+    }
+    .configurationDisplayName("海大课表 · 今日课程")
+    .description("桌面与锁屏直看今日海大课程、教室号与调休标注")
+    .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular])
+  }
+}
+
+#if canImport(ActivityKit)
+@available(iOS 16.2, *)
+struct GdouScheduleLiveActivityWidget: Widget {
+  var body: some WidgetConfiguration {
+    ActivityConfiguration(for: GdouScheduleActivityAttributes.self) { context in
+      // Lock Screen / Banner Live Activity
+      VStack(alignment: .leading, spacing: 5) {
+        HStack {
+          Text("海大课表 · \\(context.state.weekLabel)")
+            .font(.caption2).bold()
+            .foregroundColor(.blue)
+          Spacer()
+          if !context.state.timeSpan.isEmpty {
+            Text(context.state.timeSpan)
+              .font(.caption2).bold()
+              .foregroundColor(.secondary)
+          }
+        }
+        Text(context.state.headline)
+          .font(.headline)
+          .lineLimit(1)
+        Text(context.state.subline)
+          .font(.caption)
+          .foregroundColor(.secondary)
+          .lineLimit(1)
+      }
+      .padding(14)
+    } dynamicIsland: { context in
+      DynamicIsland {
+        DynamicIslandExpandedRegion(.leading) {
+          Text(context.state.weekLabel)
+            .font(.caption2).bold()
+            .foregroundColor(.cyan)
+        }
+        DynamicIslandExpandedRegion(.trailing) {
+          Text(context.state.timeSpan)
+            .font(.caption2).bold()
+            .foregroundColor(.white)
+        }
+        DynamicIslandExpandedRegion(.bottom) {
+          VStack(alignment: .leading, spacing: 3) {
+            Text(context.state.headline)
+              .font(.subheadline).bold()
+              .lineLimit(1)
+            Text(context.state.subline)
+              .font(.caption2)
+              .foregroundColor(.secondary)
+              .lineLimit(1)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
+      } compactLeading: {
+        Text(context.state.state == "ongoing" ? "上课" : "下节")
+          .font(.caption2).bold()
+          .foregroundColor(.cyan)
+      } compactTrailing: {
+        Text(context.state.room.isEmpty ? context.state.timeSpan : context.state.room)
+          .font(.caption2).bold()
+          .lineLimit(1)
+      } minimal: {
+        Image(systemName: "book.fill")
+          .foregroundColor(.cyan)
+      }
+    }
+  }
+}
+#endif
+
+@main
+struct GdouScheduleWidgetBundle: WidgetBundle {
+  var body: some Widget {
+    GdouScheduleHomeWidget()
+    #if canImport(ActivityKit)
+    if #available(iOS 16.2, *) {
+      GdouScheduleLiveActivityWidget()
+    }
+    #endif
+  }
+}
+`;
+}
+
+function buildIosWidgetInfoPlist(version, buildNumber) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>$(DEVELOPMENT_LANGUAGE)</string>
+  <key>CFBundleDisplayName</key>
+  <string>海大课表小组件</string>
+  <key>CFBundleExecutable</key>
+  <string>$(EXECUTABLE_NAME)</string>
+  <key>CFBundleIdentifier</key>
+  <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>$(PRODUCT_NAME)</string>
+  <key>CFBundlePackageType</key>
+  <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${version}</string>
+  <key>CFBundleVersion</key>
+  <string>${buildNumber}</string>
+  <key>NSExtension</key>
+  <dict>
+    <key>NSExtensionPointIdentifier</key>
+    <string>com.apple.widgetkit-extension</string>
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+function buildIosAppGroupEntitlements(appGroupId) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.application-groups</key>
+  <array>
+    <string>${appGroupId}</string>
+  </array>
+</dict>
+</plist>
+`;
+}
+
 function withGdouAndroidManifest(config) {
   return withAndroidManifest(config, (mod) => {
     const manifest = mod.modResults.manifest;
@@ -1640,11 +2757,53 @@ function withGdouAndroidManifest(config) {
       });
     }
 
-    // 2. Enforce allowBackup="false" and usesCleartextTraffic="false"
+    // 2. Enforce allowBackup="false" and usesCleartextTraffic="false", and register Home Widget + SAF Picker Activity
     const app = manifest.application?.[0];
     if (app && app.$) {
       app.$['android:allowBackup'] = 'false';
       app.$['android:usesCleartextTraffic'] = 'false';
+    }
+    if (app) {
+      if (!Array.isArray(app.receiver)) app.receiver = [];
+      const hasWidgetReceiver = app.receiver.some(
+        (r) => r?.$?.['android:name'] === '.GdouScheduleWidgetProvider'
+      );
+      if (!hasWidgetReceiver) {
+        app.receiver.push({
+          $: {
+            'android:name': '.GdouScheduleWidgetProvider',
+            'android:exported': 'true',
+            'android:label': '海大课表 · 今日课程',
+          },
+          'intent-filter': [
+            {
+              action: [{ $: { 'android:name': 'android.appwidget.action.APPWIDGET_UPDATE' } }],
+            },
+          ],
+          'meta-data': [
+            {
+              $: {
+                'android:name': 'android.appwidget.provider',
+                'android:resource': '@xml/gdou_widget_info',
+              },
+            },
+          ],
+        });
+      }
+
+      if (!Array.isArray(app.activity)) app.activity = [];
+      const hasPickerActivity = app.activity.some(
+        (a) => a?.$?.['android:name'] === '.GdouMediaPickerActivity'
+      );
+      if (!hasPickerActivity) {
+        app.activity.push({
+          $: {
+            'android:name': '.GdouMediaPickerActivity',
+            'android:exported': 'false',
+            'android:theme': '@android:style/Theme.Translucent.NoTitleBar',
+          },
+        });
+      }
     }
 
     // 3. Ensure <queries> declares SET_ALARM and SHOW_ALARMS for Android 11+ system clock alarm
@@ -1767,12 +2926,24 @@ function withGdouProguardRules(config) {
   return withDangerousMod(config, [
     'android',
     async (mod) => {
-      const proguardPath = path.join(
-        mod.modRequest.platformProjectRoot,
-        'app',
-        'proguard-rules.pro'
-      );
+      const androidRoot = mod.modRequest.platformProjectRoot;
+      const proguardPath = path.join(androidRoot, 'app', 'proguard-rules.pro');
       fs.writeFileSync(proguardPath, PROGUARD_RULES, 'utf8');
+
+      // Write Android Home Screen Widget, Ongoing Notification, MediaStore saver & zero-permission SAF Picker
+      const pkgDir = path.join(androidRoot, 'app', 'src', 'main', 'java', 'cn', 'edu', 'gdou', 'schedule');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, 'GdouScheduleWidgetProvider.kt'), ANDROID_WIDGET_PROVIDER_KT, 'utf8');
+      fs.writeFileSync(path.join(pkgDir, 'GdouMediaPickerActivity.kt'), ANDROID_MEDIA_PICKER_KT, 'utf8');
+
+      const resDir = path.join(androidRoot, 'app', 'src', 'main', 'res');
+      fs.mkdirSync(path.join(resDir, 'drawable'), { recursive: true });
+      fs.mkdirSync(path.join(resDir, 'layout'), { recursive: true });
+      fs.mkdirSync(path.join(resDir, 'xml'), { recursive: true });
+      fs.writeFileSync(path.join(resDir, 'drawable', 'gdou_widget_bg.xml'), ANDROID_WIDGET_BG_XML, 'utf8');
+      fs.writeFileSync(path.join(resDir, 'layout', 'gdou_widget_schedule.xml'), ANDROID_WIDGET_LAYOUT_XML, 'utf8');
+      fs.writeFileSync(path.join(resDir, 'xml', 'gdou_widget_info.xml'), ANDROID_WIDGET_INFO_XML, 'utf8');
+
       return mod;
     },
   ]);
@@ -1782,6 +2953,7 @@ function withGdouIosInfoPlist(config) {
   return withInfoPlist(config, (mod) => {
     mod.modResults.CFBundleShortVersionString = config.version || '1.4.3';
     mod.modResults.CFBundleVersion = String(config.ios?.buildNumber || '9');
+    mod.modResults.NSSupportsLiveActivities = true;
     if (!mod.modResults.NSAlarmKitUsageDescription) {
       mod.modResults.NSAlarmKitUsageDescription =
         '用于在 iOS 系统中直接写入海大课表每日早起、课前及考前系统级闹钟（支持锁屏全屏响铃与穿透静音/专注模式）';
@@ -1790,6 +2962,20 @@ function withGdouIosInfoPlist(config) {
       NSAllowsArbitraryLoads: false,
       NSAllowsLocalNetworking: true,
     };
+    return mod;
+  });
+}
+
+function withGdouIosEntitlements(config) {
+  return withEntitlementsPlist(config, (mod) => {
+    const bundleId = config.ios?.bundleIdentifier || 'cn.edu.gdou.schedule';
+    const appGroupId = `group.${bundleId}`;
+    const existing = Array.isArray(mod.modResults['com.apple.security.application-groups'])
+      ? mod.modResults['com.apple.security.application-groups']
+      : [];
+    if (!existing.includes(appGroupId)) {
+      mod.modResults['com.apple.security.application-groups'] = [...existing, appGroupId];
+    }
     return mod;
   });
 }
@@ -1855,12 +3041,40 @@ function withGdouIosNativeFiles(config) {
       const iosRoot = mod.modRequest.platformProjectRoot;
       const projectName = mod.modRequest.projectName;
       const appDir = path.join(iosRoot, projectName);
+      const bundleId = config.ios?.bundleIdentifier || 'cn.edu.gdou.schedule';
+      const appGroupId = `group.${bundleId}`;
+      const version = config.version || '1.4.3';
+      const buildNumber = String(config.ios?.buildNumber || '9');
 
-      // 1. Write GdouEphemeralNetworking.swift
-      const swiftPath = path.join(appDir, 'GdouEphemeralNetworking.swift');
-      fs.writeFileSync(swiftPath, IOS_EPHEMERAL_NETWORKING_SWIFT, 'utf8');
+      // 1. Write GdouEphemeralNetworking.swift & shared ActivityAttributes into main app target
+      fs.writeFileSync(path.join(appDir, 'GdouEphemeralNetworking.swift'), IOS_EPHEMERAL_NETWORKING_SWIFT, 'utf8');
+      fs.writeFileSync(path.join(appDir, 'GdouScheduleActivityAttributes.swift'), IOS_ACTIVITY_ATTRIBUTES_SWIFT, 'utf8');
 
-      // 2. Ensure Bridging-Header imports <React/RCTHTTPRequestHandler.h>
+      // 2. Write iOS WidgetKit + ActivityKit (Dynamic Island) Extension target files
+      const widgetDir = path.join(iosRoot, 'GdouScheduleWidgetExtension');
+      fs.mkdirSync(widgetDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(widgetDir, 'GdouScheduleWidget.swift'),
+        buildIosWidgetExtensionSwift(appGroupId),
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(widgetDir, 'GdouWidgetActivityAttributes.swift'),
+        IOS_ACTIVITY_ATTRIBUTES_SWIFT,
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(widgetDir, 'Info.plist'),
+        buildIosWidgetInfoPlist(version, buildNumber),
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(widgetDir, 'GdouScheduleWidgetExtension.entitlements'),
+        buildIosAppGroupEntitlements(appGroupId),
+        'utf8'
+      );
+
+      // 3. Ensure Bridging-Header imports <React/RCTHTTPRequestHandler.h>
       const bridgingHeaderPath = path.join(appDir, `${projectName}-Bridging-Header.h`);
       const importSnippet = `#if __has_include(<React/RCTHTTPRequestHandler.h>)\n#import <React/RCTHTTPRequestHandler.h>\n#endif\n`;
       if (fs.existsSync(bridgingHeaderPath)) {
@@ -1880,25 +3094,97 @@ function withGdouIosNativeFiles(config) {
 function withGdouIosXcodeSource(config) {
   return withXcodeProject(config, (mod) => {
     const projectName = mod.modRequest.projectName;
-    const filePath = `${projectName}/GdouEphemeralNetworking.swift`;
     const pbxProject = mod.modResults;
+    const bundleId = config.ios?.bundleIdentifier || 'cn.edu.gdou.schedule';
+    const widgetTargetName = 'GdouScheduleWidgetExtension';
+    const widgetBundleId = `${bundleId}.widget`;
+    const version = config.version || '1.4.3';
+    const buildNumber = String(config.ios?.buildNumber || '9');
 
-    // Avoid duplicate entries if prebuild runs without --clean
-    const existingFiles = pbxProject.pbxFileReferenceSection();
-    const alreadyAdded = Object.values(existingFiles).some(
-      (entry) =>
-        entry &&
-        typeof entry === 'object' &&
-        typeof entry.path === 'string' &&
-        entry.path.replace(/"/g, '').endsWith('GdouEphemeralNetworking.swift')
+    const hasFileEnding = (suffix) => {
+      const existingFiles = pbxProject.pbxFileReferenceSection();
+      return Object.values(existingFiles).some(
+        (entry) =>
+          entry &&
+          typeof entry === 'object' &&
+          typeof entry.path === 'string' &&
+          entry.path.replace(/"/g, '').endsWith(suffix)
+      );
+    };
+
+    // 1. Ensure main app target compiles GdouEphemeralNetworking.swift & GdouScheduleActivityAttributes.swift
+    for (const swiftFile of ['GdouEphemeralNetworking.swift', 'GdouScheduleActivityAttributes.swift']) {
+      if (!hasFileEnding(swiftFile)) {
+        IOSConfig.XcodeUtils.addBuildSourceFileToGroup({
+          filepath: `${projectName}/${swiftFile}`,
+          groupName: projectName,
+          project: pbxProject,
+        });
+      }
+    }
+
+    // 2. Deterministically add iOS WidgetKit + ActivityKit Extension target (idempotent)
+    const existingTargets = pbxProject.pbxNativeTargetSection();
+    const hasWidgetTarget = Object.values(existingTargets).some(
+      (t) =>
+        t &&
+        typeof t === 'object' &&
+        typeof t.name === 'string' &&
+        t.name.replace(/"/g, '') === widgetTargetName
     );
 
-    if (!alreadyAdded) {
-      IOSConfig.XcodeUtils.addBuildSourceFileToGroup({
-        filepath: filePath,
-        groupName: projectName,
-        project: pbxProject,
-      });
+    if (!hasWidgetTarget) {
+      const widgetGroupKey = pbxProject.pbxCreateGroup(widgetTargetName, widgetTargetName);
+      const rootProject = pbxProject.getFirstProject().firstProject;
+      pbxProject.addToPbxGroup(widgetGroupKey, rootProject.mainGroup);
+
+      const widgetTarget = pbxProject.addTarget(
+        widgetTargetName,
+        'app_extension',
+        widgetTargetName,
+        widgetBundleId
+      );
+
+      pbxProject.addBuildPhase([], 'PBXSourcesBuildPhase', 'Sources', widgetTarget.uuid);
+      pbxProject.addBuildPhase([], 'PBXFrameworksBuildPhase', 'Frameworks', widgetTarget.uuid);
+      pbxProject.addBuildPhase([], 'PBXResourcesBuildPhase', 'Resources', widgetTarget.uuid);
+
+      pbxProject.addSourceFile(
+        'GdouScheduleWidget.swift',
+        { target: widgetTarget.uuid },
+        widgetGroupKey
+      );
+      pbxProject.addSourceFile(
+        'GdouWidgetActivityAttributes.swift',
+        { target: widgetTarget.uuid },
+        widgetGroupKey
+      );
+      pbxProject.addFile('Info.plist', widgetGroupKey);
+      pbxProject.addFile('GdouScheduleWidgetExtension.entitlements', widgetGroupKey);
+
+      const xcConfigLists = pbxProject.pbxXCConfigurationList();
+      const buildConfigs = pbxProject.pbxXCBuildConfigurationSection();
+      const targetConfigList = xcConfigLists[widgetTarget.pbxNativeTarget.buildConfigurationList];
+      if (targetConfigList && Array.isArray(targetConfigList.buildConfigurations)) {
+        for (const cfgRef of targetConfigList.buildConfigurations) {
+          const cfg = buildConfigs[cfgRef.value];
+          if (!cfg || !cfg.buildSettings) continue;
+          cfg.buildSettings.PRODUCT_BUNDLE_IDENTIFIER = `"${widgetBundleId}"`;
+          cfg.buildSettings.INFOPLIST_FILE = `"${widgetTargetName}/Info.plist"`;
+          cfg.buildSettings.CODE_SIGN_ENTITLEMENTS = `"${widgetTargetName}/GdouScheduleWidgetExtension.entitlements"`;
+          cfg.buildSettings.SWIFT_VERSION = '5.0';
+          cfg.buildSettings.IPHONEOS_DEPLOYMENT_TARGET = '16.2';
+          cfg.buildSettings.TARGETED_DEVICE_FAMILY = '"1,2"';
+          cfg.buildSettings.SKIP_INSTALL = 'YES';
+          cfg.buildSettings.GENERATE_INFOPLIST_FILE = 'NO';
+          cfg.buildSettings.APPLICATION_EXTENSION_API_ONLY = 'YES';
+          cfg.buildSettings.CLANG_ENABLE_MODULES = 'YES';
+          cfg.buildSettings.MARKETING_VERSION = `"${version}"`;
+          cfg.buildSettings.CURRENT_PROJECT_VERSION = `"${buildNumber}"`;
+          cfg.buildSettings.LD_RUNPATH_SEARCH_PATHS =
+            '"$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"';
+        }
+      }
     }
 
     return mod;
@@ -1912,6 +3198,7 @@ function withGdouZeroRetention(config) {
   config = withGdouAppBuildGradle(config);
   config = withGdouProguardRules(config);
   config = withGdouIosInfoPlist(config);
+  config = withGdouIosEntitlements(config);
   config = withGdouIosPodfileProperties(config);
   config = withGdouIosAppDelegate(config);
   config = withGdouIosNativeFiles(config);

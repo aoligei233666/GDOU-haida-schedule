@@ -8,6 +8,7 @@ import {
   ScrollView,
   Share,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -65,6 +66,7 @@ interface Props {
   onUpdateSettings: (next: AppSettings) => void;
   onClearAllData: () => void;
   onOpenSync: () => void;
+  onSyncWidgetsNow?: () => void;
 }
 
 export const SettingsScreen: React.FC<Props> = ({
@@ -73,6 +75,7 @@ export const SettingsScreen: React.FC<Props> = ({
   onUpdateSettings,
   onClearAllData,
   onOpenSync,
+  onSyncWidgetsNow,
 }) => {
   const [termDateInput, setTermDateInput] = useState(settings.termStartDate);
   const [auditInfo, setAuditInfo] = useState<{
@@ -700,6 +703,84 @@ export const SettingsScreen: React.FC<Props> = ({
             )}
           </View>
         )}
+
+        {/* Desktop Widgets, Ongoing Notification & iOS Dynamic Island Card */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Ionicons name="apps-outline" size={20} color={COLORS.oceanPrimary} />
+            <Text style={styles.cardTitle}>
+              {Platform.OS === 'ios'
+                ? '桌面小组件 (WidgetKit) 与灵动岛实时课表'
+                : '桌面小组件与通知栏常驻今日课表'}
+            </Text>
+          </View>
+          <Text style={styles.cardDesc}>
+            仅同步脱敏后的今日课表与考试倒计时至系统小组件，绝不含账号密码或会话信息。
+          </Text>
+
+          <View style={styles.switchRow}>
+            <View style={{ flex: 1, paddingRight: 10 }}>
+              <Text style={styles.switchTitle}>桌面小组件自动同步</Text>
+              <Text style={styles.switchSub}>
+                {Platform.OS === 'ios'
+                  ? '桌面长按添加「海大课表」小组件，支持主屏与锁屏'
+                  : '桌面长按添加「海大课表 · 今日课程」原生小组件'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.enableWidgetSync !== false}
+              onValueChange={(val) => onUpdateSettings({ ...settings, enableWidgetSync: val })}
+              trackColor={{ false: COLORS.border, true: '#93C5FD' }}
+              thumbColor={settings.enableWidgetSync !== false ? COLORS.oceanPrimary : '#F1F5F9'}
+            />
+          </View>
+
+          {Platform.OS === 'android' ? (
+            <View style={styles.switchRow}>
+              <View style={{ flex: 1, paddingRight: 10 }}>
+                <Text style={styles.switchTitle}>通知栏常驻今日课表</Text>
+                <Text style={styles.switchSub}>
+                  在安卓下拉通知栏静默常驻当前/下节课与教室号，抬屏即看
+                </Text>
+              </View>
+              <Switch
+                value={Boolean(settings.enableOngoingNotification)}
+                onValueChange={(val) =>
+                  onUpdateSettings({ ...settings, enableOngoingNotification: val })
+                }
+                trackColor={{ false: COLORS.border, true: '#93C5FD' }}
+                thumbColor={settings.enableOngoingNotification ? COLORS.oceanPrimary : '#F1F5F9'}
+              />
+            </View>
+          ) : (
+            <View style={styles.switchRow}>
+              <View style={{ flex: 1, paddingRight: 10 }}>
+                <Text style={styles.switchTitle}>iOS 灵动岛 / 锁屏实时课表 (Live Activity)</Text>
+                <Text style={styles.switchSub}>
+                  iOS 16.1+ 灵动岛与锁屏卡片实时展示下一节课教室与倒计时
+                </Text>
+              </View>
+              <Switch
+                value={Boolean(settings.enableLiveActivity)}
+                onValueChange={(val) =>
+                  onUpdateSettings({ ...settings, enableLiveActivity: val })
+                }
+                trackColor={{ false: COLORS.border, true: '#93C5FD' }}
+                thumbColor={settings.enableLiveActivity ? COLORS.oceanPrimary : '#F1F5F9'}
+              />
+            </View>
+          )}
+
+          {onSyncWidgetsNow && (
+            <TouchableOpacity
+              style={[styles.updateSecondaryBtn, { marginTop: 10, height: 38 }]}
+              onPress={onSyncWidgetsNow}
+            >
+              <Ionicons name="refresh-outline" size={15} color={COLORS.oceanPrimary} />
+              <Text style={styles.updateSecondaryBtnText}>立即推送刷新桌面小组件 / 实时状态</Text>
+            </TouchableOpacity>
+          )}
+        </View>
 
         {/* Privacy Zero-Retention Audit Card */}
         <View style={[styles.card, styles.auditCard]}>
@@ -1670,5 +1751,24 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     fontWeight: '700',
     color: COLORS.oceanPrimary,
+  },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 9,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: COLORS.borderLight,
+  },
+  switchTitle: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+  },
+  switchSub: {
+    fontSize: 11.5,
+    color: COLORS.textSecondary,
+    marginTop: 2,
+    lineHeight: 16,
   },
 });

@@ -4,6 +4,7 @@ import React, { Component, ErrorInfo, ReactNode, useEffect, useRef, useState } f
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -28,8 +29,10 @@ import {
   mergeAlarmsIdempotently,
 } from './src/services/alarmService';
 import { buildSamplePartnerSchedule } from './src/services/coupleShareCodec';
-import { SyncResult } from './src/services/gdouAuth';
+import { AuxiliarySyncJob, SyncResult } from './src/services/gdouAuth';
+import { syncNativeWidgetsAndLiveStatus } from './src/services/nativeWidgetBridge';
 import { confirmActiveOtaBootIfNeeded } from './src/services/otaUpdateService';
+import { computeScheduleDiff } from './src/services/scheduleDiff';
 import {
   clearAllLocalData,
   createInitialAppData,
@@ -40,8 +43,10 @@ import { COLORS } from './src/theme/colors';
 import {
   AlarmRule,
   AppSettings,
+  CampusCourseSearchQuery,
   CoupleScheduleProfile,
   CourseItem,
+  EmptyClassroomQueryParams,
   ExamItem,
   PersistedAppData,
 } from './src/types/models';
@@ -116,8 +121,9 @@ function MainApp() {
   });
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [syncTargetMode, setSyncTargetMode] = useState<{
-    target: 'self' | 'partner';
+    target: 'self' | 'partner' | 'empty_classroom' | 'campus_search';
     partnerNickname: string;
+    job?: AuxiliarySyncJob;
   }>({ target: 'self', partnerNickname: 'TA' });
   const [appData, setAppData] = useState<PersistedAppData>(() => createInitialAppData());
 
@@ -179,6 +185,29 @@ function MainApp() {
     };
   }, [appData, ready]);
 
+  // Auto-sync sanitized today's schedule to Android AppWidget, Android Ongoing Notification,
+  // iOS WidgetKit, and iOS Dynamic Island Live Activity whenever data changes or app returns to foreground.
+  useEffect(() => {
+    if (!ready) return;
+    void syncNativeWidgetsAndLiveStatus(
+      appData.courses,
+      appData.exams,
+      appData.settings,
+      appData.termLabel
+    );
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void syncNativeWidgetsAndLiveStatus(
+          appData.courses,
+          appData.exams,
+          appData.settings,
+          appData.termLabel
+        );
+      }
+    });
+    return () => sub.remove();
+  }, [ready, appData.courses, appData.exams, appData.settings, appData.termLabel]);
+
   const mutateAppData = (updater: (prev: PersistedAppData) => PersistedAppData) => {
     dirtyVersionRef.current += 1;
     setAppData(updater);
@@ -190,7 +219,7 @@ function MainApp() {
   };
 
   const handleOpenSelfSync = () => {
-    setSyncTargetMode({ target: 'self', partnerNickname: 'TA' });
+    setSyncTargetMode({ target: 'self', partnerNickname: 'TA', job: { kind: 'full_sync' } });
     setSyncModalOpen(true);
   };
 
@@ -198,11 +227,64 @@ function MainApp() {
     setSyncTargetMode({
       target: 'partner',
       partnerNickname: partnerNickname.trim() || 'TA',
+      job: { kind: 'full_sync' },
+    });
+    setSyncModalOpen(true);
+  };
+
+  const handleRequestEmptyClassroomQuery = (params: EmptyClassroomQueryParams) => {
+    setSyncTargetMode({
+      target: 'empty_classroom',
+      partnerNickname: 'TA',
+      job: { kind: 'empty_classroom', params },
+    });
+    setSyncModalOpen(true);
+  };
+
+  const handleRequestCampusCourseSearch = (query: CampusCourseSearchQuery) => {
+    setSyncTargetMode({
+      target: 'campus_search',
+      partnerNickname: 'TA',
+      job: { kind: 'campus_search', query },
     });
     setSyncModalOpen(true);
   };
 
   const handleSyncSuccess = (result: SyncResult) => {
+    // Auxiliary Job A: Empty classroom live query (never alters schedule/grades)
+    if (syncTargetMode.target === 'empty_classroom') {
+      if (result.emptyClassroomSnapshot) {
+        const snap = result.emptyClassroomSnapshot;
+        mutateAppData((prev) => ({
+          ...prev,
+          emptyClassroomSnapshot: snap,
+          lastSyncReceipt: result.receipt,
+        }));
+        Alert.alert(
+          '空教室无痕查询完成',
+          `共查到 ${snap.rooms.length} 间可用空闲教室（第 ${snap.params.week} 周 · 周${snap.params.dayOfWeek} · 第 ${snap.params.sections.join(',')} 节）。\n请重新点开课表页顶部「空教室」查看并筛选（会话已核验注销）。`
+        );
+      }
+      return;
+    }
+
+    // Auxiliary Job B: Campus-wide / teacher / class course search
+    if (syncTargetMode.target === 'campus_search') {
+      if (result.campusSearchResult) {
+        const res = result.campusSearchResult;
+        mutateAppData((prev) => ({
+          ...prev,
+          campusSearchHistory: res,
+          lastSyncReceipt: result.receipt,
+        }));
+        Alert.alert(
+          '全校课表检索完成',
+          `共命中 ${res.courses.length} 条开课记录。\n请重新点开课表页顶部「蹭课搜课」查看详情并一键加入旁听（会话已核验注销）。`
+        );
+      }
+      return;
+    }
+
     // Partner-only ephemeral sync: saves ONLY partner's courses into `coupleSchedule`
     if (syncTargetMode.target === 'partner') {
       const nickname = syncTargetMode.partnerNickname || 'TA';
@@ -228,6 +310,13 @@ function MainApp() {
       );
       return;
     }
+
+    const diffReport = computeScheduleDiff(
+      appData.courses,
+      result.courses,
+      result.termLabel,
+      result.receipt.syncedAtIso
+    );
 
     mutateAppData((prev) => {
       const manualCourses = prev.courses.filter((c) => c.isManual);
@@ -267,6 +356,9 @@ function MainApp() {
         courses: [...result.courses, ...manualCourses],
         exams: [...result.exams, ...manualExams],
         grades: result.grades.length > 0 ? result.grades : prev.grades,
+        graduationAudit: result.graduationAudit ?? prev.graduationAudit,
+        emptyClassroomSnapshot: result.emptyClassroomSnapshot ?? prev.emptyClassroomSnapshot,
+        lastScheduleDiff: diffReport ?? prev.lastScheduleDiff,
         termLabel: result.termLabel,
         academicYear: result.academicYear,
         semesterCode: result.semesterCode,
@@ -294,6 +386,14 @@ function MainApp() {
         : `本地清理状态：凭据释放=${receipt.credentialsPurged ? '已校验' : '未确认'} · 存储清理=${
             receipt.storageCleaned ? '已校验' : '未确认'
           } · Cookie冲洗=${receipt.cookiesFlushed ? '已校验' : '未确认'}。`;
+    const diffLine =
+      diffReport && diffReport.entries.length > 0
+        ? `\n• 课表变动 Diff：检测到 ${diffReport.entries.length} 处变动（已在课表顶部高亮提示）`
+        : '';
+    const auditLine =
+      result.graduationAudit?.source === 'official_zf_curriculum'
+        ? '\n• 培养方案学分：已同步官方学业核对进度'
+        : '';
     const warningBlock =
       receipt.warnings && receipt.warnings.length > 0
         ? `\n\n注意事项：\n• ${receipt.warnings.slice(0, 3).join('\n• ')}`
@@ -301,7 +401,7 @@ function MainApp() {
 
     Alert.alert(
       allVerified ? '同步完成 · 已核验注销' : '同步完成 · 请留意回执',
-      `成功拉取：\n• 课程安排：${result.courses.length} 项\n• 考试日程：${result.exams.length} 场\n• 成绩与学分：${result.grades.length} 门\n（${result.termLabel}）\n\n${logoutText}\n${purgeText}${warningBlock}`
+      `成功拉取：\n• 课程安排：${result.courses.length} 项\n• 考试日程：${result.exams.length} 场\n• 成绩与学分：${result.grades.length} 门${auditLine}${diffLine}\n（${result.termLabel}）\n\n${logoutText}\n${purgeText}${warningBlock}`
     );
   };
 
@@ -383,6 +483,31 @@ function MainApp() {
     }));
   };
 
+  const handleDismissScheduleDiff = () => {
+    mutateAppData((prev) => ({
+      ...prev,
+      lastScheduleDiff: prev.lastScheduleDiff
+        ? { ...prev.lastScheduleDiff, dismissed: true }
+        : null,
+    }));
+  };
+
+  const handleSyncWidgetsNow = async () => {
+    const res = await syncNativeWidgetsAndLiveStatus(
+      appData.courses,
+      appData.exams,
+      appData.settings,
+      appData.termLabel
+    );
+    Alert.alert(
+      '桌面小组件与实时状态已刷新',
+      `桌面小组件推送：${res.widgetSynced ? '已同步' : '需安装含原生组件的新版安装包'}\n` +
+        `常驻通知 / 灵动岛：${
+          res.ongoingSynced || res.liveActivitySynced ? '已更新' : '未开启或待新版原生底座生效'
+        }`
+    );
+  };
+
   const handleUpdateSettings = (settings: AppSettings) => {
     mutateAppData((prev) => ({
       ...prev,
@@ -431,10 +556,16 @@ function MainApp() {
           <View style={[styles.tabPane, activeTab !== 'schedule' && styles.tabPaneHidden]}>
             <ScheduleScreen
               courses={appData.courses}
+              exams={appData.exams}
               coupleSchedule={appData.coupleSchedule}
               alarms={appData.alarms}
               termLabel={appData.termLabel}
+              academicYear={appData.academicYear}
+              semesterCode={appData.semesterCode}
               settings={appData.settings}
+              lastScheduleDiff={appData.lastScheduleDiff}
+              emptyClassroomSnapshot={appData.emptyClassroomSnapshot}
+              campusSearchHistory={appData.campusSearchHistory}
               onOpenSync={handleOpenSelfSync}
               onOpenPartnerSync={handleOpenPartnerSync}
               onLoadSampleData={handleLoadSample}
@@ -443,6 +574,9 @@ function MainApp() {
               onSaveCoupleSchedule={handleSaveCoupleSchedule}
               onAddManualCourse={handleAddManualCourse}
               onDeleteManualCourse={handleDeleteManualCourse}
+              onDismissScheduleDiff={handleDismissScheduleDiff}
+              onRequestEmptyClassroomQuery={handleRequestEmptyClassroomQuery}
+              onRequestCampusCourseSearch={handleRequestCampusCourseSearch}
             />
           </View>
         )}
@@ -465,6 +599,7 @@ function MainApp() {
           <View style={[styles.tabPane, activeTab !== 'grades' && styles.tabPaneHidden]}>
             <GradesScreen
               grades={appData.grades}
+              graduationAudit={appData.graduationAudit}
               onOpenSync={handleOpenSelfSync}
             />
           </View>
@@ -491,6 +626,7 @@ function MainApp() {
               onUpdateSettings={handleUpdateSettings}
               onClearAllData={handleClearAll}
               onOpenSync={handleOpenSelfSync}
+              onSyncWidgetsNow={handleSyncWidgetsNow}
             />
           </View>
         )}
@@ -523,10 +659,15 @@ function MainApp() {
 
       <EphemeralSyncModal
         visible={syncModalOpen}
+        syncJob={syncTargetMode.job}
         customHeaderTitle={
           syncTargetMode.target === 'partner'
             ? `💕 无痕拉取「${syncTargetMode.partnerNickname}」的课表`
-            : undefined
+            : syncTargetMode.target === 'empty_classroom'
+              ? '无痕实时查询教务空教室'
+              : syncTargetMode.target === 'campus_search'
+                ? '无痕检索全校 / 教师 / 班级课表'
+                : undefined
         }
         onClose={() => setSyncModalOpen(false)}
         onSyncSuccess={handleSyncSuccess}

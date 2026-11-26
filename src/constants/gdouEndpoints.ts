@@ -31,8 +31,111 @@ export const GDOU_JW_PATHS = {
     '/cjcx/cjcx_cxXsgrcj.html?doType=query&gnmkdm=N305005',
     '/cjcx/cjcx_cxDgXscj.html?doType=query&gnmkdm=N305005',
   ] as const,
+  gradeDetailQueries: [
+    '/cjcx/cjcx_cxCjxqGjh.html?gnmkdm=N305005',
+    '/cjcx/cjcx_cxXsgrcjDetail.html?gnmkdm=N305005',
+  ] as const,
+  curriculumIndex: '/xsxy/xsxyqk_cxXsxyqkIndex.html?gnmkdm=N105515&layout=default',
+  curriculumTreeQueries: [
+    '/xsxy/xsxyqk_cxJxzxjhxfyq.html?gnmkdm=N105515',
+    '/xsxy/xsxyqk_cxXsxyqkIndex.html?doType=query&gnmkdm=N105515',
+  ] as const,
+  emptyClassroomIndex: '/cdjy/cdjy_cxKxcdlb.html?gnmkdm=N2155&layout=default',
+  emptyClassroomQuery: '/cdjy/cdjy_cxKxcdlb.html?doType=query&gnmkdm=N2155',
+  campusCourseQueries: [
+    '/kbcx/qxxk_cxQxxk.html?doType=query&gnmkdm=N2156',
+    '/rwlscx/rwlscx_cxRwls.html?doType=query&gnmkdm=N2199',
+    '/kbdy/bjkbdy_cxBjKb.html?doType=query&gnmkdm=N214505',
+    '/kbcx/xskbcx_cxXskbcx.html?doType=query&gnmkdm=N2151',
+  ] as const,
   logoutSuffixes: ['/logout', '/jwglxt/logout'] as const,
 };
+
+/**
+ * Compute Zhengfang bitmask for weeks (`zcd`) or sections (`jcd`):
+ * index 1 => 2^0 = 1, index 2 => 2^1 = 2, [1, 2] => 3.
+ */
+export function buildZhengfangBitmask(indices: number[], maxIndex = 24): number {
+  let mask = 0;
+  for (const idx of indices) {
+    if (Number.isInteger(idx) && idx >= 1 && idx <= maxIndex) {
+      mask |= 1 << (idx - 1);
+    }
+  }
+  return mask;
+}
+
+export function buildEmptyClassroomQueryParams(params: {
+  xnm: string;
+  xqm: string;
+  campusId?: string;
+  buildingId?: string;
+  roomTypeId?: string;
+  week: number;
+  dayOfWeek: number;
+  sections: number[];
+  minSeats?: number;
+  timestampMs?: number;
+}): Record<string, string> {
+  const zcdMask = buildZhengfangBitmask([params.week], 30);
+  const jcdMask = buildZhengfangBitmask(params.sections, 16);
+  return {
+    fwzt: 'cx',
+    xqh_id: params.campusId || '',
+    xnm: params.xnm,
+    xqm: params.xqm,
+    cdlb_id: params.roomTypeId || '',
+    cdejlb_id: '',
+    qszws: params.minSeats && params.minSeats > 0 ? String(params.minSeats) : '',
+    jszws: '',
+    cdmc: '',
+    lh: params.buildingId || '',
+    jyfs: '0',
+    cdjylx: '',
+    sfbhkc: '',
+    zcd: String(zcdMask),
+    xqj: String(params.dayOfWeek),
+    jcd: String(jcdMask),
+    _search: 'false',
+    nd: String(params.timestampMs ?? Date.now()),
+    'queryModel.showCount': '200',
+    'queryModel.currentPage': '1',
+    'queryModel.sortName': 'cdbh',
+    'queryModel.sortOrder': 'asc',
+    time: '0',
+  };
+}
+
+export function buildCampusCourseSearchParams(params: {
+  xnm: string;
+  xqm: string;
+  keyword: string;
+  teacher?: string;
+  className?: string;
+  dayOfWeek?: number;
+  timestampMs?: number;
+}): Record<string, string> {
+  const kw = params.keyword.trim();
+  const teacher = (params.teacher || '').trim();
+  const className = (params.className || '').trim();
+  return {
+    xnm: params.xnm,
+    xqm: params.xqm,
+    kcmc: kw,
+    kch: kw,
+    jsxm: teacher,
+    jxbmc: className,
+    bjmc: className,
+    xqj: params.dayOfWeek && params.dayOfWeek >= 1 && params.dayOfWeek <= 7 ? String(params.dayOfWeek) : '',
+    _search: 'false',
+    nd: String(params.timestampMs ?? Date.now()),
+    'queryModel.showCount': '100',
+    'queryModel.currentPage': '1',
+    'queryModel.sortName': '',
+    'queryModel.sortOrder': 'asc',
+    time: '0',
+  };
+}
 
 export const GDOU_AUTH_PATHS = {
   login: '/authserver/login',
@@ -182,13 +285,29 @@ export function healWfwWrongSsoUrl(rawUrl: string, isOffCampusWfw = false): stri
   }
 
   if (isOffCampusWfw) {
-    const bareJwMatch = trimmed.match(/^https?:\/\/jw\.gdou\.edu\.cn(\/.*)?$/i);
+    const bareJwMatch = trimmed.match(/^https?:\/\/jw\.gdou\.edu\.cn(?::(?:80|443))?([/?#].*)?$/i);
     if (bareJwMatch) {
-      return `${GDOU_JW_WFW_BASE}${bareJwMatch[1] || ''}`;
+      const rest = bareJwMatch[1] || '';
+      const normalizedRest = rest && !rest.startsWith('/') ? `/${rest}` : rest;
+      return `${GDOU_JW_WFW_BASE}${normalizedRest}`;
     }
   }
 
   return null;
+}
+
+/**
+ * Extract only the lowercase hostname from a URL for safe error/timeout diagnostics
+ * (never leaks path params, query tickets, or credentials).
+ */
+export function extractSafeHostname(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+  try {
+    return new URL(trimmed).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
 }
 
 /**

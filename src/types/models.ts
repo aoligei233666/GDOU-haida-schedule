@@ -23,6 +23,8 @@ export interface CourseItem {
   colorIndex: number;
   parseWarning?: string;
   isManual?: boolean;
+  isAudit?: boolean; // true when added via 全校/教师/班级课表搜索（旁听/蹭课）
+  sourceLabel?: string;
   ownerTag?: 'mine' | 'partner';
 }
 
@@ -54,6 +56,14 @@ export interface ExamItem {
   isManual?: boolean;
 }
 
+export interface GradeSubScoreItem {
+  itemName: string; // e.g. "平时成绩" / "实验成绩" / "期末成绩" / "总评成绩"
+  weightText: string; // e.g. "30%" / "70%"
+  scoreText: string; // e.g. "92" / "85"
+}
+
+export type GradeDetailSource = 'official_zf_detail' | 'unavailable';
+
 export interface GradeItem {
   id: string;
   courseName: string;
@@ -71,6 +81,150 @@ export interface GradeItem {
   examNature: string; // ksxz e.g. "正常考试", "补考一", "重修"
   teacher: string;
   passed: boolean;
+  jxbId?: string; // 正方教学班 ID (non-personal course class ID for sub-score query)
+  rawXnm?: string; // e.g. "2025"
+  rawXqm?: string; // e.g. "3" | "12"
+  subScores?: GradeSubScoreItem[];
+  subScoreSource?: GradeDetailSource;
+  subScoreSourceLabel?: string; // Explicit source attribution shown in UI
+  subScoreSyncedAtIso?: string;
+}
+
+export type CurriculumAuditSource = 'official_zf_curriculum' | 'local_grade_estimate';
+
+export interface CurriculumModuleProgress {
+  id: string;
+  name: string;
+  parentName?: string;
+  requiredCredits: number | null;
+  earnedCredits: number;
+  inProgressCredits: number;
+  remainingCredits: number | null;
+  completedCourses: number;
+  failedCourses: number;
+  statusText?: string;
+}
+
+export interface GraduationAuditReport {
+  source: CurriculumAuditSource;
+  sourceLabel: string; // Explicit source attribution shown in UI
+  syncedAtIso: string;
+  programTitle?: string; // Major/curriculum title only (never student ID/name)
+  totalRequiredCredits: number | null;
+  totalEarnedCredits: number;
+  totalInProgressCredits: number;
+  totalRemainingCredits: number | null;
+  modules: CurriculumModuleProgress[];
+  note?: string;
+}
+
+export interface EmptyClassroomItem {
+  id: string;
+  roomName: string;
+  roomCode: string;
+  building: string;
+  campus: string;
+  roomType: string;
+  seats: number;
+  examSeats?: number;
+  floor?: string;
+}
+
+export interface EmptyClassroomFilterOptions {
+  campuses: Array<{ id: string; name: string }>;
+  buildings: Array<{ id: string; name: string; campusId?: string }>;
+  roomTypes: Array<{ id: string; name: string }>;
+}
+
+export interface EmptyClassroomQueryParams {
+  xnm: string;
+  xqm: string;
+  campusId: string;
+  buildingId: string;
+  roomTypeId: string;
+  week: number;
+  dayOfWeek: number; // 1..7
+  sections: number[]; // 1..12
+  minSeats?: number;
+}
+
+export interface EmptyClassroomSnapshot {
+  queriedAtIso: string;
+  sourceLabel: string;
+  params: EmptyClassroomQueryParams;
+  campusName?: string;
+  buildingName?: string;
+  rooms: EmptyClassroomItem[];
+  filterOptions?: EmptyClassroomFilterOptions;
+}
+
+export interface CampusCourseSearchQuery {
+  xnm: string;
+  xqm: string;
+  keyword: string;
+  teacher?: string;
+  className?: string;
+  dayOfWeek?: number; // 0 = all, 1..7
+}
+
+export interface CampusCourseSearchResult {
+  queriedAtIso: string;
+  sourceLabel: string;
+  query: CampusCourseSearchQuery;
+  courses: CourseItem[];
+  endpointUsed?: string;
+}
+
+export type ScheduleDiffKind =
+  | 'room_changed'
+  | 'time_changed'
+  | 'weeks_changed'
+  | 'teacher_changed'
+  | 'added'
+  | 'removed';
+
+export interface ScheduleDiffEntry {
+  id: string;
+  kind: ScheduleDiffKind;
+  courseName: string;
+  courseCode: string;
+  summary: string;
+  beforeText?: string;
+  afterText?: string;
+}
+
+export interface ScheduleDiffReport {
+  comparedAtIso: string;
+  termLabel: string;
+  entries: ScheduleDiffEntry[];
+  dismissed?: boolean;
+}
+
+export type CalendarOverrideKind = 'holiday' | 'makeup' | 'event';
+
+export interface CalendarDayOverride {
+  date: string; // YYYY-MM-DD
+  kind: CalendarOverrideKind;
+  label: string;
+  mappedDayOfWeek?: number; // 1..7 when kind === 'makeup'
+  mappedWeek?: number; // optional target week override
+  isPreset?: boolean;
+}
+
+export type ScheduleWallpaperPreset =
+  | 'none'
+  | 'ocean_breeze'
+  | 'sunset_xiashan'
+  | 'mist_huguang'
+  | 'sakura_couple'
+  | 'deep_sea'
+  | 'custom_photo';
+
+export interface ScheduleAppearanceSettings {
+  wallpaperPreset: ScheduleWallpaperPreset;
+  customBackgroundUri?: string;
+  backgroundDimOpacity: number; // 0..0.75
+  cardOpacity: number; // 0.65..1.0
 }
 
 export interface TermGradeBreakdown {
@@ -153,6 +307,11 @@ export interface AppSettings {
   examAdvanceMinutes: number;
   showNonCurrentWeekCourses: boolean;
   highlightCoupleFreeSlots: boolean;
+  appearance: ScheduleAppearanceSettings;
+  calendarOverrides: CalendarDayOverride[];
+  enableWidgetSync: boolean;
+  enableOngoingNotification: boolean;
+  enableLiveActivity: boolean;
 }
 
 export interface LogoutVerificationDetails {
@@ -190,6 +349,10 @@ export interface PersistedAppData {
   grades: GradeItem[];
   alarms: AlarmRule[];
   coupleSchedule: CoupleScheduleProfile | null;
+  graduationAudit: GraduationAuditReport | null;
+  lastScheduleDiff: ScheduleDiffReport | null;
+  emptyClassroomSnapshot: EmptyClassroomSnapshot | null;
+  campusSearchHistory: CampusCourseSearchResult | null;
   termLabel: string;
   academicYear: string; // e.g. "2025"
   semesterCode: string; // "3" (秋/第一学期) | "12" (春/第二学期) | "16" (第三学期)

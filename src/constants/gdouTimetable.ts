@@ -1,4 +1,80 @@
-import { AppSettings, CampusPresetKey, CourseItem, ExamItem, GradeItem, PeriodTime } from '../types/models';
+import {
+  AppSettings,
+  CampusPresetKey,
+  CourseItem,
+  ExamItem,
+  GradeItem,
+  PeriodTime,
+  ScheduleAppearanceSettings,
+  ScheduleWallpaperPreset,
+} from '../types/models';
+
+export const DEFAULT_SCHEDULE_APPEARANCE: ScheduleAppearanceSettings = {
+  wallpaperPreset: 'none',
+  customBackgroundUri: undefined,
+  backgroundDimOpacity: 0.25,
+  cardOpacity: 0.94,
+};
+
+export const WALLPAPER_PRESETS: Array<{
+  key: Exclude<ScheduleWallpaperPreset, 'custom_photo'>;
+  label: string;
+  desc: string;
+  bgColor: string;
+  accentColor: string;
+  gridTint: string;
+  isDark?: boolean;
+}> = [
+  {
+    key: 'none',
+    label: '经典海大白',
+    desc: '清爽高对比度',
+    bgColor: '#F4F7FB',
+    accentColor: '#0056D2',
+    gridTint: 'rgba(255,255,255,0.92)',
+  },
+  {
+    key: 'ocean_breeze',
+    label: '湛蓝海风',
+    desc: '湖光蔚蓝浅渐变',
+    bgColor: '#E0F2FE',
+    accentColor: '#0284C7',
+    gridTint: 'rgba(240,249,255,0.72)',
+  },
+  {
+    key: 'sunset_xiashan',
+    label: '霞山落日',
+    desc: '暖橘暮色护眼',
+    bgColor: '#FFF7ED',
+    accentColor: '#EA580C',
+    gridTint: 'rgba(255,247,237,0.78)',
+  },
+  {
+    key: 'mist_huguang',
+    label: '湖光晨雾',
+    desc: '青翠森林淡雅',
+    bgColor: '#ECFDF5',
+    accentColor: '#059669',
+    gridTint: 'rgba(236,253,245,0.76)',
+  },
+  {
+    key: 'sakura_couple',
+    label: '樱粉甜柔',
+    desc: '温柔浪漫浅粉',
+    bgColor: '#FDF2F8',
+    accentColor: '#DB2777',
+    gridTint: 'rgba(253,242,248,0.78)',
+  },
+  {
+    key: 'deep_sea',
+    label: '深海夜色',
+    desc: '护眼深蓝夜幕',
+    bgColor: '#0F172A',
+    accentColor: '#38BDF8',
+    gridTint: 'rgba(15,23,42,0.82)',
+    isDark: true,
+  },
+];
 
 export const GDOU_ENTRY_URL = 'https://netcheck.gdou.edu.cn/go.php?code=jw';
 
@@ -166,6 +242,11 @@ export function createDefaultSettings(now: Date = new Date()): AppSettings {
     examAdvanceMinutes: 90,
     showNonCurrentWeekCourses: true,
     highlightCoupleFreeSlots: true,
+    appearance: { ...DEFAULT_SCHEDULE_APPEARANCE },
+    calendarOverrides: [],
+    enableWidgetSync: true,
+    enableOngoingNotification: false,
+    enableLiveActivity: false,
   };
 }
 
@@ -391,6 +472,13 @@ export function buildSampleGdouData(now: Date = new Date()): {
       examNature: '正常考试',
       teacher: '陈海明',
       passed: true,
+      subScores: [
+        { itemName: '平时成绩', weightText: '30%', scoreText: '95' },
+        { itemName: '实验成绩', weightText: '10%', scoreText: '92' },
+        { itemName: '期末卷面成绩', weightText: '60%', scoreText: '90.5' },
+      ],
+      subScoreSource: 'official_zf_detail',
+      subScoreSourceLabel: '数据来源：海大示例预览数据（同步后自动替换为正方教务官方明细）',
     },
     {
       id: 'sample-grade-2',
@@ -407,6 +495,12 @@ export function buildSampleGdouData(now: Date = new Date()): {
       examNature: '正常考试',
       teacher: '林志强',
       passed: true,
+      subScores: [
+        { itemName: '平时成绩', weightText: '30%', scoreText: '94' },
+        { itemName: '期末卷面成绩', weightText: '70%', scoreText: '85.4' },
+      ],
+      subScoreSource: 'official_zf_detail',
+      subScoreSourceLabel: '数据来源：海大示例预览数据（同步后自动替换为正方教务官方明细）',
     },
     {
       id: 'sample-grade-3',

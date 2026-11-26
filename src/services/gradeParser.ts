@@ -2,14 +2,19 @@ import {
   CreditCategorySummary,
   GpaSummary,
   GradeItem,
+  GradeSubScoreItem,
   ScoreTierBucket,
   TermGradeBreakdown,
 } from '../types/models';
+
+export const OFFICIAL_GRADE_DETAIL_SOURCE_LABEL =
+  '数据来源：广东海洋大学正方教务「成绩明细」官方接口';
 
 interface RawZfGrade {
   kcmc?: string;
   kch?: string;
   kch_id?: string;
+  jxb_id?: string;
   xf?: string | number;
   cj?: string | number;
   bfzcj?: string | number;
@@ -25,6 +30,9 @@ interface RawZfGrade {
   jsxm?: string;
   jxbmc?: string;
   sfxwkc?: string;
+  xmblmc?: string;
+  xmcj?: string | number;
+  cjfx?: string;
 }
 
 const TEXT_SCORE_MAP: Record<string, { score: number; gpa: number; passed: boolean }> = {
@@ -136,6 +144,10 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
     if (seen.has(dedup)) continue;
     seen.add(dedup);
 
+    const jxbId = String(item.jxb_id ?? '').trim() || undefined;
+    const rawXnm = String(item.xnm ?? '').trim() || undefined;
+    const rawXqm = String(item.xqm ?? '').trim() || undefined;
+
     grades.push({
       id: `grade-${i}-${courseCode || courseName}-${termKey}`,
       courseName,
@@ -153,11 +165,135 @@ export function parseZfGradesResponse(raw: unknown): GradeItem[] {
       examNature,
       teacher,
       passed,
+      jxbId,
+      rawXnm,
+      rawXqm,
     });
   }
 
   grades.sort((a, b) => b.termKey.localeCompare(a.termKey) || b.credit - a.credit);
   return grades;
+}
+
+function stripHtmlTags(raw: string): string {
+  return raw
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Parse 正方教务成绩明细 (`/cjcx/cjcx_cxCjxqGjh.html` HTML table OR JSON array/items)
+ * into explicit sub-score rows (e.g. 平时成绩 30% -> 92, 期末成绩 70% -> 86).
+ * Strictly preserves official weights & scores; never invents missing weights.
+ */
+export function parseZfGradeSubScoresResponse(raw: unknown): GradeSubScoreItem[] {
+  const out: GradeSubScoreItem[] = [];
+  const seen = new Set<string>();
+
+  const pushUnique = (itemName: string, weightText: string, scoreText: string) => {
+    const cleanName = itemName.trim();
+    const cleanWeight = weightText.trim();
+    const cleanScore = scoreText.trim();
+    if (!cleanName || (!cleanScore && !cleanWeight)) return;
+    if (/成绩分项|分项名称|课程名称|学号|姓名/i.test(cleanName)) return;
+    const key = `${cleanName}|${cleanWeight}|${cleanScore}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      itemName: cleanName,
+      weightText: cleanWeight || '-',
+      scoreText: cleanScore || '-',
+    });
+  };
+
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return parseZfGradeSubScoresResponse(JSON.parse(trimmed));
+      } catch {
+        // Fall through to HTML table parser
+      }
+    }
+    // Parse standard 正方 `<table id="subtab">` rows:
+    // <tr><td>【 平时(30%) 】</td><td>92</td></tr>  OR  <tr><td>平时成绩</td><td>30%</td><td>92</td></tr>
+    const rowMatches = trimmed.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+    for (const rowHtml of rowMatches) {
+      const cells = Array.from(rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)).map((m) =>
+        stripHtmlTags(m[1] || '')
+      );
+      if (cells.length < 2) continue;
+      if (cells.length === 2) {
+        const left = cells[0].replace(/[【】\[\]]/g, '').trim();
+        const right = cells[1];
+        const weightMatch = left.match(/^(.+?)\s*[（(]\s*([0-9.]+%?)\s*[）)]$/);
+        if (weightMatch) {
+          pushUnique(weightMatch[1], weightMatch[2].endsWith('%') ? weightMatch[2] : `${weightMatch[2]}%`, right);
+        } else {
+          pushUnique(left, '-', right);
+        }
+      } else {
+        // 3+ columns: could be [分项, 比例, 成绩] or [课程, 分项, 比例, 成绩]
+        const lastIdx = cells.length - 1;
+        const scoreCell = cells[lastIdx];
+        const secondLast = cells[lastIdx - 1];
+        const thirdLast = cells[lastIdx - 2];
+        if (/%/.test(secondLast) || /^\d+(?:\.\d+)?$/.test(secondLast)) {
+          pushUnique(thirdLast, secondLast.includes('%') ? secondLast : `${secondLast}%`, scoreCell);
+        } else {
+          const weightMatch = secondLast.match(/^(.+?)\s*[（(]\s*([0-9.]+%?)\s*[）)]$/);
+          if (weightMatch) {
+            pushUnique(weightMatch[1], weightMatch[2], scoreCell);
+          } else {
+            pushUnique(secondLast, '-', scoreCell);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  if (raw && typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    const list = Array.isArray(raw)
+      ? raw
+      : Array.isArray(obj.items)
+        ? obj.items
+        : Array.isArray(obj.rows)
+          ? obj.rows
+          : Array.isArray(obj.data)
+            ? obj.data
+            : [];
+    for (const entry of list) {
+      if (!entry || typeof entry !== 'object') continue;
+      const rec = entry as Record<string, unknown>;
+      const rawName = String(rec.xmblmc ?? rec.cjfx ?? rec.xmbmc ?? rec.fxmc ?? rec.name ?? '').trim();
+      const rawWeight = String(rec.xmbl ?? rec.bl ?? rec.qz ?? rec.weight ?? '').trim();
+      const rawScore = String(rec.xmcj ?? rec.cj ?? rec.score ?? rec.fxcj ?? '').trim();
+      if (!rawName) continue;
+      const inlineMatch = rawName.match(/^(.+?)\s*[（(]\s*([0-9.]+%?)\s*[）)]$/);
+      if (inlineMatch) {
+        pushUnique(
+          inlineMatch[1],
+          rawWeight || (inlineMatch[2].endsWith('%') ? inlineMatch[2] : `${inlineMatch[2]}%`),
+          rawScore
+        );
+      } else {
+        pushUnique(
+          rawName,
+          rawWeight ? (rawWeight.includes('%') ? rawWeight : `${rawWeight}%`) : '-',
+          rawScore
+        );
+      }
+    }
+  }
+
+  return out;
 }
 
 function deduplicateBestAttempts(grades: GradeItem[]): GradeItem[] {

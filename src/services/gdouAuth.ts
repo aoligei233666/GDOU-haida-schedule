@@ -1,7 +1,11 @@
 import {
+  buildCampusCourseSearchParams,
+  buildEmptyClassroomQueryParams,
   buildExamParamVariants,
   buildGradeQueryParams,
+  buildZhengfangBitmask,
   DEFAULT_DESKTOP_UA,
+  extractSafeHostname,
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
   GDOU_AUTH_WFW_BASE,
@@ -15,14 +19,28 @@ import {
 } from '../constants/gdouEndpoints';
 import { deriveCurrentTermParams, GDOU_ENTRY_URL } from '../constants/gdouTimetable';
 import {
+  CampusCourseSearchQuery,
+  CampusCourseSearchResult,
   CourseItem,
+  EmptyClassroomQueryParams,
+  EmptyClassroomSnapshot,
   EphemeralCredentials,
   ExamItem,
   GradeItem,
+  GraduationAuditReport,
   LogoutVerificationDetails,
   PeriodTime,
   SyncReceipt,
 } from '../types/models';
+import {
+  buildLocalEstimatedGraduationAudit,
+  OFFICIAL_CAMPUS_COURSE_SOURCE_LABEL,
+  OFFICIAL_EMPTY_ROOM_SOURCE_LABEL,
+  parseEmptyClassroomOptionsHtml,
+  parseZfCampusCourseSearchResponse,
+  parseZfEmptyClassroomsResponse,
+  parseZfGraduationAuditResponse,
+} from './campusToolsParser';
 import {
   areCredentialsPurged,
   encryptGdouPassword,
@@ -30,13 +48,26 @@ import {
   purgeEphemeralCredentials,
 } from './cryptoAes';
 import { parseZfExamResponse } from './examParser';
-import { parseZfGradesResponse } from './gradeParser';
-import { parseZfPeriodTimesResponse, parseZfScheduleResponse } from './scheduleParser';
+import {
+  OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
+  parseZfGradesResponse,
+  parseZfGradeSubScoresResponse,
+} from './gradeParser';
+import {
+  getTodayDayOfWeek,
+  parseZfPeriodTimesResponse,
+  parseZfScheduleResponse,
+} from './scheduleParser';
 import { sanitizeEndpointUrl } from './zeroRetentionSanitizer';
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
-const OVERALL_SYNC_TIMEOUT_MS = 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const OVERALL_SYNC_TIMEOUT_MS = 90_000;
+const NETCHECK_PROBE_TIMEOUT_MS = 6_000;
+const DIRECT_JW_PROBE_TIMEOUT_MS = 3_500;
+const OVERALL_TIMEOUT_REASON = 'GDOU_OVERALL_SYNC_TIMEOUT';
 const MAX_EXAM_QUERY_ATTEMPTS = 4;
+
+export type GdouRoutePref = 'auto' | 'wfw' | 'campus';
 
 /**
  * Detect whether code is running inside the native React Native runtime (Android/iOS),
@@ -76,7 +107,10 @@ function stripInternalControlHeaders(headers?: HeadersInit): HeadersInit | undef
 
 function buildHeadersWithOptionalNativeControl(
   base: Record<string, string>,
-  controlHeader?: 'X-Gdou-Reset-Cookies-Before' | 'X-Gdou-Clear-Cookies-After'
+  controlHeader?:
+    | 'X-Gdou-Reset-Cookies-Before'
+    | 'X-Gdou-Clear-Cookies-After'
+    | 'X-Gdou-Direct-Probe'
 ): Record<string, string> {
   if (controlHeader && isNativeMobileRuntime()) {
     return { ...base, [controlHeader]: '1' };
@@ -100,10 +134,16 @@ async function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+export type AuxiliarySyncJob =
+  | { kind: 'full_sync' }
+  | { kind: 'empty_classroom'; params: EmptyClassroomQueryParams }
+  | { kind: 'campus_search'; query: CampusCourseSearchQuery };
+
 export interface AuthRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   userAgent?: string;
+  job?: AuxiliarySyncJob;
 }
 
 /**
@@ -158,6 +198,9 @@ export interface SyncResult {
   grades: GradeItem[];
   syncedPeriods?: PeriodTime[];
   detectedCampus?: string;
+  graduationAudit?: GraduationAuditReport;
+  emptyClassroomSnapshot?: EmptyClassroomSnapshot;
+  campusSearchResult?: CampusCourseSearchResult;
   termLabel: string;
   academicYear: string;
   semesterCode: string;
@@ -166,7 +209,8 @@ export interface SyncResult {
 
 export type OneShotSyncOutcome =
   | { status: 'completed'; result: SyncResult }
-  | { status: 'mfa_required'; mfa: MfaChallengeState };
+  | { status: 'mfa_required'; mfa: MfaChallengeState }
+  | { status: 'wfw_subauth_required'; subAuth: WfwSubAuthState };
 
 export type MfaCompletionOutcome =
   | { status: 'completed'; result: SyncResult }
@@ -209,6 +253,11 @@ export async function fetchWithTimeout(
   const externalSignal = options.signal;
 
   if (externalSignal?.aborted) {
+    if (externalSignal.reason === OVERALL_TIMEOUT_REASON) {
+      throw new Error(
+        `整体同步超时（${Math.round(OVERALL_SYNC_TIMEOUT_MS / 1000)} 秒），请检查网络连接（若开启代理/VPN 请先关闭）或切换「官网无痕网页」`
+      );
+    }
     throw createAbortError('已取消本次同步操作');
   }
 
@@ -216,7 +265,7 @@ export async function fetchWithTimeout(
   let timedOut = false;
 
   const onExternalAbort = () => {
-    controller.abort();
+    controller.abort(externalSignal?.reason);
   };
   externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
@@ -236,9 +285,29 @@ export async function fetchWithTimeout(
     });
   } catch (err) {
     if (timedOut) {
-      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒），请检查网络连接或切换「官网无痕网页」`);
+      const secs = Math.max(1, Math.round(timeoutMs / 1000));
+      const host = extractSafeHostname(url);
+      if (host === 'jw.gdou.edu.cn') {
+        throw new Error(
+          `请求超时（连接 jw.gdou.edu.cn 超过 ${secs} 秒）：校园网直连不可达，请切换上方「校外微门户」通道重试`
+        );
+      }
+      if (host) {
+        throw new Error(
+          `请求超时（连接 ${host} 超过 ${secs} 秒），请检查网络连接（若开启 VPN/代理 请先关闭）或切换「官网无痕网页」`
+        );
+      }
+      throw new Error(`请求超时（${secs} 秒），请检查网络连接或切换「官网无痕网页」`);
     }
-    if (externalSignal?.aborted || (err instanceof Error && err.name === 'AbortError')) {
+    if (externalSignal?.aborted) {
+      if (externalSignal.reason === OVERALL_TIMEOUT_REASON) {
+        throw new Error(
+          `整体同步超时（${Math.round(OVERALL_SYNC_TIMEOUT_MS / 1000)} 秒），请检查网络连接（若开启代理/VPN 请先关闭）或切换「官网无痕网页」`
+        );
+      }
+      throw createAbortError('已取消本次同步操作');
+    }
+    if (err instanceof Error && err.name === 'AbortError') {
       throw createAbortError('已取消本次同步操作');
     }
     throw err;
@@ -253,15 +322,18 @@ function createBoundedSyncController(externalSignal?: AbortSignal): {
   cleanup: () => void;
 } {
   const controller = new AbortController();
-  const onAbort = () => controller.abort();
+  const onAbort = () => controller.abort(externalSignal?.reason);
   if (externalSignal) {
     if (externalSignal.aborted) {
-      controller.abort();
+      controller.abort(externalSignal.reason);
     } else {
       externalSignal.addEventListener('abort', onAbort, { once: true });
     }
   }
-  const overallTimer = setTimeout(() => controller.abort(), OVERALL_SYNC_TIMEOUT_MS);
+  const overallTimer = setTimeout(
+    () => controller.abort(OVERALL_TIMEOUT_REASON),
+    OVERALL_SYNC_TIMEOUT_MS
+  );
   return {
     controller,
     cleanup: () => {
@@ -309,44 +381,119 @@ export function extractAuthError(html: string): string {
 }
 
 /**
- * Lightweight network route probe for both Direct and WebView modes:
- * checks whether `netcheck.gdou.edu.cn/go.php?code=jw` redirects to off-campus `wfw.gdou.edu.cn`
- * or stays on campus-direct `jw.gdou.edu.cn`.
+ * Fast reachability check for campus-only `jw.gdou.edu.cn` (3.5s bounded timeout).
+ * Uses `X-Gdou-Direct-Probe: 1` so native interceptors never rewrite this probe to `wfw`.
+ * Prevents off-campus carrier IPs misclassified by `netcheck` from stalling for 20-30s on TCP SYN drop.
+ */
+async function probeDirectJwReachable(options: AuthRequestOptions = {}): Promise<boolean> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  try {
+    const resp = await fetchWithTimeout(
+      GDOU_JW_SSO_SERVICE,
+      {
+        method: 'GET',
+        credentials: 'omit',
+        redirect: 'manual',
+        headers: buildHeadersWithOptionalNativeControl(
+          { 'User-Agent': ua },
+          'X-Gdou-Direct-Probe'
+        ),
+      },
+      { ...options, timeoutMs: DIRECT_JW_PROBE_TIMEOUT_MS }
+    );
+    return resp.status > 0 && resp.status < 500;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+    return false;
+  }
+}
+
+/**
+ * Lightweight, fail-safe network route probe for both Direct and WebView modes:
+ * 1) Inspects `netcheck.gdou.edu.cn/go.php?code=jw` with `redirect: 'manual'` (fast 6s timeout, 1 hop).
+ * 2) If `Location` points to `wfw.gdou.edu.cn`, immediately returns off-campus `isWebVpn: true` (~200ms).
+ * 3) If `netcheck` points to campus `jw.gdou.edu.cn` OR times out/fails, verifies real reachability
+ *    of `jw.gdou.edu.cn` within 3.5s and automatically falls back to `wfw.gdou.edu.cn` when unreachable
+ *    so off-campus mobile networks never hang waiting on campus-only `jw.gdou.edu.cn`.
  */
 export async function probeGdouNetworkRoute(
   options: AuthRequestOptions = {}
 ): Promise<{ isWebVpn: boolean; finalUrl: string; html: string }> {
   const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
-  const netResp = await fetchWithTimeout(
-    GDOU_ENTRY_URL,
-    {
-      method: 'GET',
-      credentials: 'include',
-      headers: {
-        'User-Agent': ua,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  try {
+    const netResp = await fetchWithTimeout(
+      GDOU_ENTRY_URL,
+      {
+        method: 'GET',
+        credentials: 'omit',
+        redirect: 'manual',
+        headers: {
+          'User-Agent': ua,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
       },
-    },
-    { ...options, timeoutMs: options.timeoutMs ?? 15_000 }
-  );
+      { ...options, timeoutMs: Math.min(options.timeoutMs ?? NETCHECK_PROBE_TIMEOUT_MS, 8_000) }
+    );
 
-  const finalUrl = netResp.url || GDOU_ENTRY_URL;
-  const html = await netResp.text();
-  const isWebVpn = finalUrl.includes('wfw.gdou.edu.cn');
-  return { isWebVpn, finalUrl, html };
+    if (netResp.status >= 300 && netResp.status < 400) {
+      const loc = (netResp.headers.get('location') || '').trim();
+      if (loc.includes('wfw.gdou.edu.cn')) {
+        return { isWebVpn: true, finalUrl: loc, html: '' };
+      }
+      if (loc.includes('jw.gdou.edu.cn')) {
+        const directOk = await probeDirectJwReachable(options);
+        return {
+          isWebVpn: !directOk,
+          finalUrl: directOk ? loc : GDOU_JW_WFW_BASE,
+          html: '',
+        };
+      }
+    }
+
+    const finalUrl = netResp.url || GDOU_ENTRY_URL;
+    const html = await netResp.text();
+    if (finalUrl.includes('wfw.gdou.edu.cn') || html.includes('wfw.gdou.edu.cn')) {
+      return { isWebVpn: true, finalUrl: finalUrl.includes('wfw.gdou.edu.cn') ? finalUrl : GDOU_JW_WFW_BASE, html };
+    }
+    const directOk = await probeDirectJwReachable(options);
+    return {
+      isWebVpn: !directOk,
+      finalUrl: directOk ? finalUrl : GDOU_JW_WFW_BASE,
+      html,
+    };
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+    const directOk = await probeDirectJwReachable(options);
+    return {
+      isWebVpn: !directOk,
+      finalUrl: directOk ? GDOU_JW_DIRECT_ORIGIN : GDOU_JW_WFW_BASE,
+      html: '',
+    };
+  }
 }
 
 /**
- * Step 1: Probe `netcheck.gdou.edu.cn/go.php?code=jw` to detect campus vs WebVPN route,
+ * Step 1: Resolve campus vs WebVPN route (supports explicit `routePref` override or fail-safe auto probe),
  * then fetch `https://authserver.gdou.edu.cn/authserver/login` tokens directly.
  */
 export async function prepareGdouAuthSession(
-  options: AuthRequestOptions = {}
+  options: AuthRequestOptions & { routePref?: GdouRoutePref } = {}
 ): Promise<PreparedAuthSession> {
   const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
   const ephemeralBfp = generateSecureHex(16);
+  const routePref: GdouRoutePref = options.routePref ?? 'auto';
 
-  const { isWebVpn, html: netHtml } = await probeGdouNetworkRoute(options);
+  let isWebVpn: boolean;
+  let netHtml = '';
+  if (routePref === 'wfw') {
+    isWebVpn = true;
+  } else if (routePref === 'campus') {
+    isWebVpn = false;
+  } else {
+    const probed = await probeGdouNetworkRoute(options);
+    isWebVpn = probed.isWebVpn;
+    netHtml = probed.html;
+  }
   const jwBaseUrl = isWebVpn ? GDOU_JW_WFW_BASE : GDOU_JW_DIRECT_ORIGIN;
 
   // CRITICAL (Off-campus WebVPN): wfw.gdou.edu.cn requires authenticating WFWSESSID first
@@ -372,6 +519,9 @@ export async function prepareGdouAuthSession(
     },
     options
   );
+  if (authResp.status === 403) {
+    throw new Error('海大认证中心返回 HTTP 403，请关闭手机 VPN / 代理或切换 4G/5G 流量后重试');
+  }
 
   let authHtml = await authResp.text();
   if ((authResp.url || '').includes('reAuthLoginView.do') || authHtml.includes('reAuthParams')) {
@@ -1172,6 +1322,15 @@ export async function submitGdouMfaAndCompleteSync(
     );
 
     const submitText = (await submitResp.text()).trim();
+    if (submitResp.status === 403) {
+      throw new Error('二次认证请求返回 HTTP 403，请关闭手机 VPN / 代理或切换 4G/5G 流量后重试');
+    }
+    if (!submitResp.ok) {
+      throw new Error(`二次认证提交异常 (HTTP ${submitResp.status})，请重新获取验证码或切换「官网无痕网页」`);
+    }
+    if (submitText.includes('pwdEncryptSalt') && !submitText.startsWith('{')) {
+      throw new Error('多因子验证会话已过期，请重新发起登录');
+    }
     let data: { code?: string; msg?: string } = {};
     if (submitText.startsWith('{')) {
       try {
@@ -1180,7 +1339,11 @@ export async function submitGdouMfaAndCompleteSync(
         // Non-JSON response
       }
     }
-    if (data.code === 'reAuth_failed' || data.code === 'reAuth_unauthorized') {
+    if (
+      data.code === 'reAuth_failed' ||
+      data.code === 'reAuth_unauthorized' ||
+      (data.code && !/success|ok/i.test(data.code))
+    ) {
       throw new Error(data.msg || '二次认证验证码错误或已过期，请重新输入');
     }
 
@@ -1259,6 +1422,9 @@ export async function submitGdouMfaAndCompleteSync(
         grades: pulled.grades,
         syncedPeriods: pulled.syncedPeriods,
         detectedCampus: pulled.detectedCampus,
+        graduationAudit: pulled.graduationAudit,
+        emptyClassroomSnapshot: pulled.emptyClassroomSnapshot,
+        campusSearchResult: pulled.campusSearchResult,
         termLabel: pulled.termLabel,
         academicYear: pulled.academicYear,
         semesterCode: pulled.semesterCode,
@@ -1484,6 +1650,9 @@ export async function completeWfwSubAuthAndSync(
         grades: pulled.grades,
         syncedPeriods: pulled.syncedPeriods,
         detectedCampus: pulled.detectedCampus,
+        graduationAudit: pulled.graduationAudit,
+        emptyClassroomSnapshot: pulled.emptyClassroomSnapshot,
+        campusSearchResult: pulled.campusSearchResult,
         termLabel: pulled.termLabel,
         academicYear: pulled.academicYear,
         semesterCode: pulled.semesterCode,
@@ -1592,6 +1761,9 @@ async function completeCasToJwHandoff(
       },
       options
     );
+    if (jwEntryResp.status === 403) {
+      throw new Error('校外微门户 (wfw.gdou.edu.cn) 返回 HTTP 403，请关闭手机 VPN / 代理或切换 4G/5G 流量后重试');
+    }
     const jwEntryHtml = await jwEntryResp.text();
     let salt2 = extractHiddenInput(jwEntryHtml, 'pwdEncryptSalt');
     let exe2 = extractHiddenInput(jwEntryHtml, 'execution');
@@ -1626,6 +1798,9 @@ async function completeCasToJwHandoff(
         },
         options
       );
+      if (authWfwResp.status === 403) {
+        throw new Error('校外微门户认证通道返回 HTTP 403，请关闭手机 VPN / 代理或切换 4G/5G 流量后重试');
+      }
       if (authWfwResp.ok) {
         const authWfwHtml = await authWfwResp.text();
         const freshSalt = extractHiddenInput(authWfwHtml, 'pwdEncryptSalt');
@@ -1644,7 +1819,9 @@ async function completeCasToJwHandoff(
         }
       }
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') throw err;
+      if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('HTTP 403'))) {
+        throw err;
+      }
     }
 
     if (!salt2 || !exe2) {
@@ -1652,6 +1829,17 @@ async function completeCasToJwHandoff(
     }
 
     if (!ephemeralForWfw?.username || !ephemeralForWfw?.password) {
+      return {
+        status: 'wfw_subauth_needed',
+        salt2,
+        execution2: exe2,
+        lt2,
+      };
+    }
+
+    // If proxied wfw authserver requires graphic captcha for Step 2, surface captcha UI instead of posting empty captcha
+    const step2Cap = await checkWfwSubAuthCaptcha(session, ephemeralForWfw.username, options);
+    if (step2Cap.isNeed) {
       return {
         status: 'wfw_subauth_needed',
         salt2,
@@ -1802,6 +1990,303 @@ function derivePreviousTerm(
   return { xnm: String(y), xqm: '3', label: `${y}-${y + 1}学年 第1学期` };
 }
 
+async function fetchJwGradeSubScoresBatch(
+  jwBaseUrl: string,
+  prefix: string,
+  grades: GradeItem[],
+  options: AuthRequestOptions = {}
+): Promise<GradeItem[]> {
+  if (grades.length === 0) return grades;
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const nowIso = new Date().toISOString();
+  // Cap to 16 most recent grades that have a `jxbId` so full sync stays fast & bounded
+  const candidates = grades.filter((g) => Boolean(g.jxbId && g.rawXnm && g.rawXqm)).slice(0, 16);
+  if (candidates.length === 0) return grades;
+
+  const subScoreById = new Map<string, GradeItem['subScores']>();
+  const BATCH_SIZE = 4;
+
+  for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+    if (options.signal?.aborted) break;
+    const chunk = candidates.slice(i, i + BATCH_SIZE);
+    await Promise.all(
+      chunk.map(async (grade) => {
+        for (const detailPath of GDOU_JW_PATHS.gradeDetailQueries) {
+          try {
+            const resp = await fetchWithTimeout(
+              `${jwBaseUrl}${prefix}${detailPath}`,
+              {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'User-Agent': ua,
+                  'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  Accept: 'text/html,application/json,*/*;q=0.8',
+                },
+                body: encodeFormBody({
+                  xnm: grade.rawXnm || '',
+                  xqm: grade.rawXqm || '',
+                  jxb_id: grade.jxbId || '',
+                  kcmc: grade.courseName,
+                }),
+              },
+              { ...options, timeoutMs: 6_000 }
+            );
+            if (!resp.ok) continue;
+            const rawText = (await resp.text()).trim();
+            if (!rawText || rawText.includes('pwdEncryptSalt')) continue;
+            const parsed = parseZfGradeSubScoresResponse(rawText);
+            if (parsed.length > 0) {
+              subScoreById.set(grade.id, parsed);
+              return;
+            }
+          } catch (err) {
+            if (err instanceof Error && err.name === 'AbortError') return;
+          }
+        }
+      })
+    );
+  }
+
+  return grades.map((g) => {
+    const found = subScoreById.get(g.id);
+    if (found && found.length > 0) {
+      return {
+        ...g,
+        subScores: found,
+        subScoreSource: 'official_zf_detail' as const,
+        subScoreSourceLabel: OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
+        subScoreSyncedAtIso: nowIso,
+      };
+    }
+    return g;
+  });
+}
+
+async function fetchJwGraduationAudit(
+  jwBaseUrl: string,
+  prefix: string,
+  grades: GradeItem[],
+  options: AuthRequestOptions = {}
+): Promise<GraduationAuditReport> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const nowIso = new Date().toISOString();
+
+  // 1) Try official 正方 学业情况 / 培养方案 tree JSON endpoints first
+  for (const treePath of GDOU_JW_PATHS.curriculumTreeQueries) {
+    try {
+      const resp = await fetchWithTimeout(
+        `${jwBaseUrl}${prefix}${treePath}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'User-Agent': ua,
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            Accept: 'application/json, text/html, */*;q=0.8',
+          },
+          body: encodeFormBody({
+            xfyqjd_id: '',
+            cjlrxn: '',
+            cjlrxq: '',
+            bkcjlrxn: '',
+            bkcjlrxq: '',
+            xscjcx: '1',
+          }),
+        },
+        { ...options, timeoutMs: 8_000 }
+      );
+      if (!resp.ok) continue;
+      const text = (await resp.text()).trim();
+      if (!text || text.includes('pwdEncryptSalt')) continue;
+      const parsed = parseZfGraduationAuditResponse(text, nowIso);
+      if (parsed && (parsed.modules.length > 0 || parsed.totalRequiredCredits !== null)) {
+        return parsed;
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+    }
+  }
+
+  // 2) Fallback: GET `/xsxy/xsxyqk_cxXsxyqkIndex.html` HTML summary page
+  try {
+    const htmlResp = await fetchWithTimeout(
+      `${jwBaseUrl}${prefix}${GDOU_JW_PATHS.curriculumIndex}`,
+      {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'User-Agent': ua,
+          Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+        },
+      },
+      { ...options, timeoutMs: 8_000 }
+    );
+    if (htmlResp.ok) {
+      const html = await htmlResp.text();
+      if (html && !html.includes('pwdEncryptSalt')) {
+        const parsed = parseZfGraduationAuditResponse(html, nowIso);
+        if (parsed && (parsed.modules.length > 0 || parsed.totalRequiredCredits !== null)) {
+          return parsed;
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+  }
+
+  // 3) Honest, explicitly labeled local fallback from synced grades (never pretends to be official plan)
+  return buildLocalEstimatedGraduationAudit(grades, nowIso);
+}
+
+async function fetchJwEmptyClassrooms(
+  jwBaseUrl: string,
+  prefix: string,
+  rawParams: EmptyClassroomQueryParams,
+  options: AuthRequestOptions = {}
+): Promise<EmptyClassroomSnapshot> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const nowIso = new Date().toISOString();
+  let filterOptions: EmptyClassroomSnapshot['filterOptions'];
+
+  // 1) Fetch filter dropdowns (campuses, buildings, room types) from `/cdjy/cdjy_cxKxcdlb.html`
+  try {
+    const indexResp = await fetchWithTimeout(
+      `${jwBaseUrl}${prefix}${GDOU_JW_PATHS.emptyClassroomIndex}`,
+      {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'User-Agent': ua,
+          Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+        },
+      },
+      { ...options, timeoutMs: 10_000 }
+    );
+    if (indexResp.ok) {
+      const html = await indexResp.text();
+      if (html && !html.includes('pwdEncryptSalt')) {
+        filterOptions = parseEmptyClassroomOptionsHtml(html);
+      }
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+  }
+
+  const effectiveParams: EmptyClassroomQueryParams = {
+    ...rawParams,
+    campusId: rawParams.campusId || filterOptions?.campuses?.[0]?.id || '',
+    sections: rawParams.sections.length > 0 ? rawParams.sections : [1, 2],
+  };
+
+  const queryBody = encodeFormBody(buildEmptyClassroomQueryParams(effectiveParams));
+  const resp = await fetchWithTimeout(
+    `${jwBaseUrl}${prefix}${GDOU_JW_PATHS.emptyClassroomQuery}`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'User-Agent': ua,
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        Accept: 'application/json, text/javascript, */*;q=0.01',
+      },
+      body: queryBody,
+    },
+    { ...options, timeoutMs: 15_000 }
+  );
+
+  let rooms: EmptyClassroomSnapshot['rooms'] = [];
+  if (resp.ok) {
+    const text = (await resp.text()).trim();
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try {
+        rooms = parseZfEmptyClassroomsResponse(JSON.parse(text));
+      } catch {
+        rooms = [];
+      }
+    }
+  }
+
+  const campusName = filterOptions?.campuses.find((c) => c.id === effectiveParams.campusId)?.name;
+  const buildingName = filterOptions?.buildings.find((b) => b.id === effectiveParams.buildingId)?.name;
+
+  return {
+    queriedAtIso: nowIso,
+    sourceLabel: OFFICIAL_EMPTY_ROOM_SOURCE_LABEL,
+    params: effectiveParams,
+    campusName,
+    buildingName,
+    rooms,
+    filterOptions,
+  };
+}
+
+async function fetchJwCampusCourses(
+  jwBaseUrl: string,
+  prefix: string,
+  query: CampusCourseSearchQuery,
+  options: AuthRequestOptions = {}
+): Promise<CampusCourseSearchResult> {
+  const ua = options.userAgent ?? DEFAULT_DESKTOP_UA;
+  const nowIso = new Date().toISOString();
+  const body = encodeFormBody(buildCampusCourseSearchParams(query));
+
+  for (const endpoint of GDOU_JW_PATHS.campusCourseQueries) {
+    try {
+      const resp = await fetchWithTimeout(
+        `${jwBaseUrl}${prefix}${endpoint}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'User-Agent': ua,
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            Accept: 'application/json, text/javascript, */*;q=0.01',
+          },
+          body,
+        },
+        { ...options, timeoutMs: 15_000 }
+      );
+      if (!resp.ok) continue;
+      const text = (await resp.text()).trim();
+      if (!text || (!text.startsWith('{') && !text.startsWith('['))) continue;
+      const parsedJson = JSON.parse(text);
+      const courses = parseZfCampusCourseSearchResponse(parsedJson);
+      if (courses.length > 0) {
+        return {
+          queriedAtIso: nowIso,
+          sourceLabel: OFFICIAL_CAMPUS_COURSE_SOURCE_LABEL,
+          query,
+          courses,
+          endpointUsed: sanitizeEndpointUrl(endpoint),
+        };
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+    }
+  }
+
+  return {
+    queriedAtIso: nowIso,
+    sourceLabel: OFFICIAL_CAMPUS_COURSE_SOURCE_LABEL,
+    query,
+    courses: [],
+  };
+}
+
+function guessCurrentSectionBlock(): number[] {
+  const h = new Date().getHours();
+  if (h < 10) return [1, 2];
+  if (h < 12) return [3, 4];
+  if (h < 16) return [5, 6];
+  if (h < 18) return [7, 8];
+  return [9, 10];
+}
+
 async function pullAllJwData(
   session: PreparedAuthSession,
   steps: string[],
@@ -1815,18 +2300,70 @@ async function pullAllJwData(
   grades: GradeItem[];
   syncedPeriods?: PeriodTime[];
   detectedCampus?: string;
+  graduationAudit?: GraduationAuditReport;
+  emptyClassroomSnapshot?: EmptyClassroomSnapshot;
+  campusSearchResult?: CampusCourseSearchResult;
   termLabel: string;
   academicYear: string;
   semesterCode: string;
   warnings: string[];
 }> {
   const warnings: string[] = [];
+  const job = options.job;
   let { prefix, xnm, xqm, termLabel } = await detectJwPrefixAndTerm(
     session.jwBaseUrl,
     termOverride,
     options
   );
   log(`5. 已锁定目标学期：${termLabel} (xnm=${xnm}, xqm=${xqm})`);
+
+  // Auxiliary Job A: On-demand ephemeral Empty Classroom Query
+  if (job?.kind === 'empty_classroom') {
+    const queryParams: EmptyClassroomQueryParams = {
+      ...job.params,
+      xnm: job.params.xnm || xnm,
+      xqm: job.params.xqm || xqm,
+    };
+    log(
+      `6. 正在查询第 ${queryParams.week} 周 · 周${queryParams.dayOfWeek} · 第 ${queryParams.sections.join(',')} 节空教室...`
+    );
+    const snapshot = await fetchJwEmptyClassrooms(session.jwBaseUrl, prefix, queryParams, options);
+    log(`7. 空教室查询完成：共找到 ${snapshot.rooms.length} 间可用空闲教室`);
+    return {
+      prefix,
+      courses: [],
+      exams: [],
+      grades: [],
+      emptyClassroomSnapshot: snapshot,
+      termLabel,
+      academicYear: xnm,
+      semesterCode: xqm,
+      warnings,
+    };
+  }
+
+  // Auxiliary Job B: On-demand ephemeral Campus-Wide / Teacher / Class Course Search
+  if (job?.kind === 'campus_search') {
+    const query: CampusCourseSearchQuery = {
+      ...job.query,
+      xnm: job.query.xnm || xnm,
+      xqm: job.query.xqm || xqm,
+    };
+    log(`6. 正在检索全校/教师/班级课表（关键词：${query.keyword || query.teacher || query.className || '全部'}）...`);
+    const searchRes = await fetchJwCampusCourses(session.jwBaseUrl, prefix, query, options);
+    log(`7. 全校课表检索完成：命中 ${searchRes.courses.length} 条开课记录`);
+    return {
+      prefix,
+      courses: [],
+      exams: [],
+      grades: [],
+      campusSearchResult: searchRes,
+      termLabel,
+      academicYear: xnm,
+      semesterCode: xqm,
+      warnings,
+    };
+  }
 
   let rawSchedule: unknown;
   try {
@@ -1906,8 +2443,39 @@ async function pullAllJwData(
 
   const gradeRes = await fetchJwGradesJson(session.jwBaseUrl, prefix, options);
   if (gradeRes.queryWarning) warnings.push(gradeRes.queryWarning);
-  const grades = parseZfGradesResponse(gradeRes.data);
-  log(`7. 考试与成绩拉取完成：考试 ${exams.length} 场、成绩/学分记录 ${grades.length} 门`);
+  const baseGrades = parseZfGradesResponse(gradeRes.data);
+
+  // Best-effort parallel pull of Grade Sub-scores, Graduation Curriculum Audit, and Today's Empty Room Snapshot
+  const [grades, graduationAudit, emptyClassroomSnapshot] = await Promise.all([
+    fetchJwGradeSubScoresBatch(session.jwBaseUrl, prefix, baseGrades, options).catch(
+      () => baseGrades
+    ),
+    fetchJwGraduationAudit(session.jwBaseUrl, prefix, baseGrades, options).catch(() =>
+      buildLocalEstimatedGraduationAudit(baseGrades)
+    ),
+    fetchJwEmptyClassrooms(
+      session.jwBaseUrl,
+      prefix,
+      {
+        xnm,
+        xqm,
+        campusId: parsedSchedule.campusId || '',
+        buildingId: '',
+        roomTypeId: '',
+        week: 1,
+        dayOfWeek: getTodayDayOfWeek(),
+        sections: guessCurrentSectionBlock(),
+      },
+      { ...options, timeoutMs: 8_000 }
+    ).catch(() => undefined),
+  ]);
+
+  const detailCount = grades.filter((g) => g.subScores && g.subScores.length > 0).length;
+  log(
+    `7. 考试与成绩拉取完成：考试 ${exams.length} 场、成绩 ${grades.length} 门${
+      detailCount > 0 ? `（含 ${detailCount} 门分项明细）` : ''
+    }${graduationAudit.source === 'official_zf_curriculum' ? '、已同步培养方案学分进度' : ''}`
+  );
 
   return {
     prefix,
@@ -1916,6 +2484,11 @@ async function pullAllJwData(
     grades,
     syncedPeriods: syncedPeriods.length >= 8 ? syncedPeriods : undefined,
     detectedCampus: parsedSchedule.campusName,
+    graduationAudit,
+    emptyClassroomSnapshot:
+      emptyClassroomSnapshot && emptyClassroomSnapshot.rooms.length > 0
+        ? emptyClassroomSnapshot
+        : undefined,
     termLabel: parsedSchedule.termLabel || termLabel,
     academicYear: xnm,
     semesterCode: xqm,
@@ -2170,6 +2743,25 @@ export async function executeOneShotGdouSync(
       log('4. 校外教务通道要求完成多因子二次安全验证');
       return { status: 'mfa_required', mfa: handoffOutcome.mfa };
     }
+    if (handoffOutcome.status === 'wfw_subauth_needed') {
+      keepSessionForMfa = true;
+      const cap = await checkWfwSubAuthCaptcha(session, username, reqOpts);
+      log('4. 校外教务子通道要求图形验证码校验（密码引用已释放，请确认后继续）');
+      return {
+        status: 'wfw_subauth_required',
+        subAuth: {
+          required: true,
+          username,
+          salt2: handoffOutcome.salt2,
+          execution2: handoffOutcome.execution2,
+          lt2: handoffOutcome.lt2,
+          needCaptcha: cap.isNeed,
+          captchaImageUri: cap.imageDataUri,
+          session,
+          previousSteps: steps,
+        },
+      };
+    }
     log('4. 教务通道已打通，凭据引用已从内存释放');
 
     const pulled = await pullAllJwData(session, steps, log, termOverride, reqOpts);
@@ -2211,6 +2803,9 @@ export async function executeOneShotGdouSync(
         grades: pulled.grades,
         syncedPeriods: pulled.syncedPeriods,
         detectedCampus: pulled.detectedCampus,
+        graduationAudit: pulled.graduationAudit,
+        emptyClassroomSnapshot: pulled.emptyClassroomSnapshot,
+        campusSearchResult: pulled.campusSearchResult,
         termLabel: pulled.termLabel,
         academicYear: pulled.academicYear,
         semesterCode: pulled.semesterCode,
@@ -2293,9 +2888,11 @@ export function buildIncognitoWebViewPreloadScript(): string {
           if (wrongSso) {
             return 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin' + (wrongSso[1] || '');
           }
-          var bareJw = out.match(/^https?:\\/\\/jw\\.gdou\\.edu\\.cn(\\/.*)?$/i);
+          var bareJw = out.match(/^https?:\\/\\/jw\\.gdou\\.edu\\.cn(?::(?:80|443))?([/?#].*)?$/i);
           if (bareJw) {
-            return 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn' + (bareJw[1] || '');
+            var jwRest = bareJw[1] || '';
+            if (jwRest && jwRest.charAt(0) !== '/') jwRest = '/' + jwRest;
+            return 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn' + jwRest;
           }
           // ONLY rewrite /https://authserver.../authserver/... -> /authserver/... when already inside /authserver/
           // so urlss="https://authserver.gdou.edu.cn" is guaranteed active (never breaking urlss priming or logout!).
@@ -2373,13 +2970,34 @@ export function buildIncognitoWebViewPreloadScript(): string {
 export function buildIncognitoWebViewSyncScript(
   override?: SyncTermOverride,
   bridgeToken = '',
-  expectedServiceUrl: string = `${GDOU_WFW_ORIGIN}/`
+  expectedServiceUrl: string = `${GDOU_WFW_ORIGIN}/`,
+  job?: AuxiliarySyncJob
 ): string {
   const overrideXnm = JSON.stringify(override?.xnm ?? '');
   const overrideXqm = JSON.stringify(override?.xqm ?? '');
   const tokenJson = JSON.stringify(bridgeToken);
   const prefixesJson = JSON.stringify(GDOU_JW_PREFIXES);
   const pathsJson = JSON.stringify(GDOU_JW_PATHS);
+  const jobJson = JSON.stringify(
+    job?.kind === 'empty_classroom'
+      ? {
+          kind: 'empty_classroom',
+          params: job.params,
+          formParams: buildEmptyClassroomQueryParams(job.params),
+        }
+      : job?.kind === 'campus_search'
+        ? {
+            kind: 'campus_search',
+            query: job.query,
+            formParams: buildCampusCourseSearchParams(job.query),
+          }
+        : { kind: 'full_sync' }
+  );
+  const todayEmptyMaskJson = JSON.stringify({
+    weekMask: String(buildZhengfangBitmask([1], 30)),
+    dayOfWeek: String(getTodayDayOfWeek()),
+    sectionMask: String(buildZhengfangBitmask(guessCurrentSectionBlock(), 16)),
+  });
   const originsJson = JSON.stringify({
     auth: GDOU_AUTH_ORIGIN,
     wfw: GDOU_WFW_ORIGIN,
@@ -2403,6 +3021,8 @@ export function buildIncognitoWebViewSyncScript(
       var JW_PREFIXES = ${prefixesJson};
       var JW_PATHS = ${pathsJson};
       var ORIGINS = ${originsJson};
+      var SYNC_JOB = ${jobJson};
+      var TODAY_EMPTY_MASK = ${todayEmptyMaskJson};
 
       // Idempotency guard per page URL to prevent double execution
       if (window.__GDOU_INJECTED_HREF__ === href && window.__GDOU_SYNC_RUNNING__) return;
@@ -2570,8 +3190,33 @@ export function buildIncognitoWebViewSyncScript(
         return;
       }
 
+      var hasAuthForm =
+        html.indexOf('pwdEncryptSalt') !== -1 ||
+        html.indexOf('reAuthParams') !== -1 ||
+        Boolean(document.querySelector('#loginFromId, #pwdFromId'));
+
+      var isAuthenticatedJwPortal =
+        !hasAuthForm &&
+        (href.indexOf('index_initMenu') !== -1 ||
+          html.indexOf('index_initMenu') !== -1 ||
+          html.indexOf('教学管理信息服务平台') !== -1 ||
+          html.indexOf('xskbcx') !== -1);
+
+      // If wfw followed Step 2 POST redirect server-side into JWXT while address bar stayed on /authserver/*,
+      // jump straight to ORIGINS.jwWfw instead of trapping the user on the Step 2 login banner!
       if (
         host === 'wfw.gdou.edu.cn' &&
+        isAuthenticatedJwPortal &&
+        (pathname.indexOf('/authserver/') === 0 || href.indexOf('/https://authserver.gdou.edu.cn') !== -1)
+      ) {
+        post({ type: 'PROGRESS', message: '教务通道已激活，正在进入课表页面...' });
+        window.location.replace(ORIGINS.jwWfw);
+        return;
+      }
+
+      if (
+        host === 'wfw.gdou.edu.cn' &&
+        !isAuthenticatedJwPortal &&
         (href.indexOf('/https://authserver.gdou.edu.cn') !== -1 ||
           pathname.indexOf('/authserver/') === 0 ||
           (href.indexOf('/https://jw.gdou.edu.cn') !== -1 &&
@@ -2589,7 +3234,7 @@ export function buildIncognitoWebViewSyncScript(
               await timedFetch(
                 ORIGINS.authWfw + ORIGINS.authLogin + '?service=' + encodeURIComponent(ORIGINS.jwSsoService),
                 { credentials: 'include' },
-                12000
+                8000
               );
             } catch (e) {}
             window.location.replace(
@@ -2679,23 +3324,15 @@ export function buildIncognitoWebViewSyncScript(
         return;
       }
 
-      var hasAuthForm =
-        html.indexOf('pwdEncryptSalt') !== -1 ||
-        html.indexOf('reAuthParams') !== -1 ||
-        Boolean(document.querySelector('#loginFromId, #pwdFromId')) ||
+      var hasAuthUrl =
+        hasAuthForm ||
         href.indexOf('/authserver/login') !== -1 ||
         href.indexOf('reAuthLoginView') !== -1;
-
-      var isAuthenticatedJwPortal =
-        href.indexOf('index_initMenu') !== -1 ||
-        html.indexOf('index_initMenu') !== -1 ||
-        html.indexOf('教学管理信息服务平台') !== -1 ||
-        html.indexOf('xskbcx') !== -1;
 
       var isWfwHome =
         host === 'wfw.gdou.edu.cn' &&
         !isWfwSplash &&
-        !hasAuthForm &&
+        !hasAuthUrl &&
         !isAuthenticatedJwPortal &&
         href.indexOf('jw.gdou.edu.cn') === -1 &&
         pathname.indexOf('/authserver') !== 0;
@@ -2704,7 +3341,7 @@ export function buildIncognitoWebViewSyncScript(
         href.indexOf('jw.gdou.edu.cn') !== -1 ||
         (host === 'wfw.gdou.edu.cn' && isAuthenticatedJwPortal);
 
-      if (!isWfwHome && (!isJwHost || hasAuthForm || !isAuthenticatedJwPortal)) return;
+      if (!isWfwHome && (!isJwHost || hasAuthUrl || !isAuthenticatedJwPortal)) return;
 
       window.__GDOU_SYNC_RUNNING__ = true;
 
@@ -2728,14 +3365,23 @@ export function buildIncognitoWebViewSyncScript(
           var xnm = ${overrideXnm};
           var xqm = ${overrideXqm};
           var jwReady = false;
+          var sawJwAuthBounce = false;
           var prefixesToTry = prefix ? [prefix, ''] : JW_PREFIXES.slice();
           for (var i = 0; i < prefixesToTry.length; i++) {
             var p = prefixesToTry[i];
             try {
-              var idxResp = await timedFetch(root + p + JW_PATHS.scheduleIndex, { credentials: 'include' }, 15000);
+              var idxResp = await timedFetch(
+                root + p + JW_PATHS.scheduleIndex,
+                { credentials: 'include' },
+                isWfwHome ? 8000 : 20000
+              );
               if (!idxResp.ok) continue;
               var idxHtml = await idxResp.text();
-              if (idxHtml.indexOf('pwdEncryptSalt') !== -1 || idxHtml.indexOf('统一身份认证') !== -1) continue;
+              if (idxHtml.indexOf('pwdEncryptSalt') !== -1 || idxHtml.indexOf('统一身份认证') !== -1) {
+                sawJwAuthBounce = true;
+                if (isWfwHome) break;
+                continue;
+              }
               if (idxHtml.indexOf('xnm') !== -1) {
                 prefix = p;
                 jwReady = true;
@@ -2746,33 +3392,37 @@ export function buildIncognitoWebViewSyncScript(
                 if (!xqm && xqmEl && xqmEl.value) xqm = xqmEl.value;
                 break;
               }
-            } catch (e) {}
+            } catch (e) {
+              if (isWfwHome) break;
+            }
           }
 
           if (!jwReady && isWfwHome) {
-            // 1) Check if jw is already authenticated inside WFWSESSID
-            try {
-              var primeResp = await timedFetch(ORIGINS.jwWfw, { credentials: 'include' }, 12000);
-              if (primeResp && primeResp.ok) {
-                var primeHtml = await primeResp.text();
-                if (
-                  primeHtml.indexOf('pwdEncryptSalt') === -1 &&
-                  (primeHtml.indexOf('index_initMenu') !== -1 || primeHtml.indexOf('教学管理信息服务平台') !== -1)
-                ) {
-                  window.__GDOU_SYNC_RUNNING__ = false;
-                  post({ type: 'PROGRESS', message: '教务通道已免密打通，正在进入课表页面...' });
-                  window.location.replace(ORIGINS.jwWfw);
-                  return;
+            // 1) Only probe jwWfw root if scheduleIndex didn't already confirm CAS login bounce
+            if (!sawJwAuthBounce) {
+              try {
+                var primeResp = await timedFetch(ORIGINS.jwWfw, { credentials: 'include' }, 8000);
+                if (primeResp && primeResp.ok) {
+                  var primeHtml = await primeResp.text();
+                  if (
+                    primeHtml.indexOf('pwdEncryptSalt') === -1 &&
+                    (primeHtml.indexOf('index_initMenu') !== -1 || primeHtml.indexOf('教学管理信息服务平台') !== -1)
+                  ) {
+                    window.__GDOU_SYNC_RUNNING__ = false;
+                    post({ type: 'PROGRESS', message: '教务通道已免密打通，正在进入课表页面...' });
+                    window.location.replace(ORIGINS.jwWfw);
+                    return;
+                  }
                 }
-              }
-            } catch (e) {}
-            // 2) CRITICAL: Prime urlss="https://authserver.gdou.edu.cn" + Path=/authserver cookies BEFORE navigating
-            //    to /authserver/login, otherwise stale urlss="https://jw.gdou.edu.cn" causes immediate HTTP 404!
+              } catch (e) {}
+            }
+            // 2) Prime urlss="https://authserver.gdou.edu.cn" + Path=/authserver cookies BEFORE navigating
+            //    to /authserver/login so Step 2 always routes to authserver cleanly!
             try {
               await timedFetch(
                 ORIGINS.authWfw + ORIGINS.authLogin + '?service=' + encodeURIComponent(ORIGINS.jwSsoService),
                 { credentials: 'include' },
-                12000
+                6000
               );
             } catch (e) {}
             window.__GDOU_SYNC_RUNNING__ = false;
@@ -2791,148 +3441,302 @@ export function buildIncognitoWebViewSyncScript(
             if (!xqm) xqm = (m >= 8 || m === 1) ? '3' : '12';
           }
 
-          post({ type: 'PROGRESS', message: '正在拉取 ' + xnm + ' 学年课表数据...' });
-          var kbResp = await timedFetch(root + prefix + JW_PATHS.scheduleQuery, {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-              'X-Requested-With': 'XMLHttpRequest'
-            },
-            body: encodeForm({ xnm: xnm, xqm: xqm, kzlx: 'ck', xsdm: '' })
-          }, 20000);
-          var kbText = (await kbResp.text()).trim();
-          if (!kbResp.ok || !kbText || kbText.charAt(0) !== '{') {
-            window.__GDOU_SYNC_RUNNING__ = false;
-            if (isWfwHome) {
-              window.location.href = ORIGINS.jwWfw;
-            }
-            return;
-          }
-          var kbJson = JSON.parse(kbText);
-          if ((!kbJson.kbList || kbJson.kbList.length === 0) && !${overrideXnm} && !${overrideXqm}) {
-            var yNum = parseInt(xnm, 10);
-            if (!isNaN(yNum)) {
-              var prevXnm = xqm === '3' ? String(yNum - 1) : String(yNum);
-              var prevXqm = xqm === '3' ? '12' : '3';
-              try {
-                var prevResp = await timedFetch(root + prefix + JW_PATHS.scheduleQuery, {
-                  method: 'POST',
-                  credentials: 'include',
-                  headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                    'X-Requested-With': 'XMLHttpRequest'
-                  },
-                  body: encodeForm({ xnm: prevXnm, xqm: prevXqm, kzlx: 'ck', xsdm: '' })
-                }, 15000);
-                var prevText = (await prevResp.text()).trim();
-                if (prevResp.ok && prevText && prevText.charAt(0) === '{') {
-                  var prevJson = JSON.parse(prevText);
-                  if (prevJson.kbList && prevJson.kbList.length > 0) {
-                    kbJson = prevJson;
-                    xnm = prevXnm;
-                    xqm = prevXqm;
-                  }
-                }
-              } catch (e) {}
-            }
-          }
-
+          var kbJson = { kbList: [] };
           var periodTimesJson = null;
-          try {
-            var xqhId = (kbJson.kbList && kbJson.kbList[0] && kbJson.kbList[0].xqh_id) ? String(kbJson.kbList[0].xqh_id) : '1';
-            var rjcBodies = [
-              encodeForm({ xnm: xnm, xqm: xqm, xqh_id: xqhId }),
-              encodeForm({ xnm: xnm, xqm: xqm })
-            ];
-            for (var ri = 0; ri < rjcBodies.length && !periodTimesJson; ri++) {
-              try {
-                var rjcResp = await timedFetch(root + prefix + JW_PATHS.periodTimes, {
-                  method: 'POST',
-                  credentials: 'include',
-                  headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                    'X-Requested-With': 'XMLHttpRequest'
-                  },
-                  body: rjcBodies[ri]
-                }, 10000);
-                if (!rjcResp.ok) continue;
-                var rjcText = (await rjcResp.text()).trim();
-                if (rjcText.charAt(0) === '{' || rjcText.charAt(0) === '[') {
-                  var rjcParsed = JSON.parse(rjcText);
-                  var arr = Array.isArray(rjcParsed) ? rjcParsed : (rjcParsed.items || rjcParsed.rows || rjcParsed.rjcList || rjcParsed.sjdList || []);
-                  if (Array.isArray(arr) && arr.length >= 8) {
-                    periodTimesJson = rjcParsed;
-                  }
-                }
-              } catch (e) {}
-            }
-          } catch (e) {}
-
-          post({ type: 'PROGRESS', message: '正在拉取考试安排与考场座位...' });
           var examJson = { items: [] };
-          var examVariants = [
-            { xnm: xnm, xqm: xqm, ksmcdmb_id: '', kch: '', kc: '', ksrq: '', kkbm_id: '', _search: 'false', nd: String(Date.now()), 'queryModel.showCount': '100', 'queryModel.currentPage': '1', 'queryModel.sortName': '', 'queryModel.sortOrder': 'asc', time: '0' },
-            { xnm: xnm, xqm: '', 'queryModel.showCount': '100', 'queryModel.currentPage': '1' },
-            { xnm: '', xqm: '', 'queryModel.showCount': '100', 'queryModel.currentPage': '1' }
-          ];
-          var examAttempts = 0;
-          var examAbortedEarly = false;
-          for (var u = 0; u < JW_PATHS.examQueries.length && (!examJson.items || examJson.items.length === 0) && !examAbortedEarly && examAttempts < 4; u++) {
-            for (var b = 0; b < examVariants.length && examAttempts < 4; b++) {
-              examAttempts++;
-              try {
-                var exResp = await timedFetch(root + prefix + JW_PATHS.examQueries[u], {
-                  method: 'POST',
-                  credentials: 'include',
-                  headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                    'X-Requested-With': 'XMLHttpRequest'
-                  },
-                  body: encodeForm(examVariants[b])
-                }, 15000);
-                if (exResp.status === 401 || exResp.status === 403 || exResp.status === 429 || exResp.status === 901) {
-                  examAbortedEarly = true;
-                  break;
-                }
-                if (!exResp.ok) continue;
-                var exText = (await exResp.text()).trim();
-                if (exText.charAt(0) === '{') {
-                  var parsed = JSON.parse(exText);
-                  if ((parsed.items && parsed.items.length > 0) || (parsed.rows && parsed.rows.length > 0)) {
-                    examJson = parsed;
-                    break;
-                  }
-                }
-              } catch (e) {}
-            }
-          }
-
-          post({ type: 'PROGRESS', message: '正在拉取全部学期成绩、绩点与学分...' });
           var gradeJson = { items: [] };
-          var gradeBody = encodeForm({
-            xnm: '', xqm: '', _search: 'false', nd: String(Date.now()),
-            'queryModel.showCount': '5000', 'queryModel.currentPage': '1',
-            'queryModel.sortName': '', 'queryModel.sortOrder': 'asc', time: '0'
-          });
-          for (var g = 0; g < JW_PATHS.gradeQueries.length; g++) {
+          var gradeSubScoresRaw = {};
+          var curriculumRaw = null;
+          var emptyClassroomOptionsHtml = '';
+          var emptyClassroomRaw = null;
+          var campusSearchRaw = null;
+
+          if (SYNC_JOB && SYNC_JOB.kind === 'empty_classroom') {
+            post({ type: 'PROGRESS', message: '正在拉取教务空教室筛选选项与实时空闲列表...' });
             try {
-              var grResp = await timedFetch(root + prefix + JW_PATHS.gradeQueries[g], {
+              var optResp = await timedFetch(root + prefix + JW_PATHS.emptyClassroomIndex, { credentials: 'include' }, 10000);
+              if (optResp && optResp.ok) {
+                emptyClassroomOptionsHtml = await optResp.text();
+              }
+            } catch (e) {}
+            try {
+              var ecForm = Object.assign({}, SYNC_JOB.formParams || {});
+              if (!ecForm.xnm) ecForm.xnm = xnm;
+              if (!ecForm.xqm) ecForm.xqm = xqm;
+              var ecResp = await timedFetch(root + prefix + JW_PATHS.emptyClassroomQuery, {
                 method: 'POST',
                 credentials: 'include',
                 headers: {
                   'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
                   'X-Requested-With': 'XMLHttpRequest'
                 },
-                body: gradeBody
+                body: encodeForm(ecForm)
               }, 15000);
-              if (!grResp.ok) continue;
-              var grText = (await grResp.text()).trim();
-              if (grText.charAt(0) === '{') {
-                var grParsed = JSON.parse(grText);
-                if ((grParsed.items && grParsed.items.length > 0) || (grParsed.rows && grParsed.rows.length > 0)) {
-                  gradeJson = grParsed;
-                  break;
+              if (ecResp && ecResp.ok) {
+                var ecText = (await ecResp.text()).trim();
+                if (ecText.charAt(0) === '{' || ecText.charAt(0) === '[') {
+                  emptyClassroomRaw = JSON.parse(ecText);
+                }
+              }
+            } catch (e) {}
+          } else if (SYNC_JOB && SYNC_JOB.kind === 'campus_search') {
+            post({ type: 'PROGRESS', message: '正在无痕检索全校 / 教师 / 班级课表...' });
+            var csForm = Object.assign({}, SYNC_JOB.formParams || {});
+            if (!csForm.xnm) csForm.xnm = xnm;
+            if (!csForm.xqm) csForm.xqm = xqm;
+            for (var csi = 0; csi < JW_PATHS.campusCourseQueries.length && !campusSearchRaw; csi++) {
+              try {
+                var csResp = await timedFetch(root + prefix + JW_PATHS.campusCourseQueries[csi], {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest'
+                  },
+                  body: encodeForm(csForm)
+                }, 15000);
+                if (!csResp || !csResp.ok) continue;
+                var csText = (await csResp.text()).trim();
+                if (csText.charAt(0) === '{' || csText.charAt(0) === '[') {
+                  var csParsed = JSON.parse(csText);
+                  var csArr = Array.isArray(csParsed) ? csParsed : (csParsed.items || csParsed.kbList || csParsed.rows || []);
+                  if (Array.isArray(csArr) && csArr.length > 0) {
+                    campusSearchRaw = csParsed;
+                  }
+                }
+              } catch (e) {}
+            }
+          } else {
+            post({ type: 'PROGRESS', message: '正在拉取 ' + xnm + ' 学年课表数据...' });
+            var kbResp = await timedFetch(root + prefix + JW_PATHS.scheduleQuery, {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest'
+              },
+              body: encodeForm({ xnm: xnm, xqm: xqm, kzlx: 'ck', xsdm: '' })
+            }, 25000);
+            var kbText = (await kbResp.text()).trim();
+            if (!kbResp.ok || !kbText || kbText.charAt(0) !== '{') {
+              window.__GDOU_SYNC_RUNNING__ = false;
+              if (isWfwHome) {
+                window.location.href = ORIGINS.jwWfw;
+              }
+              return;
+            }
+            kbJson = JSON.parse(kbText);
+            if ((!kbJson.kbList || kbJson.kbList.length === 0) && !${overrideXnm} && !${overrideXqm}) {
+              var yNum = parseInt(xnm, 10);
+              if (!isNaN(yNum)) {
+                var prevXnm = xqm === '3' ? String(yNum - 1) : String(yNum);
+                var prevXqm = xqm === '3' ? '12' : '3';
+                try {
+                  var prevResp = await timedFetch(root + prefix + JW_PATHS.scheduleQuery, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: encodeForm({ xnm: prevXnm, xqm: prevXqm, kzlx: 'ck', xsdm: '' })
+                  }, 15000);
+                  var prevText = (await prevResp.text()).trim();
+                  if (prevResp.ok && prevText && prevText.charAt(0) === '{') {
+                    var prevJson = JSON.parse(prevText);
+                    if (prevJson.kbList && prevJson.kbList.length > 0) {
+                      kbJson = prevJson;
+                      xnm = prevXnm;
+                      xqm = prevXqm;
+                    }
+                  }
+                } catch (e) {}
+              }
+            }
+
+            try {
+              var xqhId = (kbJson.kbList && kbJson.kbList[0] && kbJson.kbList[0].xqh_id) ? String(kbJson.kbList[0].xqh_id) : '1';
+              var rjcBodies = [
+                encodeForm({ xnm: xnm, xqm: xqm, xqh_id: xqhId }),
+                encodeForm({ xnm: xnm, xqm: xqm })
+              ];
+              for (var ri = 0; ri < rjcBodies.length && !periodTimesJson; ri++) {
+                try {
+                  var rjcResp = await timedFetch(root + prefix + JW_PATHS.periodTimes, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: rjcBodies[ri]
+                  }, 10000);
+                  if (!rjcResp.ok) continue;
+                  var rjcText = (await rjcResp.text()).trim();
+                  if (rjcText.charAt(0) === '{' || rjcText.charAt(0) === '[') {
+                    var rjcParsed = JSON.parse(rjcText);
+                    var arr = Array.isArray(rjcParsed) ? rjcParsed : (rjcParsed.items || rjcParsed.rows || rjcParsed.rjcList || rjcParsed.sjdList || []);
+                    if (Array.isArray(arr) && arr.length >= 8) {
+                      periodTimesJson = rjcParsed;
+                    }
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+
+            post({ type: 'PROGRESS', message: '正在拉取考试安排与考场座位...' });
+            var examVariants = [
+              { xnm: xnm, xqm: xqm, ksmcdmb_id: '', kch: '', kc: '', ksrq: '', kkbm_id: '', _search: 'false', nd: String(Date.now()), 'queryModel.showCount': '100', 'queryModel.currentPage': '1', 'queryModel.sortName': '', 'queryModel.sortOrder': 'asc', time: '0' },
+              { xnm: xnm, xqm: '', 'queryModel.showCount': '100', 'queryModel.currentPage': '1' },
+              { xnm: '', xqm: '', 'queryModel.showCount': '100', 'queryModel.currentPage': '1' }
+            ];
+            var examAttempts = 0;
+            var examAbortedEarly = false;
+            for (var u = 0; u < JW_PATHS.examQueries.length && (!examJson.items || examJson.items.length === 0) && !examAbortedEarly && examAttempts < 4; u++) {
+              for (var b = 0; b < examVariants.length && examAttempts < 4; b++) {
+                examAttempts++;
+                try {
+                  var exResp = await timedFetch(root + prefix + JW_PATHS.examQueries[u], {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: encodeForm(examVariants[b])
+                  }, 15000);
+                  if (exResp.status === 401 || exResp.status === 403 || exResp.status === 429 || exResp.status === 901) {
+                    examAbortedEarly = true;
+                    break;
+                  }
+                  if (!exResp.ok) continue;
+                  var exText = (await exResp.text()).trim();
+                  if (exText.charAt(0) === '{') {
+                    var parsed = JSON.parse(exText);
+                    if ((parsed.items && parsed.items.length > 0) || (parsed.rows && parsed.rows.length > 0)) {
+                      examJson = parsed;
+                      break;
+                    }
+                  }
+                } catch (e) {}
+              }
+            }
+
+            post({ type: 'PROGRESS', message: '正在拉取全部学期成绩、分项明细与培养方案...' });
+            var gradeBody = encodeForm({
+              xnm: '', xqm: '', _search: 'false', nd: String(Date.now()),
+              'queryModel.showCount': '5000', 'queryModel.currentPage': '1',
+              'queryModel.sortName': '', 'queryModel.sortOrder': 'asc', time: '0'
+            });
+            for (var g = 0; g < JW_PATHS.gradeQueries.length; g++) {
+              try {
+                var grResp = await timedFetch(root + prefix + JW_PATHS.gradeQueries[g], {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest'
+                  },
+                  body: gradeBody
+                }, 15000);
+                if (!grResp.ok) continue;
+                var grText = (await grResp.text()).trim();
+                if (grText.charAt(0) === '{') {
+                  var grParsed = JSON.parse(grText);
+                  if ((grParsed.items && grParsed.items.length > 0) || (grParsed.rows && grParsed.rows.length > 0)) {
+                    gradeJson = grParsed;
+                    break;
+                  }
+                }
+              } catch (e) {}
+            }
+
+            // Best-effort grade sub-scores (recent 12 courses with jxb_id)
+            try {
+              var gList = (gradeJson.items || gradeJson.rows || []).filter(function(it) {
+                return it && it.jxb_id && it.xnm && it.xqm;
+              }).slice(0, 12);
+              for (var gi = 0; gi < gList.length; gi++) {
+                var git = gList[gi];
+                try {
+                  var sdResp = await timedFetch(root + prefix + JW_PATHS.gradeDetailQueries[0], {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: encodeForm({ xnm: String(git.xnm), xqm: String(git.xqm), jxb_id: String(git.jxb_id), kcmc: String(git.kcmc || '') })
+                  }, 5000);
+                  if (sdResp && sdResp.ok) {
+                    var sdTxt = (await sdResp.text()).trim();
+                    if (sdTxt && sdTxt.indexOf('pwdEncryptSalt') === -1) {
+                      gradeSubScoresRaw[String(git.jxb_id)] = sdTxt;
+                    }
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+
+            // Best-effort official graduation curriculum audit
+            try {
+              for (var ci = 0; ci < JW_PATHS.curriculumTreeQueries.length && !curriculumRaw; ci++) {
+                try {
+                  var curResp = await timedFetch(root + prefix + JW_PATHS.curriculumTreeQueries[ci], {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: encodeForm({ xfyqjd_id: '', xscjcx: '1' })
+                  }, 7000);
+                  if (curResp && curResp.ok) {
+                    var curTxt = (await curResp.text()).trim();
+                    if (curTxt && curTxt.indexOf('pwdEncryptSalt') === -1) {
+                      curriculumRaw = curTxt;
+                    }
+                  }
+                } catch (e) {}
+              }
+              if (!curriculumRaw) {
+                var curHtmlResp = await timedFetch(root + prefix + JW_PATHS.curriculumIndex, { credentials: 'include' }, 7000);
+                if (curHtmlResp && curHtmlResp.ok) {
+                  var curHtml = await curHtmlResp.text();
+                  if (curHtml && curHtml.indexOf('pwdEncryptSalt') === -1) {
+                    curriculumRaw = curHtml;
+                  }
+                }
+              }
+            } catch (e) {}
+
+            // Best-effort today's empty classroom snapshot
+            try {
+              var snapOptResp = await timedFetch(root + prefix + JW_PATHS.emptyClassroomIndex, { credentials: 'include' }, 6000);
+              if (snapOptResp && snapOptResp.ok) {
+                emptyClassroomOptionsHtml = await snapOptResp.text();
+              }
+              var snapXqh = (kbJson.kbList && kbJson.kbList[0] && kbJson.kbList[0].xqh_id) ? String(kbJson.kbList[0].xqh_id) : '';
+              var snapResp = await timedFetch(root + prefix + JW_PATHS.emptyClassroomQuery, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                  'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: encodeForm({
+                  fwzt: 'cx', xqh_id: snapXqh, xnm: xnm, xqm: xqm,
+                  cdlb_id: '', cdejlb_id: '', qszws: '', jszws: '', cdmc: '', lh: '', jyfs: '0',
+                  cdjylx: '', sfbhkc: '', zcd: TODAY_EMPTY_MASK.weekMask, xqj: TODAY_EMPTY_MASK.dayOfWeek,
+                  jcd: TODAY_EMPTY_MASK.sectionMask, _search: 'false', nd: String(Date.now()),
+                  'queryModel.showCount': '150', 'queryModel.currentPage': '1',
+                  'queryModel.sortName': 'cdbh', 'queryModel.sortOrder': 'asc', time: '0'
+                })
+              }, 7000);
+              if (snapResp && snapResp.ok) {
+                var snapTxt = (await snapResp.text()).trim();
+                if (snapTxt.charAt(0) === '{' || snapTxt.charAt(0) === '[') {
+                  emptyClassroomRaw = JSON.parse(snapTxt);
                 }
               }
             } catch (e) {}
@@ -2982,6 +3786,7 @@ export function buildIncognitoWebViewSyncScript(
 
           post({
             type: 'SYNC_COMPLETE',
+            jobKind: SYNC_JOB ? SYNC_JOB.kind : 'full_sync',
             xnm: xnm,
             xqm: xqm,
             isWebVpn: isWebVpn,
@@ -2989,6 +3794,11 @@ export function buildIncognitoWebViewSyncScript(
             periodTimesRaw: periodTimesJson,
             examRaw: examJson,
             gradeRaw: gradeJson,
+            gradeSubScoresRaw: gradeSubScoresRaw,
+            curriculumRaw: curriculumRaw,
+            emptyClassroomOptionsHtml: emptyClassroomOptionsHtml,
+            emptyClassroomRaw: emptyClassroomRaw,
+            campusSearchRaw: campusSearchRaw,
             storageCleaned: storageCleaned,
             logoutDetails: {
               attempted: logoutAttempted,
