@@ -312,6 +312,7 @@ export interface AppSettings {
   enableWidgetSync: boolean;
   enableOngoingNotification: boolean;
   enableLiveActivity: boolean;
+  dismissedUpdateVersion?: string;
 }
 
 export interface LogoutVerificationDetails {

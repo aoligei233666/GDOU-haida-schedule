@@ -119,8 +119,12 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const [mfaCode, setMfaCode] = useState('');
   const [mfaHint, setMfaHint] = useState<string | null>(null);
   const [sendingMfaCode, setSendingMfaCode] = useState(false);
+  const [mfaCooldown, setMfaCooldown] = useState(0);
 
-  // Off-campus WebVPN (`wfw`) Step 2 sub-session auth after MFA passes (zero password retention)
+  // One-tap passwordless SMS login shortcut in WebView
+  const [preferSmsLogin, setPreferSmsLogin] = useState(false);
+
+  // Off-campus WebVPN (`wfw`) Step 2 sub-session auth fallback (only if outer CAS SSO ticket bridge rejected)
   const [wfwSubAuth, setWfwSubAuth] = useState<WfwSubAuthState | null>(null);
   const [subAuthPassword, setSubAuthPassword] = useState('');
   const [subAuthCaptcha, setSubAuthCaptcha] = useState('');
@@ -140,11 +144,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const [probingWebViewRoute, setProbingWebViewRoute] = useState(false);
   const [bridgeToken, setBridgeToken] = useState<string>(() => generateSecureHex(16));
   const [webViewStatus, setWebViewStatus] = useState(
-    '第 1 步：请完成海大统一身份认证（用完即删，自动同步）'
+    '只需认证一次：支持短信免密 / 企微扫码 / 账号密码（用完即删，自动同步）'
   );
 
   const webViewRef = useRef<WebView<object> | null>(null);
   const scrollViewRef = useRef<React.ComponentRef<typeof ScrollView> | null>(null);
+  const passwordInputRef = useRef<React.ComponentRef<typeof TextInput> | null>(null);
+  const captchaInputRef = useRef<React.ComponentRef<typeof TextInput> | null>(null);
+  const mfaInputRef = useRef<React.ComponentRef<typeof TextInput> | null>(null);
   const captchaSessionKeyRef = useRef<string>('');
   const activeAbortRef = useRef<AbortController | null>(null);
   const bridgeTokenRef = useRef<string>(bridgeToken);
@@ -204,6 +211,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     setCaptchaUri(undefined);
     setMfaCode('');
     setMfaHint(null);
+    setMfaCooldown(0);
     setSubAuthPassword('');
     setSubAuthCaptcha('');
     setShowSubAuthPassword(false);
@@ -608,14 +616,22 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     }
   };
 
+  useEffect(() => {
+    if (mfaCooldown <= 0) return;
+    const t = setTimeout(() => setMfaCooldown((c) => Math.max(0, c - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [mfaCooldown]);
+
   const handleSendMfaCode = async () => {
-    if (!mfaChallenge) return;
+    if (!mfaChallenge || mfaCooldown > 0) return;
     const ac = createFreshAbortController();
     setSendingMfaCode(true);
     setErrorText(null);
     try {
       const msg = await requestGdouMfaDynamicCode(mfaChallenge, mfaType, { signal: ac.signal });
       setMfaHint(msg);
+      setMfaCooldown(60);
+      setTimeout(() => mfaInputRef.current?.focus(), 120);
     } catch (err) {
       if (!(err instanceof Error && err.name === 'AbortError')) {
         setErrorText(`发送验证码失败：${err instanceof Error ? err.message : String(err)}`);
@@ -1063,9 +1079,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           : undefined,
         bridgeToken,
         expectedWebViewServiceUrl,
-        syncJob
+        syncJob,
+        preferSmsLogin
       ),
-    [xnmOverride, xqmOverride, bridgeToken, expectedWebViewServiceUrl, syncJob]
+    [xnmOverride, xqmOverride, bridgeToken, expectedWebViewServiceUrl, syncJob, preferSmsLogin]
   );
 
   const reloadWebView = (nextPref?: WebViewRoutePref) => {
@@ -1118,9 +1135,9 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           <View style={styles.privacyBanner}>
             <Ionicons name="shield-checkmark" size={18} color={COLORS.emerald} />
             <View style={styles.privacyTextWrap}>
-              <Text style={styles.privacyTitle}>凭据用完即删 · 双端内存隔离已开启</Text>
+              <Text style={styles.privacyTitle}>单次登录免密直通 · 凭据用完即删</Text>
               <Text style={styles.privacyDesc}>
-                账号密码仅用于本次拉取，双端纯内存 Cookie 隔离，同步完自动校验注销并释放引用，绝不落盘。
+                校内 / 校外均只需输一次密码（自动复用统一认证票据），双端纯内存隔离，同步完自动校验注销。
               </Text>
             </View>
           </View>
@@ -1130,7 +1147,10 @@ export const EphemeralSyncModal: React.FC<Props> = ({
         <View style={[styles.modeTabs, mode === 'webview' && { marginTop: 8 }]}>
           <TouchableOpacity
             style={[styles.modeTab, mode === 'direct' && styles.modeTabActive]}
-            onPress={() => setMode('direct')}
+            onPress={() => {
+              setPreferSmsLogin(false);
+              setMode('direct');
+            }}
           >
             <Ionicons
               name="flash-outline"
@@ -1141,12 +1161,15 @@ export const EphemeralSyncModal: React.FC<Props> = ({
               style={[styles.modeTabText, mode === 'direct' && styles.modeTabTextActive]}
               numberOfLines={1}
             >
-              极速直连登录
+              极速直连（仅输一次）
             </Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.modeTab, mode === 'webview' && styles.modeTabActive]}
-            onPress={() => setMode('webview')}
+            onPress={() => {
+              setPreferSmsLogin(false);
+              setMode('webview');
+            }}
           >
             <Ionicons
               name="globe-outline"
@@ -1157,7 +1180,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
               style={[styles.modeTabText, mode === 'webview' && styles.modeTabTextActive]}
               numberOfLines={1}
             >
-              官网无痕网页
+              短信免密 / 官网网页
             </Text>
           </TouchableOpacity>
         </View>
@@ -1371,24 +1394,34 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   <View style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}>
                     <Ionicons name="keypad-outline" size={18} color={COLORS.textMuted} />
                     <TextInput
+                      ref={mfaInputRef}
                       style={styles.input}
                       placeholder="输入 6 位动态验证码"
                       placeholderTextColor={COLORS.textMuted}
                       keyboardType="number-pad"
+                      textContentType="oneTimeCode"
+                      autoComplete="sms-otp"
+                      returnKeyType="done"
+                      onSubmitEditing={() => void handleSubmitMfaCode()}
                       value={mfaCode}
                       onChangeText={setMfaCode}
                       maxLength={8}
                     />
                   </View>
                   <TouchableOpacity
-                    style={styles.sendCodeBtn}
+                    style={[
+                      styles.sendCodeBtn,
+                      (sendingMfaCode || mfaCooldown > 0) && { opacity: 0.65 },
+                    ]}
                     onPress={handleSendMfaCode}
-                    disabled={sendingMfaCode}
+                    disabled={sendingMfaCode || mfaCooldown > 0}
                   >
                     {sendingMfaCode ? (
                       <ActivityIndicator size="small" color={COLORS.white} />
                     ) : (
-                      <Text style={styles.sendCodeText}>获取验证码</Text>
+                      <Text style={styles.sendCodeText}>
+                        {mfaCooldown > 0 ? `${mfaCooldown}s 后重发` : '获取验证码'}
+                      </Text>
                     )}
                   </TouchableOpacity>
                 </View>
@@ -1422,6 +1455,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                     value={username}
                     onChangeText={setUsername}
                     onBlur={handleUsernameBlur}
+                    returnKeyType="next"
+                    onSubmitEditing={() => passwordInputRef.current?.focus()}
                     autoCapitalize="none"
                     autoCorrect={false}
                     autoComplete="off"
@@ -1430,16 +1465,25 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   />
                 </View>
 
-                <Text style={styles.fieldLabel}>统一身份认证密码（仅本次使用）</Text>
+                <Text style={styles.fieldLabel}>统一身份认证密码（仅本次输一次，用完即删）</Text>
                 <View style={styles.inputRow}>
                   <Ionicons name="lock-closed-outline" size={18} color={COLORS.textMuted} />
                   <TextInput
+                    ref={passwordInputRef}
                     style={styles.input}
                     placeholder="请输入统一身份认证密码"
                     placeholderTextColor={COLORS.textMuted}
                     value={password}
                     onChangeText={setPassword}
                     secureTextEntry={!showPassword}
+                    returnKeyType={needCaptcha ? 'next' : 'go'}
+                    onSubmitEditing={() => {
+                      if (needCaptcha) {
+                        captchaInputRef.current?.focus();
+                      } else if (!syncing && !preparing && !checkingCaptcha) {
+                        void handleDirectSync();
+                      }
+                    }}
                     autoCapitalize="none"
                     autoCorrect={false}
                     autoComplete="off"
@@ -1462,11 +1506,18 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                       <View style={[styles.inputRow, { flex: 1, marginBottom: 0 }]}>
                         <Ionicons name="shield-outline" size={18} color={COLORS.textMuted} />
                         <TextInput
+                          ref={captchaInputRef}
                           style={styles.input}
                           placeholder="输入右侧 4 位验证码"
                           placeholderTextColor={COLORS.textMuted}
                           value={captcha}
                           onChangeText={setCaptcha}
+                          returnKeyType="go"
+                          onSubmitEditing={() => {
+                            if (!syncing && !preparing && !checkingCaptcha) {
+                              void handleDirectSync();
+                            }
+                          }}
                           autoCapitalize="none"
                           autoCorrect={false}
                           maxLength={8}
@@ -1583,9 +1634,15 @@ export const EphemeralSyncModal: React.FC<Props> = ({
               </View>
             )}
 
-            <TouchableOpacity style={styles.fallbackHint} onPress={() => setMode('webview')}>
+            <TouchableOpacity
+              style={styles.fallbackHint}
+              onPress={() => {
+                setPreferSmsLogin(true);
+                setMode('webview');
+              }}
+            >
               <Text style={styles.fallbackHintText}>
-                也可切换「官网无痕网页同步」支持手机短信验证码免密码登录 →
+                不想输密码？一键切到「手机短信验证码免密 / 企微扫码」登录（同样只需验证一次） →
               </Text>
             </TouchableOpacity>
           </ScrollView>
@@ -1696,8 +1753,12 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   // 3) Keep Step-2 authserver redirects inside wfw.gdou.edu.cn/authserver/... and normalize ONLY once urlss=authserver is active
                   const upgradedHttps = upgradeGdouHttpToHttps(req.url);
                   const afterUpgrade = upgradedHttps ?? req.url;
-                  const healedWfwSso = healWfwWrongSsoUrl(afterUpgrade, !useCampusWebView);
                   const curUrl = webViewCurrentUrlRef.current || '';
+                  const isCurrentlyOnWfw = curUrl.includes('wfw.gdou.edu.cn');
+                  const healedWfwSso = healWfwWrongSsoUrl(
+                    afterUpgrade,
+                    !useCampusWebView || isCurrentlyOnWfw
+                  );
                   const isCurrentlyInWfwAuth =
                     curUrl.startsWith(`${GDOU_WFW_ORIGIN}/authserver/`) ||
                     curUrl.includes(`${GDOU_WFW_ORIGIN}/https://authserver.gdou.edu.cn/authserver/`);
@@ -1732,6 +1793,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                       setErrorText(null);
                       if (targetUrl.includes('reAuthLoginView')) {
                         setWebViewStatus('请完成海大多因子二次安全验证（短信 / 企业微信）');
+                      } else if (targetUrl.includes('jziotlogin') && targetUrl.includes('ticket=')) {
+                        setWebViewStatus('统一认证票据已自动复用，正在免密直通教务系统...');
                       }
                       // Let WKNavigationActionPolicyCancel settle first; navigate via JS location.replace without mutating `source` prop
                       scheduleWebViewLocationReplace(targetUrl);

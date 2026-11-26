@@ -176,6 +176,10 @@ jobs:
           grep -q "NSAlarmKitUsageDescription" ios/*/Info.plist
           grep -q "NSSupportsLiveActivities" ios/*/Info.plist
           grep -q "GdouScheduleWidgetBundle" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "containerBackground(for: .widget)" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "GdouWidgetGroupDiscovery" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "<string>XPC!</string>" ios/GdouScheduleWidgetExtension/Info.plist
+          grep -q "SKStoreProductViewController" "$SWIFT_FILE"
           grep -q "ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider" "$SWIFT_FILE"
           grep -q "readBodyStream" "$SWIFT_FILE"
           grep -q "if didRedirect {" "$SWIFT_FILE"
@@ -252,22 +256,42 @@ jobs:
             exit 1
           fi
           # Bottom-up ad-hoc sign all embedded frameworks/dylibs and app extensions (.appex) first, then the main .app bundle,
-          # so every Mach-O binary has a valid LC_CODE_SIGNATURE slot & _CodeSignature/CodeResources
-          # for maximum compatibility with Feather / ESign / i4Tools / SideStore on iOS 18+.
+          # embedding App Group entitlements so TrollStore / SideStore / AltStore / Feather / ESign / Sideloadly
+          # preserve WidgetKit App Group containers cleanly on iOS 18+ / iOS 26.
           if [ -d "$APP_PATH/Frameworks" ]; then
             find "$APP_PATH/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' fw; do
               echo "Ad-hoc signing embedded binary: $fw"
               codesign --force --sign - --timestamp=none "$fw"
             done
           fi
+          WIDGET_APPEX="$APP_PATH/PlugIns/GdouScheduleWidgetExtension.appex"
+          if [ ! -d "$WIDGET_APPEX" ]; then
+            echo "ERROR: Embedded GdouScheduleWidgetExtension.appex missing from $APP_PATH/PlugIns!"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c "Print :CFBundlePackageType" "$WIDGET_APPEX/Info.plist" | grep -qx "XPC!"
+          /usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPointIdentifier" "$WIDGET_APPEX/Info.plist" | grep -qx "com.apple.widgetkit-extension"
+          WIDGET_ENTITLEMENTS="GdouScheduleWidgetExtension/GdouScheduleWidgetExtension.entitlements"
           if [ -d "$APP_PATH/PlugIns" ]; then
             find "$APP_PATH/PlugIns" -maxdepth 1 -name "*.appex" -print0 | while IFS= read -r -d '' ext; do
-              echo "Ad-hoc signing embedded app extension: $ext"
-              codesign --force --sign - --timestamp=none "$ext"
+              echo "Ad-hoc signing embedded app extension with entitlements: $ext"
+              if [ -f "$WIDGET_ENTITLEMENTS" ]; then
+                codesign --force --sign - --timestamp=none --entitlements "$WIDGET_ENTITLEMENTS" "$ext"
+              else
+                codesign --force --sign - --timestamp=none "$ext"
+              fi
             done
           fi
-          codesign --force --sign - --timestamp=none "$APP_PATH"
+          MAIN_ENTITLEMENTS=$(find . -maxdepth 2 -name "*.entitlements" ! -path "./GdouScheduleWidgetExtension/*" | head -n 1 || true)
+          if [ -n "$MAIN_ENTITLEMENTS" ] && [ -f "$MAIN_ENTITLEMENTS" ]; then
+            echo "Ad-hoc signing main app with entitlements: $MAIN_ENTITLEMENTS"
+            codesign --force --sign - --timestamp=none --entitlements "$MAIN_ENTITLEMENTS" "$APP_PATH"
+          else
+            codesign --force --sign - --timestamp=none "$APP_PATH"
+          fi
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign -d --entitlements :- "$APP_PATH" 2>&1 | grep -q "com.apple.security.application-groups"
+          codesign -d --entitlements :- "$WIDGET_APPEX" 2>&1 | grep -q "com.apple.security.application-groups"
           OUT_NAME="haida-schedule-v${APP_VERSION}-ios-unsigned.ipa"
           rm -rf Payload "$OUT_NAME"
           mkdir -p Payload
@@ -287,4 +311,85 @@ jobs:
           path: |
             dist/haida-schedule-v*-ios-unsigned.ipa
             dist/haida-schedule-v*-ios-ota.jsbundle
+          if-no-files-found: error
+
+  generate-ota-manifest:
+    name: Generate Verified OTA Manifest (SHA-256 + Runtime ABI)
+    needs: [ build-android-apk, build-ios-ipa ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download Android OTA bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: haida-schedule-android-apk
+          path: dist
+
+      - name: Download iOS OTA bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: haida-schedule-ios-unsigned-ipa
+          path: dist
+
+      - name: Build haida-schedule-vX.Y.Z-ota-manifest.json
+        run: |
+          node -e '
+            const fs = require("fs");
+            const crypto = require("crypto");
+            const appJson = require("./app.json");
+            const version = appJson.expo.version;
+            const otaSrc = fs.readFileSync("src/services/otaUpdateService.ts", "utf8");
+            const rtMatch = otaSrc.match(/NATIVE_OTA_RUNTIME_VERSION\s*=\s*(\d+)/);
+            const minNativeRuntimeVersion = rtMatch ? Number(rtMatch[1]) : 1;
+            const iosName = `haida-schedule-v${version}-ios-ota.jsbundle`;
+            const androidName = `haida-schedule-v${version}-android-ota.jsbundle`;
+            const hashAndSize = (fname) => {
+              const p = `dist/${fname}`;
+              if (!fs.existsSync(p)) return null;
+              const buf = fs.readFileSync(p);
+              return {
+                sha256: crypto.createHash("sha256").update(buf).digest("hex"),
+                size: buf.length,
+              };
+            };
+            const iosInfo = hashAndSize(iosName);
+            const androidInfo = hashAndSize(androidName);
+            const manifest = {
+              version,
+              minNativeRuntimeVersion,
+              publishedAt: new Date().toISOString(),
+              ...(iosInfo
+                ? {
+                    iosBundleName: iosName,
+                    iosSha256: iosInfo.sha256,
+                    iosSize: iosInfo.size,
+                    ios: { fileName: iosName, sha256: iosInfo.sha256, size: iosInfo.size },
+                  }
+                : {}),
+              ...(androidInfo
+                ? {
+                    androidBundleName: androidName,
+                    androidSha256: androidInfo.sha256,
+                    androidSize: androidInfo.size,
+                    android: { fileName: androidName, sha256: androidInfo.sha256, size: androidInfo.size },
+                  }
+                : {}),
+            };
+            const outPath = `dist/haida-schedule-v${version}-ota-manifest.json`;
+            fs.writeFileSync(outPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+            console.log("Generated", outPath, manifest);
+          '
+
+      - name: Upload OTA manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haida-schedule-ota-manifest
+          path: dist/haida-schedule-v*-ota-manifest.json
           if-no-files-found: error

@@ -20,14 +20,23 @@
       "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
       "tintColor": "#0284C7",
       "category": "utilities",
-      "version": "1.5.0",
-      "buildVersion": "10",
+      "version": "1.5.1",
+      "buildVersion": "11",
       "versionDate": "2026-11-27",
-      "versionDescription": "v1.5.0：\n1. 根治安卓校外登录超时：升级单跳路由探测 + jw.gdou.edu.cn 探活自动回退校外微门户、OkHttp 短连接池防 NAT 僵死，直连与无痕网页均支持手动切换校外微门户/校园网直连；\n2. 新增 9 大校园效率功能：查询空教室（离线快照 + 无痕实时查 + 情侣空闲联动）、培养方案毕业学分进度核对（显式标注来源）、平时分/卷面占比成绩明细（显式标注来源）、课表变动 Diff 提醒、全校/教师/班级蹭课搜索、课表自定义相册背景与 1240×2160 高清课表图导出、海大校历与法定节假日调休映射；\n3. 新增原生桌面小组件（iOS WidgetKit / Android AppWidget）、Android 通知栏常驻今日课表与 iOS 灵动岛实时课表。",
-      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.0/haida-schedule-v1.5.0-ios-unsigned.ipa",
-      "size": 12400000,
+      "versionDescription": "v1.5.1：\n1. 根治 iOS 桌面小组件显示一片空白：重构 WidgetKit containerBackground(for: .widget) 并完整适配 iOS 17/18/26 浅色/深色/色调/液态玻璃模式，支持小/中/大号主屏与锁屏组件；CI 打包正式嵌入 App Group 权限，主程序与小组件动态自动发现重签后的 App Group 容器并采用原子 JSON 文件 + UserDefaults 双通道同步；\n2. 升级类邮政 EMS 体验的软件内更新：启动自动静默检测新版本并弹出居中更新卡片，支持软件内进度条直下热更新包并原地平滑重载（免电脑免重签），支持原生 StoreKit 应用内更新弹窗及自动探测已装签名器一键安装；\n3. 彻底简化教务系统登录流程（只需输一次密码）：校外微门户登录后自动复用 authserver CASTGC 票据直通教务系统，双通道均不再要求二次输入密码，新增键盘一键跳转、iOS 短信验证码自动填充与一键短信免密/企微扫码入口。",
+      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.1/haida-schedule-v1.5.1-ios-unsigned.ipa",
+      "size": 12450000,
       "minOSVersion": "16.4",
       "versions": [
+        {
+          "version": "1.5.1",
+          "buildVersion": "11",
+          "date": "2026-11-27",
+          "localizedDescription": "v1.5.1：\n1. 修复 iOS 桌面挂件一片空白（重构 iOS 17/18/26 containerBackground 与色调/玻璃适配、嵌入 App Group 权限、动态发现重签容器与原子文件双通道同步，新增大号桌面组件）；\n2. 新增启动自动检测与软件内弹窗更新（实时进度条热更新原地重载、原生应用内商店卡片与已装签名器一键安装）；\n3. 简化教务系统登录流程：校外自动复用 CAS 票据直通教务，彻底告别每次输两次密码，支持 iOS 短信验证码一键填充与免密快捷登录。",
+          "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.1/haida-schedule-v1.5.1-ios-unsigned.ipa",
+          "size": 12450000,
+          "minOSVersion": "16.4"
+        },
         {
           "version": "1.5.0",
           "buildVersion": "10",
@@ -93,7 +102,9 @@
         }
       ],
       "appPermissions": {
-        "entitlements": [],
+        "entitlements": [
+          "com.apple.security.application-groups"
+        ],
         "privacy": {
           "NSAlarmKitUsageDescription": "用于在 iOS 系统中直接写入海大课表每日早起、课前及考前系统级闹钟（支持锁屏全屏响铃与穿透静音/专注模式）",
           "NSCalendarsUsageDescription": "用于将您的广东海洋大学课表与考试日程一键写入系统日历",

@@ -27,6 +27,8 @@ import {
   clearOtaAndRollbackToEmbedded,
   downloadAndApplyGithubOtaUpdate,
   downloadAndOpenReleaseInstaller,
+  getEffectiveRunningVersion,
+  openIosInAppStoreSheet,
   readActiveOtaState,
   TransferProgressInfo,
   triggerNativeOtaReload,
@@ -59,6 +61,7 @@ const APP_BUILD_NUMBER =
 const APP_DISTRIBUTION = (process.env.EXPO_PUBLIC_APP_DISTRIBUTION || 'sideload').toLowerCase();
 const IS_APPLE_OFFICIAL_STORE =
   Platform.OS === 'ios' && (APP_DISTRIBUTION === 'testflight' || APP_DISTRIBUTION === 'appstore');
+const IOS_APP_STORE_ID = (process.env.EXPO_PUBLIC_IOS_APP_STORE_ID || '').trim();
 
 interface Props {
   settings: AppSettings;
@@ -67,6 +70,7 @@ interface Props {
   onClearAllData: () => void;
   onOpenSync: () => void;
   onSyncWidgetsNow?: () => void;
+  onPresentUpdateModal?: (result: UpdateCheckResult) => void;
 }
 
 export const SettingsScreen: React.FC<Props> = ({
@@ -76,6 +80,7 @@ export const SettingsScreen: React.FC<Props> = ({
   onClearAllData,
   onOpenSync,
   onSyncWidgetsNow,
+  onPresentUpdateModal,
 }) => {
   const [termDateInput, setTermDateInput] = useState(settings.termStartDate);
   const [auditInfo, setAuditInfo] = useState<{
@@ -217,12 +222,20 @@ export const SettingsScreen: React.FC<Props> = ({
     }
   };
 
+  const effectiveVersion = useMemo(
+    () => getEffectiveRunningVersion(APP_VERSION, activeOta),
+    [activeOta]
+  );
+
   const handleCheckUpdate = async () => {
     setCheckingUpdate(true);
     setUpdateError(null);
     try {
-      const res = await checkForAppUpdate(APP_VERSION, Platform.OS);
+      const res = await checkForAppUpdate(effectiveVersion, Platform.OS);
       setUpdateResult(res);
+      if (res.hasUpdate && onPresentUpdateModal) {
+        onPresentUpdateModal(res);
+      }
     } catch (err) {
       setUpdateError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -251,7 +264,7 @@ export const SettingsScreen: React.FC<Props> = ({
         otaDownloadUrl: updateResult.otaDownloadUrl,
         otaManifestUrl: updateResult.otaManifestUrl,
         expectedSizeBytes: updateResult.otaSizeBytes,
-        currentRunningVersion: APP_VERSION,
+        currentRunningVersion: effectiveVersion,
         fallbackNativeBuild: APP_BUILD_NUMBER,
         onProgress: (info) => setDownloadProgress(info),
         signal: ac.signal,
@@ -406,25 +419,34 @@ export const SettingsScreen: React.FC<Props> = ({
               </Text>
             </View>
             <Text style={styles.cardDesc}>
-              当前版本：v{APP_VERSION}（Build {appConfig.expo.ios.buildNumber}）{'\n'}
+              当前版本：v{effectiveVersion}（Build {appConfig.expo.ios.buildNumber}）{'\n'}
               {APP_DISTRIBUTION === 'testflight'
                 ? '新版本发布后将通过 Apple TestFlight 自动推送更新，无需手动下载或重新签名。'
-                : '新版本发布后将通过 Apple App Store 自动推送更新。'}
+                : '支持应用内弹出官方更新卡片，无需跳出 App 即可一键更新。'}
             </Text>
+            {IOS_APP_STORE_ID ? (
+              <TouchableOpacity
+                style={[styles.updatePrimaryBtn, { marginTop: 10, flex: 0 }]}
+                onPress={() => void openIosInAppStoreSheet(IOS_APP_STORE_ID)}
+              >
+                <Ionicons name="cloud-download-outline" size={16} color={COLORS.white} />
+                <Text style={styles.updatePrimaryBtnText}>应用内检查并更新</Text>
+              </TouchableOpacity>
+            ) : null}
           </View>
         ) : (
           <View style={styles.card}>
             <View style={styles.cardHeader}>
               <Ionicons name="cloud-download-outline" size={20} color={COLORS.oceanPrimary} />
-              <Text style={styles.cardTitle}>检查更新与软件内直接下载（GitHub）</Text>
+              <Text style={styles.cardTitle}>软件内自动更新（免跳出 App）</Text>
             </View>
             <Text style={styles.cardDesc}>
-              当前版本：v{APP_VERSION} · 已自动识别系统：{Platform.OS === 'ios' ? 'iOS' : 'Android'}
+              当前版本：v{effectiveVersion} · 已自动识别系统：{Platform.OS === 'ios' ? 'iOS' : 'Android'}
               {activeOta ? `（⚡ 热更新已生效 · 底座 v${activeOta.baseNativeVersion}）` : ''}
               {'\n'}
               {Platform.OS === 'ios'
-                ? '支持在软件内直接从 GitHub 下载免电脑免重签热更新包，或直下 IPA 导入签名工具安装。'
-                : '支持在软件内直接从 GitHub 下载极速热更新包，或直接下载 APK 自动调起系统安装。'}
+                ? '启动自动检测新版本并弹窗提醒，常规更新支持软件内带进度条直接热更并原地重启（免电脑免重签）。'
+                : '启动自动检测新版本并弹窗提醒，支持软件内极速热更新或直下 APK 调起系统安装。'}
             </Text>
 
             {activeOta && (

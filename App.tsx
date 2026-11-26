@@ -5,13 +5,16 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  Platform,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import appConfig from './app.json';
 import { EphemeralSyncModal } from './src/components/EphemeralSyncModal';
+import { InAppUpdateModal } from './src/components/InAppUpdateModal';
 import {
   buildSampleGdouData,
   getDefaultTermStartDateForTerm,
@@ -31,7 +34,10 @@ import {
 import { buildSamplePartnerSchedule } from './src/services/coupleShareCodec';
 import { AuxiliarySyncJob, SyncResult } from './src/services/gdouAuth';
 import { syncNativeWidgetsAndLiveStatus } from './src/services/nativeWidgetBridge';
-import { confirmActiveOtaBootIfNeeded } from './src/services/otaUpdateService';
+import {
+  confirmActiveOtaBootIfNeeded,
+  getEffectiveRunningVersion,
+} from './src/services/otaUpdateService';
 import { computeScheduleDiff } from './src/services/scheduleDiff';
 import {
   clearAllLocalData,
@@ -39,6 +45,7 @@ import {
   loadPersistedData,
   savePersistedData,
 } from './src/services/storageService';
+import { checkForAppUpdate, normalizeVersionTag, UpdateCheckResult } from './src/services/updateService';
 import { COLORS } from './src/theme/colors';
 import {
   AlarmRule,
@@ -52,6 +59,16 @@ import {
 } from './src/types/models';
 
 type TabKey = 'schedule' | 'exams' | 'grades' | 'alarms' | 'settings';
+
+const NATIVE_APP_VERSION = appConfig.expo.version;
+const NATIVE_APP_BUILD =
+  Platform.OS === 'ios'
+    ? String(appConfig.expo.ios.buildNumber)
+    : String(appConfig.expo.android.versionCode);
+const APP_DISTRIBUTION = (process.env.EXPO_PUBLIC_APP_DISTRIBUTION || 'sideload').toLowerCase();
+const IS_APPLE_OFFICIAL_STORE =
+  Platform.OS === 'ios' && (APP_DISTRIBUTION === 'testflight' || APP_DISTRIBUTION === 'appstore');
+const IOS_APP_STORE_ID = (process.env.EXPO_PUBLIC_IOS_APP_STORE_ID || '').trim();
 
 const TABS: {
   key: TabKey;
@@ -120,6 +137,9 @@ function MainApp() {
     settings: false,
   });
   const [syncModalOpen, setSyncModalOpen] = useState(false);
+  const [updateModalVisible, setUpdateModalVisible] = useState(false);
+  const [pendingUpdate, setPendingUpdate] = useState<UpdateCheckResult | null>(null);
+  const autoUpdateCheckedRef = useRef(false);
   const [syncTargetMode, setSyncTargetMode] = useState<{
     target: 'self' | 'partner' | 'empty_classroom' | 'campus_search';
     partnerNickname: string;
@@ -207,6 +227,37 @@ function MainApp() {
     });
     return () => sub.remove();
   }, [ready, appData.courses, appData.exams, appData.settings, appData.termLabel]);
+
+  // Silent EMS-style startup version check: automatically presents centered InAppUpdateModal
+  // when a newer release is published (never blocks startup or pops errors when offline).
+  useEffect(() => {
+    if (!ready || autoUpdateCheckedRef.current) return;
+    if (Platform.OS !== 'ios' && Platform.OS !== 'android') return;
+    autoUpdateCheckedRef.current = true;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => {
+      const runningVer = getEffectiveRunningVersion(NATIVE_APP_VERSION);
+      void checkForAppUpdate(runningVer, Platform.OS, { signal: ac.signal, timeoutMs: 8_000 })
+        .then((res) => {
+          if (ac.signal.aborted || !res.hasUpdate) return;
+          const dismissed = normalizeVersionTag(appData.settings.dismissedUpdateVersion || '');
+          if (dismissed && dismissed === normalizeVersionTag(res.latestVersion)) {
+            return;
+          }
+          setPendingUpdate(res);
+          setUpdateModalVisible(true);
+        })
+        .catch(() => {
+          // Silent on offline / campus rate-limit / timeout
+        });
+    }, 1_800);
+
+    return () => {
+      clearTimeout(timer);
+      ac.abort();
+    };
+  }, [ready, appData.settings.dismissedUpdateVersion]);
 
   const mutateAppData = (updater: (prev: PersistedAppData) => PersistedAppData) => {
     dirtyVersionRef.current += 1;
@@ -499,13 +550,34 @@ function MainApp() {
       appData.settings,
       appData.termLabel
     );
+    const iosGroupNote =
+      Platform.OS === 'ios' && res.widgetSynced && res.appGroupAccessible === false
+        ? '\n\n⚠️ 检测到当前侧载签名未授予 App Group 共享容器，桌面小组件可能只能显示默认占位内容；建议覆盖安装最新 v1.5.1 IPA（已内置 App Group 权限）并使用 SideStore / TrollStore / 保留权限的重签方式安装，然后移除旧挂件重新添加。'
+        : Platform.OS === 'ios' && res.widgetSynced && res.appGroupAccessible
+          ? `\nApp Group 共享容器：已连通 (${res.widgetSuite || 'group'})`
+          : '';
     Alert.alert(
       '桌面小组件与实时状态已刷新',
       `桌面小组件推送：${res.widgetSynced ? '已同步' : '需安装含原生组件的新版安装包'}\n` +
         `常驻通知 / 灵动岛：${
           res.ongoingSynced || res.liveActivitySynced ? '已更新' : '未开启或待新版原生底座生效'
-        }`
+        }${iosGroupNote}`
     );
+  };
+
+  const handlePresentUpdateModal = (res: UpdateCheckResult) => {
+    setPendingUpdate(res);
+    setUpdateModalVisible(true);
+  };
+
+  const handleDismissUpdateVersion = (version: string) => {
+    mutateAppData((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        dismissedUpdateVersion: normalizeVersionTag(version),
+      },
+    }));
   };
 
   const handleUpdateSettings = (settings: AppSettings) => {
@@ -627,6 +699,7 @@ function MainApp() {
               onClearAllData={handleClearAll}
               onOpenSync={handleOpenSelfSync}
               onSyncWidgetsNow={handleSyncWidgetsNow}
+              onPresentUpdateModal={handlePresentUpdateModal}
             />
           </View>
         )}
@@ -671,6 +744,17 @@ function MainApp() {
         }
         onClose={() => setSyncModalOpen(false)}
         onSyncSuccess={handleSyncSuccess}
+      />
+
+      <InAppUpdateModal
+        visible={updateModalVisible}
+        updateResult={pendingUpdate}
+        currentRunningVersion={getEffectiveRunningVersion(NATIVE_APP_VERSION)}
+        fallbackNativeBuild={NATIVE_APP_BUILD}
+        isAppleOfficialStore={IS_APPLE_OFFICIAL_STORE}
+        appStoreId={IOS_APP_STORE_ID}
+        onClose={() => setUpdateModalVisible(false)}
+        onDismissVersion={handleDismissUpdateVersion}
       />
     </SafeAreaView>
   );

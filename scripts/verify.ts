@@ -422,6 +422,96 @@ async function run() {
       injected.includes(GDOU_JW_SSO_SERVICE),
       'WebView script must embed campus GDOU_JW_SSO_SERVICE so jw serviceValidate succeeds'
     );
+    assert.ok(
+      injected.includes('__gdou_outer_sso_tried__'),
+      'WebView script must bridge outer authserver CASTGC to jw via wfw to eliminate double password prompt'
+    );
+    const smsInjected = buildIncognitoWebViewSyncScript(undefined, token, 'https://wfw.gdou.edu.cn/', undefined, true);
+    new Function(smsInjected);
+    assert.ok(
+      smsInjected.includes('dynamicLogin_a') && smsInjected.includes('PREFER_SMS_LOGIN = true'),
+      'WebView SMS shortcut script must target live #dynamicLogin_a tab cleanly'
+    );
+
+    // 3e-00. Off-campus ONE-PASSWORD outer CAS SSO ticket bridge (302 manual redirect -> wfw wrap -> JWXT, ZERO 2nd password!)
+    const onePassUrls: string[] = [];
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input);
+      onePassUrls.push(url);
+      if (url.includes('reAuthSubmit.do')) {
+        return makeMockResponse(200, JSON.stringify({ code: 'reAuth_success', msg: '认证成功' }), url);
+      }
+      if (url === `https://authserver.gdou.edu.cn/authserver/login?service=${encodeURIComponent('https://wfw.gdou.edu.cn/')}`) {
+        return makeMockResponse(200, '<html>wfw ok</html>', 'https://wfw.gdou.edu.cn/');
+      }
+      if (url === `https://authserver.gdou.edu.cn/authserver/login?service=${encodeURIComponent(GDOU_JW_SSO_SERVICE)}`) {
+        return {
+          ok: false,
+          status: 302,
+          url,
+          headers: new Headers({ location: `${GDOU_JW_SSO_SERVICE}?ticket=ST-ONE-PASS-999` }),
+          text: async () => '',
+        } as unknown as Response;
+      }
+      if (url === `${GDOU_JW_WFW_SSO_SERVICE}?ticket=ST-ONE-PASS-999`) {
+        return makeMockResponse(
+          200,
+          '<html><body>教学管理信息服务平台 index_initMenu</body></html>',
+          'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/xtgl/index_initMenu.html'
+        );
+      }
+      if (url.includes('xskbcx_cxXskbcxIndex.html')) {
+        return makeMockResponse(
+          200,
+          '<select id="xnm"><option value="2026" selected>2026</option></select><select id="xqm"><option value="3" selected>1</option></select>',
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxXsgrkb.html')) {
+        return makeMockResponse(
+          200,
+          JSON.stringify({
+            kbList: [{ kcmc: '单次密码免密直通课', xqj: '1', jcs: '1-2', zcd: '1-16周', xqh_id: '1', xqmc: '湖光校区' }],
+          }),
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxRjc.html')) {
+        return makeMockResponse(200, JSON.stringify([]), url);
+      }
+      if (url.includes('kscx_cxXsksxx') || url.includes('cjcx_cx')) {
+        return makeMockResponse(200, JSON.stringify({ items: [] }), url);
+      }
+      return makeMockResponse(200, 'ok', url);
+    }) as typeof fetch;
+
+    const onePassMfa: MfaChallengeState = {
+      required: true,
+      reAuthUserId: 'TEST_STUDENT_001',
+      serviceUrl: 'https://wfw.gdou.edu.cn/',
+      defaultReAuthType: '3',
+      credentialsPurged: true,
+      session: {
+        ...mockSession,
+        jwBaseUrl: 'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn',
+        isWebVpn: true,
+        serviceUrl: 'https://wfw.gdou.edu.cn/',
+      },
+      previousSteps: ['1. init', '2. enc', '3. mfa'],
+    };
+    const onePassRes = await submitGdouMfaAndCompleteSync(onePassMfa, '123456', '3');
+    assert.equal(
+      onePassRes.status,
+      'completed',
+      'Off-campus MFA must complete via outer CAS SSO ticket bridge WITHOUT asking for a second password'
+    );
+    if (onePassRes.status === 'completed') {
+      assert.equal(onePassRes.result.courses[0]?.name, '单次密码免密直通课');
+    }
+    assert.ok(
+      onePassUrls.includes(`${GDOU_JW_WFW_SSO_SERVICE}?ticket=ST-ONE-PASS-999`),
+      'Outer CAS 302 ticket must be wrapped and exchanged through wfw.gdou.edu.cn'
+    );
 
     // 3e-0. Phase-2 MFA on GDOU_AUTH_WFW_BASE -> campus GDOU_JW_SSO_SERVICE ticket -> JWXT sync!
     const phase2Urls: string[] = [];
@@ -1538,10 +1628,49 @@ async function run() {
       pluginSrc.includes('GdouIosWidgetBridge') &&
       pluginSrc.includes('PHPickerViewController') &&
       pluginSrc.includes('com.apple.security.application-groups') &&
-      pluginSrc.includes('GdouScheduleWidgetExtension'),
-    'Native plugin must contain Android AppWidget, Ongoing Notification, Zero-Permission SAF Picker/MediaStore, iOS WidgetKit, Dynamic Island & PHPicker'
+      pluginSrc.includes('GdouScheduleWidgetExtension') &&
+      pluginSrc.includes('containerBackground(for: .widget)') &&
+      !pluginSrc.includes('.containerBackground(.clear, for: .widget)') &&
+      pluginSrc.includes('widgetRenderingMode') &&
+      pluginSrc.includes('GdouAppGroupResolver') &&
+      pluginSrc.includes('GdouWidgetGroupDiscovery') &&
+      pluginSrc.includes('embedded", withExtension: "mobileprovision"') &&
+      pluginSrc.includes('gdou_widget_payload_v1.json') &&
+      pluginSrc.includes('<string>XPC!</string>') &&
+      pluginSrc.includes('PRODUCT_BUNDLE_PACKAGE_TYPE = \'"XPC!"\'') &&
+      pluginSrc.includes('SKStoreProductViewController') &&
+      pluginSrc.includes('dismiss(animated: false)'),
+    'Native plugin must include non-blank iOS 17/18/26 WidgetKit containerBackground, dynamic App Group discovery, XPC! package type, StoreKit in-app update sheet & clean OTA reload'
   );
-  console.log('   OK: All 9 new feature engines, source attributions, zero-retention & native widget plugins verified.');
+  const workflowSrc = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), '.github', 'workflows', 'build-mobile.yml'),
+    'utf8'
+  );
+  assert.ok(
+    workflowSrc.includes('--entitlements "$WIDGET_ENTITLEMENTS"') &&
+      workflowSrc.includes('--entitlements "$MAIN_ENTITLEMENTS"') &&
+      workflowSrc.includes('generate-ota-manifest') &&
+      workflowSrc.includes('ota-manifest.json'),
+    'CI workflow must embed App Group entitlements in ad-hoc IPA signing and generate ota-manifest.json'
+  );
+  const appTsxSrc = nodeFs.readFileSync(nodePath.join(process.cwd(), 'App.tsx'), 'utf8');
+  assert.ok(
+    appTsxSrc.includes('InAppUpdateModal') &&
+      appTsxSrc.includes('checkForAppUpdate') &&
+      appTsxSrc.includes('getEffectiveRunningVersion'),
+    'App.tsx must perform silent startup update check and mount InAppUpdateModal'
+  );
+  const otaSvcSrc = nodeFs.readFileSync(
+    nodePath.join(process.cwd(), 'src', 'services', 'otaUpdateService.ts'),
+    'utf8'
+  );
+  assert.ok(
+    otaSvcSrc.includes('NATIVE_OTA_RUNTIME_VERSION = 2') &&
+      otaSvcSrc.includes('openIosInAppStoreSheet') &&
+      otaSvcSrc.includes('detectInstalledIosSigners'),
+    'otaUpdateService must bump runtime ABI to v2 and expose StoreKit sheet & signer detection'
+  );
+  console.log('   OK: All feature engines, single-password CAS bridge, iOS WidgetKit fix, EMS-style updater & CI workflow verified.');
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

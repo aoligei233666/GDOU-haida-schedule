@@ -117,15 +117,29 @@ export async function syncNativeWidgetsAndLiveStatus(
   exams: ExamItem[],
   settings: AppSettings,
   termLabel: string
-): Promise<{ widgetSynced: boolean; ongoingSynced: boolean; liveActivitySynced: boolean }> {
+): Promise<{
+  widgetSynced: boolean;
+  appGroupAccessible?: boolean;
+  widgetSuite?: string;
+  ongoingSynced: boolean;
+  liveActivitySynced: boolean;
+}> {
   const payload = buildNativeWidgetPayload(courses, exams, settings, termLabel);
   let widgetSynced = false;
+  let appGroupAccessible: boolean | undefined;
+  let widgetSuite: string | undefined;
   let ongoingSynced = false;
   let liveActivitySynced = false;
 
   if (settings.enableWidgetSync !== false) {
     const res = await callNativeWidgetBridge('/sync-widget', payload);
     widgetSynced = Boolean(res.ok);
+    if (typeof res.appGroupAccessible === 'boolean') {
+      appGroupAccessible = res.appGroupAccessible;
+    }
+    if (typeof res.suite === 'string') {
+      widgetSuite = res.suite;
+    }
   }
 
   if (Platform.OS === 'android') {
@@ -144,7 +158,7 @@ export async function syncNativeWidgetsAndLiveStatus(
     liveActivitySynced = Boolean(res.ok);
   }
 
-  return { widgetSynced, ongoingSynced, liveActivitySynced };
+  return { widgetSynced, appGroupAccessible, widgetSuite, ongoingSynced, liveActivitySynced };
 }
 
 /**

@@ -87,7 +87,12 @@ private class GdouEphemeralCookieJar : CookieJarContainer {
   fun hasWfwSession(): Boolean {
     val now = System.currentTimeMillis()
     return store.values.any {
-      it.name.equals("WFWSESSID", ignoreCase = true) && it.expiresAt > now && it.value.isNotEmpty()
+      it.expiresAt > now &&
+        it.value.isNotEmpty() &&
+        (it.name.equals("WFWSESSID", ignoreCase = true) ||
+          (it.domain.equals("wfw.gdou.edu.cn", ignoreCase = true) &&
+            (it.name.contains("SESS", ignoreCase = true) ||
+              it.name.equals("wengine_vpn_ticket", ignoreCase = true))))
     }
   }
 
@@ -418,6 +423,24 @@ class MainApplication : Application(), ReactApplication {
         .addInterceptor { chain ->
           val orig = chain.request()
           if (orig.url.host.equals("gdou-ota-internal.local", ignoreCase = true)) {
+            val reqPath = orig.url.encodedPath.lowercase()
+            if (reqPath == "/status") {
+              val statusBody = JSONObject()
+                .put("ok", true)
+                .put("platform", "android")
+                .put("nativeVersion", BuildConfig.VERSION_NAME)
+                .put("nativeBuild", BuildConfig.VERSION_CODE.toString())
+                .put("otaSupported", true)
+                .toString()
+              return@addInterceptor Response.Builder()
+                .request(orig)
+                .protocol(Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .header("Content-Type", "application/json")
+                .body(statusBody.toResponseBody(null))
+                .build()
+            }
             Handler(Looper.getMainLooper()).postDelayed({
               GdouOtaBundle.restartApp(applicationContext)
             }, 180L)
@@ -650,6 +673,9 @@ import ActivityKit
 #endif
 #if canImport(PhotosUI)
 @preconcurrency import PhotosUI
+#endif
+#if canImport(StoreKit)
+@preconcurrency import StoreKit
 #endif
 #if canImport(AlarmKit)
 import AlarmKit
@@ -1064,6 +1090,30 @@ enum GdouOtaBundle {
     return bundleURL
   }
 
+  static func statusJSON() -> Data {
+    let currentNativeVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? ""
+    let currentNativeBuild = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? ""
+    var activeOtaVersion = ""
+    let fm = FileManager.default
+    if let docsDir = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+      let stateURL = docsDir.appendingPathComponent(otaDirName, isDirectory: true).appendingPathComponent(stateFileName)
+      if let rawData = try? Data(contentsOf: stateURL),
+         let json = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any],
+         let ver = json["otaVersion"] as? String {
+        activeOtaVersion = ver
+      }
+    }
+    let obj: [String: Any] = [
+      "ok": true,
+      "platform": "ios",
+      "nativeVersion": currentNativeVersion,
+      "nativeBuild": currentNativeBuild,
+      "otaSupported": true,
+      "activeOtaVersion": activeOtaVersion,
+    ]
+    return (try? JSONSerialization.data(withJSONObject: obj, options: [])) ?? Data("{\\"ok\\":true}".utf8)
+  }
+
   @MainActor
   static func reloadIntoActiveBundle() {
     let targetURL = resolveBundleURL() ?? Bundle.main.url(forResource: "main", withExtension: "jsbundle")
@@ -1079,12 +1129,100 @@ enum GdouOtaBundle {
     for scene in UIApplication.shared.connectedScenes {
       if let ws = scene as? UIWindowScene {
         for win in ws.windows where win.rootViewController != nil {
-          win.rootViewController?.view = newRootView
+          if win.rootViewController?.presentedViewController != nil {
+            win.rootViewController?.dismiss(animated: false)
+          }
+          UIView.transition(
+            with: win,
+            duration: 0.22,
+            options: [.transitionCrossDissolve],
+            animations: {
+              win.rootViewController?.view = newRootView
+            },
+            completion: nil
+          )
         }
       }
     }
   }
 }
+
+#if canImport(StoreKit)
+/// Native iOS in-app App Store update sheet (\`SKStoreProductViewController\`) for official Store/TestFlight builds.
+@MainActor
+final class GdouIosStoreSheetCoordinator: NSObject, SKStoreProductViewControllerDelegate {
+  private static var activeCoordinator: GdouIosStoreSheetCoordinator?
+
+  private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resumed = false
+    private var cont: CheckedContinuation<Bool, Never>?
+
+    init(_ cont: CheckedContinuation<Bool, Never>) {
+      self.cont = cont
+    }
+
+    func resume(_ value: Bool) {
+      lock.lock()
+      if resumed {
+        lock.unlock()
+        return
+      }
+      resumed = true
+      let pending = cont
+      cont = nil
+      lock.unlock()
+      pending?.resume(returning: value)
+    }
+  }
+
+  static func presentStoreProduct(appId: String) async -> Data {
+    let cleaned = appId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let numericId = Int(cleaned), numericId > 0 else {
+      return Data("{\\"ok\\":false,\\"error\\":\\"Invalid App Store ID\\"}".utf8)
+    }
+    guard let rootVc = topViewController() else {
+      return Data("{\\"ok\\":false,\\"error\\":\\"No active root view controller\\"}".utf8)
+    }
+    let coordinator = GdouIosStoreSheetCoordinator()
+    activeCoordinator = coordinator
+    let storeVc = SKStoreProductViewController()
+    storeVc.delegate = coordinator
+    let loaded: Bool = await withCheckedContinuation { cont in
+      let gate = ResumeOnce(cont)
+      DispatchQueue.global().asyncAfter(deadline: .now() + 8.0) {
+        gate.resume(false)
+      }
+      storeVc.loadProduct(withParameters: [
+        SKStoreProductParameterITunesItemIdentifier: NSNumber(value: numericId)
+      ]) { success, _ in
+        gate.resume(success)
+      }
+    }
+    guard loaded else {
+      activeCoordinator = nil
+      return Data("{\\"ok\\":false,\\"error\\":\\"App Store sheet load failed or timed out\\"}".utf8)
+    }
+    rootVc.present(storeVc, animated: true)
+    return Data("{\\"ok\\":true}".utf8)
+  }
+
+  private static func topViewController() -> UIViewController? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let keyWindow = scenes.flatMap(\\.windows).first(where: \\.isKeyWindow) ?? scenes.first?.windows.first
+    var top = keyWindow?.rootViewController
+    while let presented = top?.presentedViewController {
+      top = presented
+    }
+    return top
+  }
+
+  func productViewControllerDidFinish(_ viewController: SKStoreProductViewController) {
+    viewController.dismiss(animated: true)
+    Self.activeCoordinator = nil
+  }
+}
+#endif
 
 /// Pure volatile RAM-only cookie store for iOS zero-retention GDOU authentication.
 /// Mirrors Android's GdouEphemeralCookieJar:
@@ -1111,9 +1249,15 @@ final class GdouEphemeralCookieStore: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     for cookie in cookiesByKey.values {
-      if cookie.name.caseInsensitiveCompare("WFWSESSID") == .orderedSame && !cookie.value.isEmpty {
-        let notExpired = cookie.expiresDate.map { $0 > now } ?? true
-        if notExpired { return true }
+      guard !cookie.value.isEmpty else { continue }
+      let notExpired = cookie.expiresDate.map { $0 > now } ?? true
+      guard notExpired else { continue }
+      let nameLower = cookie.name.lowercased()
+      let domainLower = cookie.domain.lowercased()
+      if nameLower == "wfwsessid" ||
+        (domainLower.contains("wfw.gdou.edu.cn") &&
+          (nameLower.contains("sess") || nameLower == "wengine_vpn_ticket")) {
+        return true
       }
     }
     return false
@@ -1394,6 +1538,45 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       return
     }
     if initialUrl.host?.lowercased() == "gdou-ota-internal.local" {
+      let lowerPath = initialUrl.path.lowercased()
+      if lowerPath == "/status" {
+        let payload = GdouOtaBundle.statusJSON()
+        if let resp = HTTPURLResponse(
+          url: initialUrl,
+          statusCode: 200,
+          httpVersion: "HTTP/1.1",
+          headerFields: ["Content-Type": "application/json"]
+        ) {
+          client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+          client?.urlProtocol(self, didLoad: payload)
+          client?.urlProtocolDidFinishLoading(self)
+        }
+        return
+      }
+      if lowerPath == "/open-store" {
+        let comps = URLComponents(url: initialUrl, resolvingAgainstBaseURL: false)
+        let appId = comps?.queryItems?.first(where: { $0.name == "appId" })?.value ?? ""
+        self.alarmTask = Task { [weak self] in
+          let respData: Data
+          #if canImport(StoreKit)
+          respData = await GdouIosStoreSheetCoordinator.presentStoreProduct(appId: appId)
+          #else
+          respData = Data("{\\"ok\\":false,\\"error\\":\\"StoreKit unavailable\\"}".utf8)
+          #endif
+          guard !Task.isCancelled, let self = self else { return }
+          if let resp = HTTPURLResponse(
+            url: initialUrl,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+          ) {
+            self.client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: respData)
+            self.client?.urlProtocolDidFinishLoading(self)
+          }
+        }
+        return
+      }
       let payload = Data("{\\"ok\\":true}".utf8)
       if let resp = HTTPURLResponse(
         url: initialUrl,
@@ -1766,15 +1949,52 @@ final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDeleg
 }
 #endif
 
+/// Dynamically discovers the active App Group container(s) from the signed bundle's
+/// \`embedded.mobileprovision\` + runtime \`Bundle.main.bundleIdentifier\` (handles Sideloadly /
+/// AltStore / SideStore / Feather / ESign bundle ID rewriting as well as TrollStore & TestFlight).
+enum GdouAppGroupResolver {
+  private static func provisionedAppGroups() -> [String] {
+    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          let data = try? Data(contentsOf: url),
+          let raw = String(data: data, encoding: .isoLatin1),
+          let startRange = raw.range(of: "<?xml"),
+          let endRange = raw.range(of: "</plist>") else {
+      return []
+    }
+    let plistText = String(raw[startRange.lowerBound..<endRange.upperBound])
+    guard let plistData = plistText.data(using: .utf8),
+          let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any],
+          let entitlements = plist["Entitlements"] as? [String: Any],
+          let groups = entitlements["com.apple.security.application-groups"] as? [String] else {
+      return []
+    }
+    return groups.filter { !$0.isEmpty }
+  }
+
+  static func candidateSuites(fallbackBundleId: String = "cn.edu.gdou.schedule") -> [String] {
+    var out: [String] = []
+    let appendUnique: (String) -> Void = { candidate in
+      let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty && !out.contains(trimmed) {
+        out.append(trimmed)
+      }
+    }
+    for group in provisionedAppGroups() {
+      appendUnique(group)
+    }
+    if let bid = Bundle.main.bundleIdentifier, !bid.isEmpty {
+      appendUnique("group.\\(bid)")
+    }
+    appendUnique("group.\\(fallbackBundleId)")
+    return out
+  }
+}
+
 /// Native iOS bridge for WidgetKit App Group sync, Dynamic Island / Live Activity (ActivityKit),
 /// and zero-permission PHPicker custom schedule background selection.
 enum GdouIosWidgetBridge {
   private static let storageKey = "gdou_widget_payload_v1"
-
-  private static func appGroupSuiteName() -> String {
-    let bid = Bundle.main.bundleIdentifier ?? "cn.edu.gdou.schedule"
-    return "group.\\(bid)"
-  }
+  private static let fileName = "gdou_widget_payload_v1.json"
 
   private static func encodeJSON(_ obj: [String: Any]) -> Data {
     if let data = try? JSONSerialization.data(withJSONObject: obj, options: []) {
@@ -1788,15 +2008,40 @@ enum GdouIosWidgetBridge {
       guard let rawJson = String(data: bodyData, encoding: .utf8), !rawJson.isEmpty else {
         return encodeJSON(["ok": false, "error": "Empty widget payload"])
       }
-      let suite = appGroupSuiteName()
-      if let sharedDefaults = UserDefaults(suiteName: suite) {
-        sharedDefaults.set(rawJson, forKey: storageKey)
+      let candidates = GdouAppGroupResolver.candidateSuites()
+      var activeSuite = candidates.first ?? "group.cn.edu.gdou.schedule"
+      var appGroupAccessible = false
+      var fileWritten = false
+      let fm = FileManager.default
+
+      for suite in candidates {
+        if let containerUrl = fm.containerURL(forSecurityApplicationGroupIdentifier: suite) {
+          appGroupAccessible = true
+          activeSuite = suite
+          let fileUrl = containerUrl.appendingPathComponent(fileName, isDirectory: false)
+          if (try? bodyData.write(to: fileUrl, options: .atomic)) != nil {
+            fileWritten = true
+          }
+          if let sharedDefaults = UserDefaults(suiteName: suite) {
+            sharedDefaults.set(rawJson, forKey: storageKey)
+            sharedDefaults.synchronize()
+          }
+        }
+      }
+      if !appGroupAccessible, let fallbackDefaults = UserDefaults(suiteName: activeSuite) {
+        fallbackDefaults.set(rawJson, forKey: storageKey)
       }
       UserDefaults.standard.set(rawJson, forKey: storageKey)
       #if canImport(WidgetKit)
+      WidgetCenter.shared.reloadTimelines(ofKind: "GdouScheduleHomeWidget")
       WidgetCenter.shared.reloadAllTimelines()
       #endif
-      return encodeJSON(["ok": true, "suite": suite])
+      return encodeJSON([
+        "ok": true,
+        "suite": activeSuite,
+        "appGroupAccessible": appGroupAccessible,
+        "fileWritten": fileWritten,
+      ])
     }
 
     if path.hasSuffix("/live-activity/stop") {
@@ -2482,7 +2727,7 @@ import WidgetKit
 import ActivityKit
 #endif
 
-struct GdouWidgetCourseRow: Codable, Hashable {
+struct GdouWidgetCourseRow: Codable, Hashable, Sendable {
   let name: String
   let location: String
   let time: String
@@ -2490,7 +2735,7 @@ struct GdouWidgetCourseRow: Codable, Hashable {
   let status: String
 }
 
-struct GdouWidgetPayload: Codable {
+struct GdouWidgetPayload: Codable, Sendable {
   let updatedAtIso: String?
   let termLabel: String?
   let dateStr: String?
@@ -2506,136 +2751,323 @@ struct GdouWidgetPayload: Codable {
   let todayItems: [GdouWidgetCourseRow]?
   let nextExamTitle: String?
   let nextExamCountdown: String?
+
+  static let previewPlaceholder = GdouWidgetPayload(
+    updatedAtIso: nil,
+    termLabel: "海大课表",
+    dateStr: nil,
+    week: 1,
+    weekdayLabel: "周一",
+    overrideBadge: nil,
+    state: "upcoming",
+    headline: "海洋科学导论",
+    subline: "08:10-09:45 · 钟海楼02018",
+    activeCourseName: "海洋科学导论",
+    activeCourseRoom: "钟海楼02018",
+    activeCourseTime: "08:10-09:45",
+    todayItems: [
+      GdouWidgetCourseRow(
+        name: "海洋科学导论",
+        location: "钟海楼02018",
+        time: "08:10-09:45",
+        sectionText: "1-2节",
+        status: "upcoming"
+      ),
+      GdouWidgetCourseRow(
+        name: "高等数学（上）",
+        location: "主教学楼305",
+        time: "10:15-11:50",
+        sectionText: "3-4节",
+        status: "upcoming"
+      ),
+    ],
+    nextExamTitle: nil,
+    nextExamCountdown: nil
+  )
 }
 
-struct GdouScheduleEntry: TimelineEntry {
+enum GdouWidgetGroupDiscovery {
+  private static func provisionedAppGroups() -> [String] {
+    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          let data = try? Data(contentsOf: url),
+          let raw = String(data: data, encoding: .isoLatin1),
+          let startRange = raw.range(of: "<?xml"),
+          let endRange = raw.range(of: "</plist>") else {
+      return []
+    }
+    let plistText = String(raw[startRange.lowerBound..<endRange.upperBound])
+    guard let plistData = plistText.data(using: .utf8),
+          let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any],
+          let entitlements = plist["Entitlements"] as? [String: Any],
+          let groups = entitlements["com.apple.security.application-groups"] as? [String] else {
+      return []
+    }
+    return groups.filter { !$0.isEmpty }
+  }
+
+  static func candidateSuites(fallbackGroupId: String) -> [String] {
+    var out: [String] = []
+    let appendUnique: (String) -> Void = { candidate in
+      let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty && !out.contains(trimmed) {
+        out.append(trimmed)
+      }
+    }
+    for group in provisionedAppGroups() {
+      appendUnique(group)
+    }
+    if let extBid = Bundle.main.bundleIdentifier, !extBid.isEmpty {
+      if extBid.hasSuffix(".widget") {
+        appendUnique("group." + String(extBid.dropLast(".widget".count)))
+      } else if let dotIdx = extBid.lastIndex(of: ".") {
+        appendUnique("group." + String(extBid[..<dotIdx]))
+      }
+    }
+    appendUnique(fallbackGroupId)
+    appendUnique("group.cn.edu.gdou.schedule")
+    return out
+  }
+}
+
+struct GdouScheduleEntry: TimelineEntry, Sendable {
   let date: Date
   let payload: GdouWidgetPayload?
+  let isPlaceholder: Bool
 }
 
 struct GdouScheduleProvider: TimelineProvider {
-  private let groupSuite = "${appGroupId}"
+  private let fallbackGroupSuite = "${appGroupId}"
   private let storageKey = "gdou_widget_payload_v1"
+  private let fileName = "gdou_widget_payload_v1.json"
 
   private func loadPayload() -> GdouWidgetPayload? {
-    let raw =
-      UserDefaults(suiteName: groupSuite)?.string(forKey: storageKey) ??
-      UserDefaults.standard.string(forKey: storageKey)
-    guard let raw = raw, let data = raw.data(using: .utf8) else { return nil }
-    return try? JSONDecoder().decode(GdouWidgetPayload.self, from: data)
+    let decoder = JSONDecoder()
+    let fm = FileManager.default
+    let candidates = GdouWidgetGroupDiscovery.candidateSuites(fallbackGroupId: fallbackGroupSuite)
+
+    // 1. Prefer direct atomic JSON file inside App Group container (immune to cfprefsd cache lag)
+    for suite in candidates {
+      if let containerUrl = fm.containerURL(forSecurityApplicationGroupIdentifier: suite) {
+        let fileUrl = containerUrl.appendingPathComponent(fileName, isDirectory: false)
+        if let data = try? Data(contentsOf: fileUrl),
+           let decoded = try? decoder.decode(GdouWidgetPayload.self, from: data) {
+          return decoded
+        }
+      }
+    }
+
+    // 2. Secondary mirror via App Group UserDefaults
+    for suite in candidates {
+      if let raw = UserDefaults(suiteName: suite)?.string(forKey: storageKey),
+         let data = raw.data(using: .utf8),
+         let decoded = try? decoder.decode(GdouWidgetPayload.self, from: data) {
+        return decoded
+      }
+    }
+
+    // 3. Final fallback to UserDefaults.standard
+    if let raw = UserDefaults.standard.string(forKey: storageKey),
+       let data = raw.data(using: .utf8),
+       let decoded = try? decoder.decode(GdouWidgetPayload.self, from: data) {
+      return decoded
+    }
+    return nil
   }
 
   func placeholder(in context: Context) -> GdouScheduleEntry {
-    GdouScheduleEntry(date: Date(), payload: nil)
+    GdouScheduleEntry(date: Date(), payload: .previewPlaceholder, isPlaceholder: true)
   }
 
   func getSnapshot(in context: Context, completion: @escaping (GdouScheduleEntry) -> Void) {
-    completion(GdouScheduleEntry(date: Date(), payload: loadPayload()))
+    let loaded = loadPayload()
+    let effective = loaded ?? (context.isPreview ? .previewPlaceholder : nil)
+    completion(GdouScheduleEntry(date: Date(), payload: effective, isPlaceholder: context.isPreview && loaded == nil))
   }
 
   func getTimeline(in context: Context, completion: @escaping (Timeline<GdouScheduleEntry>) -> Void) {
     let now = Date()
-    let entry = GdouScheduleEntry(date: now, payload: loadPayload())
-    let refresh = Calendar.current.date(byAdding: .minute, value: 30, to: now) ?? now.addingTimeInterval(1800)
-    completion(Timeline(entries: [entry], policy: .after(refresh)))
+    let payload = loadPayload()
+    let entry = GdouScheduleEntry(date: now, payload: payload, isPlaceholder: false)
+    let next15Min = Calendar.current.date(byAdding: .minute, value: 15, to: now) ?? now.addingTimeInterval(900)
+    let nextMidnight = Calendar.current.nextDate(
+      after: now,
+      matching: DateComponents(hour: 0, minute: 2),
+      matchingPolicy: .nextTime
+    )
+    let refreshDate = min(next15Min, nextMidnight ?? next15Min)
+    completion(Timeline(entries: [entry], policy: .after(refreshDate)))
+  }
+}
+
+struct GdouWidgetCardBackground: View {
+  let family: WidgetFamily
+
+  var body: some View {
+    if family == .accessoryRectangular {
+      Color.clear
+    } else {
+      LinearGradient(
+        colors: [
+          Color(red: 0.0, green: 0.23, blue: 0.56),
+          Color(red: 0.01, green: 0.52, blue: 0.78),
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+      )
+    }
+  }
+}
+
+extension View {
+  @ViewBuilder
+  func gdouWidgetContainerBackground(family: WidgetFamily) -> some View {
+    if #available(iOS 17.0, *) {
+      self.containerBackground(for: .widget) {
+        GdouWidgetCardBackground(family: family)
+      }
+    } else {
+      self
+        .padding(family == .accessoryRectangular ? 0 : 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(GdouWidgetCardBackground(family: family))
+    }
   }
 }
 
 struct GdouScheduleWidgetEntryView: View {
   var entry: GdouScheduleProvider.Entry
-  @Environment(\\.widgetFamily) var family
+  @Environment(\\.widgetFamily) private var family
+  @Environment(\\.widgetRenderingMode) private var renderingMode
 
   var body: some View {
     let p = entry.payload
     let week = p?.week ?? 1
     let weekday = p?.weekdayLabel ?? ""
-    let headline = p?.headline ?? "海大课表"
-    let subline = p?.subline ?? "打开 App 同步今日课表"
+    let headline = (p?.headline?.isEmpty == false ? p?.headline : nil) ?? "海大课表"
+    let subline = (p?.subline?.isEmpty == false ? p?.subline : nil) ?? "打开海大课表同步今日课程"
+    let activeRoom = p?.activeCourseRoom ?? ""
     let items = p?.todayItems ?? []
+    let nextExamTitle = p?.nextExamTitle ?? ""
+    let nextExamCountdown = p?.nextExamCountdown ?? ""
+    let isFullColor = (renderingMode == .fullColor) && (family != .accessoryRectangular)
+
+    let accentColor: Color = isFullColor ? Color(red: 0.73, green: 0.90, blue: 0.99) : .primary
+    let primaryColor: Color = isFullColor ? .white : .primary
+    let secondaryColor: Color = isFullColor ? Color.white.opacity(0.86) : .secondary
+    let dividerColor: Color = isFullColor ? Color.white.opacity(0.24) : Color.primary.opacity(0.18)
 
     Group {
       if family == .accessoryRectangular {
         VStack(alignment: .leading, spacing: 2) {
           Text("海大 第\\(week)周 \\(weekday)")
             .font(.caption2).bold()
+            .lineLimit(1)
           Text(headline)
-            .font(.caption).bold().lineLimit(1)
-          Text(p?.activeCourseRoom?.isEmpty == false ? "@\\(p!.activeCourseRoom!)" : subline)
-            .font(.caption2).lineLimit(1)
+            .font(.caption).bold()
+            .lineLimit(1)
+          Text(activeRoom.isEmpty ? subline : "@\\(activeRoom)")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .lineLimit(1)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
       } else {
-        VStack(alignment: .leading, spacing: 5) {
-          HStack {
-            Text("海大课表 · 第\\(week)周 \\(weekday)")
+        VStack(alignment: .leading, spacing: family == .systemLarge ? 7 : 5) {
+          HStack(spacing: 4) {
+            Text(p == nil ? "海大课表 · 今日课程" : "海大课表 · 第\\(week)周 \\(weekday)")
               .font(.caption2).bold()
-              .foregroundColor(Color(red: 0.73, green: 0.90, blue: 0.99))
-            Spacer()
+              .foregroundColor(accentColor)
+              .lineLimit(1)
+            Spacer(minLength: 4)
             if let badge = p?.overrideBadge, !badge.isEmpty {
               Text(badge)
                 .font(.system(size: 9, weight: .bold))
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
-                .background(Color.orange.opacity(0.85))
-                .foregroundColor(.white)
+                .background(isFullColor ? Color.orange.opacity(0.9) : Color.primary.opacity(0.15))
+                .foregroundColor(isFullColor ? .white : .primary)
                 .cornerRadius(4)
             }
           }
+
           Text(headline)
-            .font(.subheadline).bold()
-            .foregroundColor(.white)
-            .lineLimit(1)
+            .font(family == .systemLarge ? .headline : .subheadline)
+            .bold()
+            .foregroundColor(primaryColor)
+            .lineLimit(family == .systemSmall ? 2 : 1)
+
           Text(subline)
             .font(.caption2)
-            .foregroundColor(Color.white.opacity(0.86))
-            .lineLimit(1)
+            .foregroundColor(secondaryColor)
+            .lineLimit(family == .systemSmall ? 2 : 1)
 
-          if family == .systemMedium {
-            Divider().background(Color.white.opacity(0.22))
+          if family == .systemMedium || family == .systemLarge {
+            Rectangle()
+              .fill(dividerColor)
+              .frame(height: 0.75)
+              .padding(.vertical, 1)
+
             if items.isEmpty {
-              Text("今日暂无排课，适合去自习或休息")
+              Text(p == nil ? "点击打开海大课表，一键同步课表与考试" : "今日暂无排课，适合自习或休息")
                 .font(.caption2)
-                .foregroundColor(Color.white.opacity(0.85))
+                .foregroundColor(secondaryColor)
+                .lineLimit(2)
             } else {
-              ForEach(Array(items.prefix(3)), id: \\.self) { row in
+              let maxRows = family == .systemLarge ? 6 : 3
+              ForEach(Array(items.prefix(maxRows)), id: \\.self) { row in
                 HStack(spacing: 6) {
                   Text(row.time)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Color(red: 0.73, green: 0.90, blue: 0.99))
+                    .foregroundColor(accentColor)
                   Text(row.name)
                     .font(.caption2).bold()
-                    .foregroundColor(.white)
+                    .foregroundColor(primaryColor)
                     .lineLimit(1)
-                  Spacer()
+                  Spacer(minLength: 4)
                   Text(row.location)
                     .font(.caption2)
-                    .foregroundColor(Color.white.opacity(0.82))
+                    .foregroundColor(secondaryColor)
                     .lineLimit(1)
                 }
               }
             }
-          } else if let room = p?.activeCourseRoom, !room.isEmpty {
+
+            if family == .systemLarge && !nextExamTitle.isEmpty && !nextExamCountdown.isEmpty {
+              Spacer(minLength: 4)
+              HStack(spacing: 6) {
+                Text("近期考试")
+                  .font(.system(size: 10, weight: .bold))
+                  .padding(.horizontal, 6)
+                  .padding(.vertical, 2)
+                  .background(isFullColor ? Color.white.opacity(0.18) : Color.primary.opacity(0.12))
+                  .foregroundColor(primaryColor)
+                  .cornerRadius(5)
+                Text("\\(nextExamTitle) · \\(nextExamCountdown)")
+                  .font(.caption2).bold()
+                  .foregroundColor(accentColor)
+                  .lineLimit(1)
+              }
+            }
+          } else if !activeRoom.isEmpty {
             Spacer(minLength: 2)
-            Text("@\\(room)")
+            Text("@\\(activeRoom)")
               .font(.caption).bold()
-              .foregroundColor(Color(red: 0.73, green: 0.90, blue: 0.99))
+              .foregroundColor(accentColor)
+              .lineLimit(1)
+          } else if !nextExamTitle.isEmpty && !nextExamCountdown.isEmpty {
+            Spacer(minLength: 2)
+            Text("考: \\(nextExamTitle) (\\(nextExamCountdown))")
+              .font(.caption2)
+              .foregroundColor(accentColor)
               .lineLimit(1)
           }
+
           Spacer(minLength: 0)
         }
-        .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-          LinearGradient(
-            colors: [
-              Color(red: 0.0, green: 0.23, blue: 0.56),
-              Color(red: 0.01, green: 0.52, blue: 0.78),
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-          )
-        )
       }
     }
+    .gdouWidgetContainerBackground(family: family)
   }
 }
 
@@ -2644,16 +3076,11 @@ struct GdouScheduleHomeWidget: Widget {
 
   var body: some WidgetConfiguration {
     StaticConfiguration(kind: kind, provider: GdouScheduleProvider()) { entry in
-      if #available(iOS 17.0, *) {
-        GdouScheduleWidgetEntryView(entry: entry)
-          .containerBackground(.clear, for: .widget)
-      } else {
-        GdouScheduleWidgetEntryView(entry: entry)
-      }
+      GdouScheduleWidgetEntryView(entry: entry)
     }
     .configurationDisplayName("海大课表 · 今日课程")
     .description("桌面与锁屏直看今日海大课程、教室号与调休标注")
-    .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular])
+    .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .accessoryRectangular])
   }
 }
 
@@ -2754,7 +3181,7 @@ function buildIosWidgetInfoPlist(version, buildNumber) {
   <key>CFBundleName</key>
   <string>$(PRODUCT_NAME)</string>
   <key>CFBundlePackageType</key>
-  <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+  <string>XPC!</string>
   <key>CFBundleShortVersionString</key>
   <string>${version}</string>
   <key>CFBundleVersion</key>
@@ -3250,12 +3677,15 @@ function withGdouIosXcodeSource(config) {
           if (!cfg || !cfg.buildSettings) continue;
           cfg.buildSettings.SDKROOT = 'iphoneos';
           cfg.buildSettings.PRODUCT_BUNDLE_IDENTIFIER = `"${widgetBundleId}"`;
+          cfg.buildSettings.PRODUCT_BUNDLE_PACKAGE_TYPE = '"XPC!"';
           cfg.buildSettings.INFOPLIST_FILE = `"${widgetTargetName}/Info.plist"`;
           cfg.buildSettings.CODE_SIGN_ENTITLEMENTS = `"${widgetTargetName}/GdouScheduleWidgetExtension.entitlements"`;
           cfg.buildSettings.SWIFT_VERSION = '5.0';
           cfg.buildSettings.SWIFT_DEFAULT_ACTOR_ISOLATION = 'nonisolated';
+          cfg.buildSettings.SWIFT_EMIT_LOC_STRINGS = 'YES';
           cfg.buildSettings.IPHONEOS_DEPLOYMENT_TARGET = '16.2';
           cfg.buildSettings.TARGETED_DEVICE_FAMILY = '"1,2"';
+          cfg.buildSettings.SUPPORTS_MACCATALYST = 'NO';
           cfg.buildSettings.SKIP_INSTALL = 'YES';
           cfg.buildSettings.GENERATE_INFOPLIST_FILE = 'NO';
           cfg.buildSettings.APPLICATION_EXTENSION_API_ONLY = 'YES';
