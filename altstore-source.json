@@ -25,7 +25,7 @@
       "versionDate": "2026-11-27",
       "versionDescription": "v2.0.0（架构与体验里程碑大版本）：\n1. 节假日/调休全链路贯通：系统日历、.ics 导出与闹钟统一按海大校历跳过放假、自动补排调休课程，支持云端海大校历免发版同步；\n2. 体验全面升级：新增全局深色模式（跟随系统/深色/浅色）、多学期本地归档与一键切换、单课临时教室/备注/配色编辑与作业实验 DDL 提醒、脱敏成绩单 CSV/文本导出、纯本地无凭据全量备份换机、手势左右滑切周与 1-20 周快捷网格跳转；\n3. 原生生态深化：桌面挂件与灵动岛支持点击深链直达（gdouschedule://），iOS 新增 Siri/快捷指令 AppIntents 与 BGAppRefreshTask 后台刷新，Android 新增 4×4 一周滚动大挂件与课节边界自刷新，内置海大四校区离线教学楼速查；\n4. 安全与工程重构：OTA 热更引入 Ed25519 数字签名强制验签与校园网加速镜像兜底，原生桥接迁移至本地 Expo Native Module（JSI），完成插件与认证核心模块化拆分。",
       "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v2.0.0/haida-schedule-v2.0.0-ios-unsigned.ipa",
-      "size": 12400000,
+      "size": 12370054,
       "minOSVersion": "16.4",
       "versions": [
         {
@@ -34,7 +34,7 @@
           "date": "2026-11-27",
           "localizedDescription": "v2.0.0：\n1. 节假日与调休贯通日历/.ics/闹钟，支持云端海大校历静默同步；\n2. 新增全局深色模式、多学期归档切换、课程编辑与作业 DDL、脱敏成绩单导出、本地无凭据全量备份换机、手势滑动切周与快捷跳周；\n3. 小组件/灵动岛支持深链直达，iOS 新增 Siri/快捷指令 AppIntents 与后台刷新，Android 新增 4×4 周课表大挂件，内置四校区离线教学楼速查；\n4. OTA 热更升级 Ed25519 强制验签与校园网镜像兜底，原生桥接迁移至本地 Expo Module。",
           "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v2.0.0/haida-schedule-v2.0.0-ios-unsigned.ipa",
-          "size": 12400000,
+          "size": 12370054,
           "minOSVersion": "16.4"
         },
         {
