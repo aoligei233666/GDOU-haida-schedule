@@ -2,85 +2,17 @@ import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { Platform } from 'react-native';
 import { AppSettings, CourseItem, ExamItem } from '../types/models';
-import { buildTodayLiveSnapshot, TodayClassLiveItem } from './academicCalendar';
-import { sanitizeForZeroRetention } from './zeroRetentionSanitizer';
+import {
+  buildNativeWidgetPayload,
+  NativeWidgetCourseRow,
+  NativeWidgetDaySnapshot,
+  NativeWidgetPayload,
+} from './widgetPayloadBuilder';
+
+export { buildNativeWidgetPayload };
+export type { NativeWidgetCourseRow, NativeWidgetDaySnapshot, NativeWidgetPayload };
 
 const WIDGET_BRIDGE_BASE = 'https://gdou-widget-internal.local';
-
-export interface NativeWidgetPayload {
-  updatedAtIso: string;
-  termLabel: string;
-  dateStr: string;
-  week: number;
-  weekdayLabel: string;
-  overrideBadge: string | null;
-  state: 'ongoing' | 'upcoming' | 'holiday' | 'done' | 'empty';
-  headline: string;
-  subline: string;
-  activeCourseName: string;
-  activeCourseRoom: string;
-  activeCourseTime: string;
-  minutesDelta: number;
-  todayItems: Array<{
-    name: string;
-    location: string;
-    time: string;
-    sectionText: string;
-    status: TodayClassLiveItem['status'];
-  }>;
-  nextExamTitle: string;
-  nextExamCountdown: string;
-}
-
-export function buildNativeWidgetPayload(
-  courses: CourseItem[],
-  exams: ExamItem[],
-  settings: AppSettings,
-  termLabel: string,
-  now: Date = new Date()
-): NativeWidgetPayload {
-  const snap = buildTodayLiveSnapshot(courses, settings, now);
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const upcomingExam = exams
-    .map((e) => ({ e, ts: e.dateText ? Date.parse(`${e.dateText}T00:00:00`) : NaN }))
-    .filter((x) => Number.isFinite(x.ts) && x.ts >= todayStart)
-    .sort((a, b) => a.ts - b.ts)[0];
-
-  const nextExamTitle = upcomingExam ? upcomingExam.e.courseName : '';
-  const nextExamCountdown = upcomingExam
-    ? (() => {
-        const d = Math.max(0, Math.round((upcomingExam.ts - todayStart) / 86_400_000));
-        return d === 0 ? '今天考试' : `还有 ${d} 天`;
-      })()
-    : '';
-
-  return sanitizeForZeroRetention({
-    updatedAtIso: now.toISOString(),
-    termLabel,
-    dateStr: snap.dateStr,
-    week: snap.week,
-    weekdayLabel: snap.weekdayLabel,
-    overrideBadge: snap.overrideBadge,
-    state: snap.state,
-    headline: snap.headline,
-    subline: snap.subline,
-    activeCourseName: snap.activeCourse?.name || snap.headline,
-    activeCourseRoom: snap.activeCourse?.location || '',
-    activeCourseTime: snap.activeCourse
-      ? `${snap.activeCourse.startTime}-${snap.activeCourse.endTime}`
-      : '',
-    minutesDelta: snap.minutesDelta ?? 0,
-    todayItems: snap.items.slice(0, 6).map((it) => ({
-      name: it.name,
-      location: it.location,
-      time: `${it.startTime}-${it.endTime}`,
-      sectionText: `${it.startSection}-${it.endSection}节`,
-      status: it.status,
-    })),
-    nextExamTitle,
-    nextExamCountdown,
-  });
-}
 
 async function callNativeWidgetBridge(
   path: string,
@@ -106,10 +38,10 @@ async function callNativeWidgetBridge(
 }
 
 /**
- * Push sanitized today's schedule snapshot to:
- * - Android Home Screen AppWidget (SharedPreferences + AppWidgetManager broadcast)
+ * Push sanitized today's + 7-day rolling schedule snapshot to:
+ * - Android Home Screen AppWidget (SharedPreferences + atomic file mirror + AppWidgetManager broadcast)
  * - Android Ongoing Status Bar Notification (if enabled)
- * - iOS WidgetKit Extension (App Group UserDefaults + WidgetCenter.reloadAllTimelines)
+ * - iOS WidgetKit Extension (App Group atomic file + UserDefaults + Shared Keychain fallback + WidgetCenter.reloadAllTimelines)
  * - iOS Dynamic Island / Lock Screen Live Activity (if enabled)
  */
 export async function syncNativeWidgetsAndLiveStatus(
@@ -120,6 +52,9 @@ export async function syncNativeWidgetsAndLiveStatus(
 ): Promise<{
   widgetSynced: boolean;
   appGroupAccessible?: boolean;
+  keychainAccessible?: boolean;
+  keychainGroup?: string;
+  widgetTransport?: string;
   widgetSuite?: string;
   ongoingSynced: boolean;
   liveActivitySynced: boolean;
@@ -127,6 +62,9 @@ export async function syncNativeWidgetsAndLiveStatus(
   const payload = buildNativeWidgetPayload(courses, exams, settings, termLabel);
   let widgetSynced = false;
   let appGroupAccessible: boolean | undefined;
+  let keychainAccessible: boolean | undefined;
+  let keychainGroup: string | undefined;
+  let widgetTransport: string | undefined;
   let widgetSuite: string | undefined;
   let ongoingSynced = false;
   let liveActivitySynced = false;
@@ -136,6 +74,15 @@ export async function syncNativeWidgetsAndLiveStatus(
     widgetSynced = Boolean(res.ok);
     if (typeof res.appGroupAccessible === 'boolean') {
       appGroupAccessible = res.appGroupAccessible;
+    }
+    if (typeof res.keychainAccessible === 'boolean') {
+      keychainAccessible = res.keychainAccessible;
+    }
+    if (typeof res.keychainGroup === 'string' && res.keychainGroup) {
+      keychainGroup = res.keychainGroup;
+    }
+    if (typeof res.transport === 'string' && res.transport) {
+      widgetTransport = res.transport;
     }
     if (typeof res.suite === 'string') {
       widgetSuite = res.suite;
@@ -158,7 +105,16 @@ export async function syncNativeWidgetsAndLiveStatus(
     liveActivitySynced = Boolean(res.ok);
   }
 
-  return { widgetSynced, appGroupAccessible, widgetSuite, ongoingSynced, liveActivitySynced };
+  return {
+    widgetSynced,
+    appGroupAccessible,
+    keychainAccessible,
+    keychainGroup,
+    widgetTransport,
+    widgetSuite,
+    ongoingSynced,
+    liveActivitySynced,
+  };
 }
 
 /**

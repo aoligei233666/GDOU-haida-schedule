@@ -581,6 +581,10 @@ class MainApplication : Application(), ReactApplication {
             val isOnWfw = effectiveReq.url.host.equals("wfw.gdou.edu.cn", ignoreCase = true)
             val isWfwActive = isOnWfw || (!isNetcheck && ephemeralCookieJar.hasWfwSession())
             val isInWfwProxiedPath = isOnWfw && effectiveReq.url.encodedPath.startsWith("/https://", ignoreCase = true)
+            val isInWfwAuthPath = isOnWfw && (
+              effectiveReq.url.encodedPath.startsWith("/authserver", ignoreCase = true) ||
+                effectiveReq.url.encodedPath.startsWith("/https://authserver.gdou.edu.cn/authserver", ignoreCase = true)
+            )
             val wrongWfwSsoRe = Regex(
               "^(?:https?://wfw\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?)?(?:/https?://authserver\\\\.gdou\\\\.edu\\\\.cn)?/sso/jziotlogin([?#].*)?\$",
               RegexOption.IGNORE_CASE
@@ -589,13 +593,26 @@ class MainApplication : Application(), ReactApplication {
               "^https?://jw\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?([/?#].*)?\$",
               RegexOption.IGNORE_CASE
             )
+            val bareAuthPathRe = Regex(
+              "^https?://authserver\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?(/authserver(?:[/?#].*)?)\$",
+              RegexOption.IGNORE_CASE
+            )
+            val wfwNestedAuthRe = Regex(
+              "^https?://wfw\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?/https?://(?:jw|authserver)\\\\.gdou\\\\.edu\\\\.cn(/authserver(?:[/?#].*)?)\$",
+              RegexOption.IGNORE_CASE
+            )
             val bareAuthLocRe = Regex(
               "^https?://authserver\\\\.gdou\\\\.edu\\\\.cn(?::(?:80|443))?([/?#].*)?\$",
               RegexOption.IGNORE_CASE
             )
+            val targetsWfwPortalService =
+              upgradedCandidate.contains("service=https%3A%2F%2Fwfw.gdou.edu.cn", ignoreCase = true) ||
+                upgradedCandidate.contains("service=https://wfw.gdou.edu.cn", ignoreCase = true)
             val wrongSsoMatch = if (isOnWfw) wrongWfwSsoRe.matchEntire(upgradedCandidate) else null
             val bareJwMatch = if (isWfwActive) bareJwLocRe.matchEntire(upgradedCandidate) else null
-            val bareAuthMatch = if (isInWfwProxiedPath) bareAuthLocRe.matchEntire(upgradedCandidate) else null
+            val wfwNestedAuthMatch = if (isInWfwAuthPath) wfwNestedAuthRe.matchEntire(upgradedCandidate) else null
+            val keepAuthWfwMatch = if (isInWfwAuthPath && !targetsWfwPortalService) bareAuthPathRe.matchEntire(upgradedCandidate) else null
+            val bareAuthMatch = if (isInWfwProxiedPath && !isInWfwAuthPath) bareAuthLocRe.matchEntire(upgradedCandidate) else null
             rewrittenLoc = when {
               wrongSsoMatch != null ->
                 "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/sso/jziotlogin\${wrongSsoMatch.groupValues[1]}"
@@ -604,6 +621,10 @@ class MainApplication : Application(), ReactApplication {
                 val normRest = if (rest.isNotEmpty() && !rest.startsWith("/")) "/\$rest" else rest
                 "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn\$normRest"
               }
+              wfwNestedAuthMatch != null ->
+                "https://wfw.gdou.edu.cn\${wfwNestedAuthMatch.groupValues[1]}"
+              keepAuthWfwMatch != null ->
+                "https://wfw.gdou.edu.cn\${keepAuthWfwMatch.groupValues[1]}"
               bareAuthMatch != null -> {
                 val rest = bareAuthMatch.groupValues[1]
                 val normRest = if (rest.isNotEmpty() && !rest.startsWith("/")) "/\$rest" else rest
@@ -611,7 +632,7 @@ class MainApplication : Application(), ReactApplication {
               }
               loc.startsWith("/authserver", ignoreCase = true) &&
                 reqUrl.contains("wfw.gdou.edu.cn/https://authserver.gdou.edu.cn", ignoreCase = true) ->
-                "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn\$loc"
+                "https://wfw.gdou.edu.cn\$loc"
               loc.startsWith("/") &&
                 !loc.startsWith("/https://") &&
                 !loc.startsWith("/http://") &&
@@ -663,6 +684,7 @@ class MainApplication : Application(), ReactApplication {
 const IOS_EPHEMERAL_NETWORKING_SWIFT = `internal import Expo
 import Foundation
 import React
+import Security
 import UIKit
 import WebKit
 #if canImport(WidgetKit)
@@ -1447,7 +1469,12 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     return upgradeGdouHttpUrl(parsed)
   }
 
-  private static func healWfwRedirectUrl(_ raw: String, isOnWfw: Bool, isInWfwProxiedPath: Bool = false) -> URL? {
+  private static func healWfwRedirectUrl(
+    _ raw: String,
+    isOnWfw: Bool,
+    isInWfwProxiedPath: Bool = false,
+    isInWfwAuthPath: Bool = false
+  ) -> URL? {
     guard isOnWfw else { return nil }
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     let lower = trimmed.lowercased()
@@ -1483,7 +1510,42 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       }
     }
 
-    if isInWfwProxiedPath {
+    if isInWfwAuthPath {
+      for nestedPrefix in [
+        "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver",
+        "https://wfw.gdou.edu.cn/http://authserver.gdou.edu.cn/authserver",
+        "https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/authserver",
+        "https://wfw.gdou.edu.cn/http://jw.gdou.edu.cn/authserver",
+      ] {
+        if lower.hasPrefix(nestedPrefix) {
+          let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: nestedPrefix.count)
+          let suffix = String(trimmed[suffixStart...])
+          if suffix.isEmpty || suffix.hasPrefix("/") || suffix.hasPrefix("?") || suffix.hasPrefix("#") {
+            return URL(string: "https://wfw.gdou.edu.cn/authserver" + suffix)
+          }
+        }
+      }
+
+      let targetsWfwPortal =
+        lower.contains("service=https%3a%2f%2fwfw.gdou.edu.cn") ||
+        lower.contains("service=https://wfw.gdou.edu.cn")
+      if !targetsWfwPortal {
+        for authPrefix in [
+          "https://authserver.gdou.edu.cn:443/authserver",
+          "https://authserver.gdou.edu.cn/authserver",
+          "http://authserver.gdou.edu.cn:80/authserver",
+          "http://authserver.gdou.edu.cn/authserver",
+        ] {
+          if lower.hasPrefix(authPrefix) {
+            let suffixStart = trimmed.index(trimmed.startIndex, offsetBy: authPrefix.count)
+            let suffix = String(trimmed[suffixStart...])
+            if suffix.isEmpty || suffix.hasPrefix("/") || suffix.hasPrefix("?") || suffix.hasPrefix("#") {
+              return URL(string: "https://wfw.gdou.edu.cn/authserver" + suffix)
+            }
+          }
+        }
+      }
+    } else if isInWfwProxiedPath {
       for authPrefix in [
         "https://authserver.gdou.edu.cn:443",
         "https://authserver.gdou.edu.cn",
@@ -1509,7 +1571,7 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     var data = Data()
     let chunkSize = 16 * 1024
     var buffer = [UInt8](repeating: 0, count: chunkSize)
-    while stream.hasBytesAvailable && data.count < maxBytes {
+    while data.count < maxBytes {
       let remaining = maxBytes - data.count
       let readCount = stream.read(&buffer, maxLength: min(chunkSize, remaining))
       if readCount <= 0 { break }
@@ -1767,14 +1829,22 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
     let isNetcheck = lowerSource.contains("netcheck.gdou.edu.cn")
     let isOnWfw = lowerSource.contains("wfw.gdou.edu.cn") || (!isNetcheck && GdouEphemeralCookieStore.shared.hasWfwSession())
     let isInWfwProxiedPath = lowerSource.contains("wfw.gdou.edu.cn/https://")
+    let isInWfwAuthPath =
+      lowerSource.contains("wfw.gdou.edu.cn/authserver") ||
+      lowerSource.contains("wfw.gdou.edu.cn/https://authserver.gdou.edu.cn/authserver")
 
     if let loc = rawLoc {
       let upgradedLocStr = Self.upgradeGdouHttpUrl(from: loc)?.absoluteString ?? loc
-      if let healedWfw = Self.healWfwRedirectUrl(upgradedLocStr, isOnWfw: isOnWfw, isInWfwProxiedPath: isInWfwProxiedPath) {
+      if let healedWfw = Self.healWfwRedirectUrl(
+        upgradedLocStr,
+        isOnWfw: isOnWfw,
+        isInWfwProxiedPath: isInWfwProxiedPath,
+        isInWfwAuthPath: isInWfwAuthPath
+      ) {
         nextMutable.url = healedWfw
       } else if loc.lowercased().hasPrefix("/authserver"),
                 lowerSource.contains("wfw.gdou.edu.cn/https://authserver.gdou.edu.cn"),
-                let rewrittenAuth = URL(string: "https://wfw.gdou.edu.cn/https://authserver.gdou.edu.cn" + loc) {
+                let rewrittenAuth = URL(string: "https://wfw.gdou.edu.cn" + loc) {
         nextMutable.url = rewrittenAuth
       } else if loc.hasPrefix("/"),
                 !loc.hasPrefix("/https://"),
@@ -1793,7 +1863,12 @@ final class GdouEphemeralURLProtocol: URLProtocol, URLSessionDataDelegate, @unch
       if let upgradedResolved = Self.upgradeGdouHttpUrl(resolvedUrl) {
         nextMutable.url = upgradedResolved
       }
-      if let healedResolved = Self.healWfwRedirectUrl(nextMutable.url?.absoluteString ?? "", isOnWfw: isOnWfw, isInWfwProxiedPath: isInWfwProxiedPath) {
+      if let healedResolved = Self.healWfwRedirectUrl(
+        nextMutable.url?.absoluteString ?? "",
+        isOnWfw: isOnWfw,
+        isInWfwProxiedPath: isInWfwProxiedPath,
+        isInWfwAuthPath: isInWfwAuthPath
+      ) {
         nextMutable.url = healedResolved
       }
     }
@@ -1949,33 +2024,40 @@ final class GdouIosPhotoPickerCoordinator: NSObject, PHPickerViewControllerDeleg
 }
 #endif
 
-/// Dynamically discovers the active App Group container(s) from the signed bundle's
-/// \`embedded.mobileprovision\` + runtime \`Bundle.main.bundleIdentifier\` (handles Sideloadly /
-/// AltStore / SideStore / Feather / ESign bundle ID rewriting as well as TrollStore & TestFlight).
+/// Dynamically discovers the active App Group container(s) and Keychain Access Group(s) from the
+/// signed bundle's \`embedded.mobileprovision\` + runtime \`Bundle.main.bundleIdentifier\` (handles
+/// Sideloadly / AltStore / SideStore / Feather / ESign / Enterprise wildcard P12 / TrollStore / TestFlight).
 enum GdouAppGroupResolver {
-  private static func provisionedAppGroups() -> [String] {
-    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-          let data = try? Data(contentsOf: url),
+  static func readMobileProvisionPlist(at url: URL) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: url),
           let raw = String(data: data, encoding: .isoLatin1),
           let startRange = raw.range(of: "<?xml"),
           let endRange = raw.range(of: "</plist>") else {
-      return []
+      return nil
     }
     let plistText = String(raw[startRange.lowerBound..<endRange.upperBound])
     guard let plistData = plistText.data(using: .utf8),
-          let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any],
+          let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any] else {
+      return nil
+    }
+    return plist
+  }
+
+  private static func provisionedAppGroups() -> [String] {
+    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          let plist = readMobileProvisionPlist(at: url),
           let entitlements = plist["Entitlements"] as? [String: Any],
           let groups = entitlements["com.apple.security.application-groups"] as? [String] else {
       return []
     }
-    return groups.filter { !$0.isEmpty }
+    return groups.filter { !$0.isEmpty && !$0.contains("*") }
   }
 
   static func candidateSuites(fallbackBundleId: String = "cn.edu.gdou.schedule") -> [String] {
     var out: [String] = []
     let appendUnique: (String) -> Void = { candidate in
       let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty && !out.contains(trimmed) {
+      if !trimmed.isEmpty && !trimmed.contains("*") && !out.contains(trimmed) {
         out.append(trimmed)
       }
     }
@@ -1990,8 +2072,159 @@ enum GdouAppGroupResolver {
   }
 }
 
-/// Native iOS bridge for WidgetKit App Group sync, Dynamic Island / Live Activity (ActivityKit),
-/// and zero-permission PHPicker custom schedule background selection.
+/// Shared Keychain transport for **sanitized** schedule widget snapshots (ZERO credentials — only
+/// public course titles, classrooms, times & exam countdowns). Works across Main App <-> WidgetKit
+/// Extension even when sideloaded via ESign / Feather / KSign / Enterprise wildcard P12 / Free Apple ID
+/// where \`com.apple.security.application-groups\` is stripped but \`keychain-access-groups: ["<TEAM>.*"]\`
+/// is granted to both binaries.
+enum GdouSharedKeychainStore {
+  static let service = "cn.edu.gdou.schedule.widget.snapshot.v1"
+  static let account = "schedule_payload_json"
+  private static let probeService = "cn.edu.gdou.schedule.widget.probe.v1"
+  private static let probeAccount = "team_prefix_probe"
+  private static let sharedGroupSuffix = "cn.edu.gdou.schedule.widgetshared"
+
+  private static func extractTeamPrefix(from group: String) -> String? {
+    let trimmed = group.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let dotIdx = trimmed.firstIndex(of: ".") else { return nil }
+    let prefix = String(trimmed[..<dotIdx])
+    return prefix.isEmpty || prefix.contains("*") ? nil : prefix
+  }
+
+  private static func discoverRuntimeTeamPrefix() -> String? {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: probeService,
+      kSecAttrAccount as String: probeAccount,
+      kSecAttrSynchronizable as String: false,
+      kSecReturnAttributes as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var item: CFTypeRef?
+    var status = SecItemCopyMatching(query as CFDictionary, &item)
+    if status == errSecItemNotFound {
+      let addQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: probeService,
+        kSecAttrAccount as String: probeAccount,
+        kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        kSecAttrSynchronizable as String: false,
+        kSecValueData as String: Data("1".utf8),
+      ]
+      let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+      if addStatus == errSecSuccess || addStatus == errSecDuplicateItem {
+        status = SecItemCopyMatching(query as CFDictionary, &item)
+      }
+    }
+    if status == errSecSuccess,
+       let dict = item as? [String: Any],
+       let accessGroup = dict[kSecAttrAccessGroup as String] as? String {
+      return extractTeamPrefix(from: accessGroup)
+    }
+    return nil
+  }
+
+  static func candidateAccessGroups() -> [String] {
+    var groups: [String] = []
+    var prefixes: [String] = []
+    let appendGroup: (String) -> Void = { raw in
+      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty && !trimmed.contains("*") && !groups.contains(trimmed) {
+        groups.append(trimmed)
+      }
+    }
+    let appendPrefix: (String) -> Void = { raw in
+      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty && !trimmed.contains("*") && !prefixes.contains(trimmed) {
+        prefixes.append(trimmed)
+      }
+    }
+
+    if let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+       let plist = GdouAppGroupResolver.readMobileProvisionPlist(at: url) {
+      if let appPrefixes = plist["ApplicationIdentifierPrefix"] as? [String] {
+        for p in appPrefixes { appendPrefix(p) }
+      }
+      if let teamIds = plist["TeamIdentifier"] as? [String] {
+        for t in teamIds { appendPrefix(t) }
+      }
+      if let ent = plist["Entitlements"] as? [String: Any] {
+        if let appId = ent["application-identifier"] as? String,
+           let p = extractTeamPrefix(from: appId) {
+          appendPrefix(p)
+        }
+        if let kcGroups = ent["keychain-access-groups"] as? [String] {
+          for rawGroup in kcGroups {
+            if rawGroup.hasSuffix(".*"), let p = extractTeamPrefix(from: rawGroup) {
+              appendPrefix(p)
+            } else if !rawGroup.contains("*") {
+              appendGroup(rawGroup)
+              if let p = extractTeamPrefix(from: rawGroup) {
+                appendPrefix(p)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if let runtimePrefix = discoverRuntimeTeamPrefix() {
+      appendPrefix(runtimePrefix)
+    }
+
+    let bid = Bundle.main.bundleIdentifier ?? "cn.edu.gdou.schedule"
+    for p in prefixes {
+      appendGroup("\\(p).\\(sharedGroupSuffix)")
+      appendGroup("\\(p).\\(bid)")
+    }
+    return groups
+  }
+
+  static func writeSanitizedPayload(_ data: Data) -> (ok: Bool, group: String?) {
+    let groups = candidateAccessGroups()
+    var firstSuccessGroup: String? = nil
+
+    for group in groups {
+      let baseQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecAttrAccessGroup as String: group,
+        kSecAttrSynchronizable as String: false,
+      ]
+      SecItemDelete(baseQuery as CFDictionary)
+      var addQuery = baseQuery
+      addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+      addQuery[kSecValueData as String] = data
+      let status = SecItemAdd(addQuery as CFDictionary, nil)
+      if status == errSecSuccess, firstSuccessGroup == nil {
+        firstSuccessGroup = group
+      }
+    }
+
+    // Also mirror into default app access group if no explicit shared group succeeded
+    if firstSuccessGroup == nil {
+      let defaultBase: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecAttrSynchronizable as String: false,
+      ]
+      SecItemDelete(defaultBase as CFDictionary)
+      var addDefault = defaultBase
+      addDefault[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+      addDefault[kSecValueData as String] = data
+      if SecItemAdd(addDefault as CFDictionary, nil) == errSecSuccess {
+        return (true, "default")
+      }
+      return (false, nil)
+    }
+    return (true, firstSuccessGroup)
+  }
+}
+
+/// Native iOS bridge for WidgetKit App Group + Shared Keychain sync, Dynamic Island / Live Activity
+/// (ActivityKit), and zero-permission PHPicker custom schedule background selection.
 enum GdouIosWidgetBridge {
   private static let storageKey = "gdou_widget_payload_v1"
   private static let fileName = "gdou_widget_payload_v1.json"
@@ -2032,6 +2265,21 @@ enum GdouIosWidgetBridge {
         fallbackDefaults.set(rawJson, forKey: storageKey)
       }
       UserDefaults.standard.set(rawJson, forKey: storageKey)
+
+      // Always mirror sanitized schedule JSON into Shared Keychain so sideloaded builds without
+      // App Group entitlements (ESign / Feather / Enterprise wildcard / Free Apple ID) still work!
+      let keychainResult = GdouSharedKeychainStore.writeSanitizedPayload(bodyData)
+      let transport: String
+      if appGroupAccessible && keychainResult.ok {
+        transport = "app_group+keychain"
+      } else if appGroupAccessible {
+        transport = "app_group"
+      } else if keychainResult.ok {
+        transport = "keychain_shared"
+      } else {
+        transport = "local_only"
+      }
+
       #if canImport(WidgetKit)
       WidgetCenter.shared.reloadTimelines(ofKind: "GdouScheduleHomeWidget")
       WidgetCenter.shared.reloadAllTimelines()
@@ -2040,6 +2288,9 @@ enum GdouIosWidgetBridge {
         "ok": true,
         "suite": activeSuite,
         "appGroupAccessible": appGroupAccessible,
+        "keychainAccessible": keychainResult.ok,
+        "keychainGroup": keychainResult.group ?? "",
+        "transport": transport,
         "fileWritten": fileWritten,
       ])
     }
@@ -2209,6 +2460,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
@@ -2216,23 +2468,44 @@ import android.util.Log
 import android.widget.RemoteViews
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.Calendar
+import java.util.Locale
 
 object GdouWidgetStore {
   private const val PREF_NAME = "gdou_widget_prefs"
   private const val KEY_PAYLOAD = "widget_payload_v1"
+  private const val MIRROR_FILE = "gdou_widget_payload_v1.json"
 
   fun savePayload(context: Context, jsonStr: String) {
     context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
       .edit()
       .putString(KEY_PAYLOAD, jsonStr)
-      .apply()
+      .commit()
+    try {
+      val tmp = File(context.filesDir, "\$MIRROR_FILE.tmp")
+      val target = File(context.filesDir, MIRROR_FILE)
+      tmp.writeText(jsonStr, Charsets.UTF_8)
+      if (!tmp.renameTo(target)) {
+        target.writeText(jsonStr, Charsets.UTF_8)
+        tmp.delete()
+      }
+    } catch (err: Throwable) {
+      Log.w("GdouWidget", "Mirror write failed: \${err.message}")
+    }
   }
 
   fun readPayload(context: Context): JSONObject? {
-    val raw = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-      .getString(KEY_PAYLOAD, null) ?: return null
+    val rawPref = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+      .getString(KEY_PAYLOAD, null)
+    if (!rawPref.isNullOrBlank()) {
+      try {
+        return JSONObject(rawPref)
+      } catch (_: Throwable) {}
+    }
     return try {
-      JSONObject(raw)
+      val file = File(context.filesDir, MIRROR_FILE)
+      if (file.exists()) JSONObject(file.readText(Charsets.UTF_8)) else null
     } catch (_: Throwable) {
       null
     }
@@ -2240,6 +2513,21 @@ object GdouWidgetStore {
 }
 
 class GdouScheduleWidgetProvider : AppWidgetProvider() {
+  override fun onEnabled(context: Context) {
+    super.onEnabled(context)
+    updateAllWidgets(context)
+  }
+
+  override fun onAppWidgetOptionsChanged(
+    context: Context,
+    appWidgetManager: AppWidgetManager,
+    appWidgetId: Int,
+    newOptions: Bundle
+  ) {
+    super.onAppWidgetOptionsChanged(context, appWidgetManager, appWidgetId, newOptions)
+    updateSingleWidget(context, appWidgetManager, appWidgetId)
+  }
+
   override fun onUpdate(
     context: Context,
     appWidgetManager: AppWidgetManager,
@@ -2251,6 +2539,29 @@ class GdouScheduleWidgetProvider : AppWidgetProvider() {
   }
 
   companion object {
+    private fun parseMinutesFromTimeRange(timeStr: String): Pair<Int, Int> {
+      val parts = timeStr.split("-")
+      if (parts.size != 2) return 0 to 0
+      fun toMin(s: String): Int {
+        val hm = s.trim().split(":")
+        val h = hm.getOrNull(0)?.toIntOrNull() ?: return 0
+        val m = hm.getOrNull(1)?.toIntOrNull() ?: return 0
+        return h * 60 + m
+      }
+      return toMin(parts[0]) to toMin(parts[1])
+    }
+
+    private fun formatCountdown(mins: Int): String {
+      val safe = maxOf(1, mins)
+      return if (safe >= 60) {
+        val h = safe / 60
+        val rem = safe % 60
+        if (rem > 0) "\${h}小时\${rem}分" else "\${h}小时"
+      } else {
+        "\${safe}分钟"
+      }
+    }
+
     fun updateAllWidgets(context: Context) {
       try {
         val manager = AppWidgetManager.getInstance(context)
@@ -2274,16 +2585,135 @@ class GdouScheduleWidgetProvider : AppWidgetProvider() {
       val payload = GdouWidgetStore.readPayload(context)
 
       if (payload != null) {
-        val week = payload.optInt("week", 1)
-        val weekday = payload.optString("weekdayLabel", "")
-        val badge = payload.optString("overrideBadge", "")
-        val header = if (badge.isNotEmpty() && badge != "null") {
+        val cal = Calendar.getInstance()
+        val todayDateStr = String.format(
+          Locale.US,
+          "%04d-%02d-%02d",
+          cal.get(Calendar.YEAR),
+          cal.get(Calendar.MONTH) + 1,
+          cal.get(Calendar.DAY_OF_MONTH)
+        )
+        val nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val upcomingDays = payload.optJSONArray("upcomingDays")
+        var matchedDay: JSONObject? = null
+        var nextDayFromUpcoming: JSONObject? = null
+
+        if (upcomingDays != null) {
+          for (i in 0 until upcomingDays.length()) {
+            val d = upcomingDays.optJSONObject(i) ?: continue
+            val dStr = d.optString("dateStr", "")
+            if (dStr == todayDateStr) {
+              matchedDay = d
+            } else if (dStr > todayDateStr && nextDayFromUpcoming == null) {
+              val dItems = d.optJSONArray("items")
+              if (dItems != null && dItems.length() > 0) {
+                nextDayFromUpcoming = d
+              }
+            }
+          }
+        }
+
+        val week = matchedDay?.optInt("week", payload.optInt("week", 1)) ?: payload.optInt("week", 1)
+        val weekday = matchedDay?.optString("weekdayLabel", "")?.ifBlank { payload.optString("weekdayLabel", "") }
+          ?: payload.optString("weekdayLabel", "")
+        val rawBadge = matchedDay?.optString("overrideBadge", "") ?: payload.optString("overrideBadge", "")
+        val badge = if (rawBadge == "null") "" else rawBadge
+        val header = if (badge.isNotEmpty()) {
           "海大课表 · 第\${week}周 \$weekday · \$badge"
         } else {
           "海大课表 · 第\${week}周 \$weekday"
         }
-        val headline = payload.optString("headline", "今日课表")
-        val subline = payload.optString("subline", "打开海大课表同步最新安排")
+
+        val todayItems = matchedDay?.optJSONArray("items") ?: payload.optJSONArray("todayItems") ?: JSONArray()
+        val nextClassDayItems = nextDayFromUpcoming?.optJSONArray("items")
+          ?: payload.optJSONArray("nextClassDayItems")
+          ?: JSONArray()
+        val nextClassDayLabel = if (nextDayFromUpcoming != null) {
+          val ndWeek = nextDayFromUpcoming.optString("weekdayLabel", "")
+          val ndDate = nextDayFromUpcoming.optString("dateStr", "")
+          val shortMd = if (ndDate.length >= 10) "\${ndDate.substring(5, 7).toIntOrNull() ?: ""}月\${ndDate.substring(8, 10).toIntOrNull() ?: ""}日" else ""
+          "\$shortMd \$ndWeek".trim()
+        } else {
+          payload.optString("nextClassDayLabel", "")
+        }
+
+        val totalCourses = payload.optInt("totalCourseCount", -1)
+        val isHoliday = matchedDay?.optBoolean("isHoliday", false) ?: (payload.optString("state", "") == "holiday")
+        val holidayLabel = matchedDay?.optString("holidayLabel", "") ?: ""
+
+        var headline = payload.optString("headline", "今日课表")
+        var subline = payload.optString("subline", "打开海大课表同步最新安排")
+        var listPrefix = ""
+        var displayItems = todayItems
+
+        if (totalCourses == 0 && todayItems.length() == 0 && nextClassDayItems.length() == 0) {
+          headline = "尚未同步课表"
+          subline = "点击打开海大课表，一步登录教务同步课程"
+        } else if (todayItems.length() > 0) {
+          var ongoing: JSONObject? = null
+          var ongoingEnd = 0
+          var upcoming: JSONObject? = null
+          var upcomingStart = 0
+          for (i in 0 until todayItems.length()) {
+            val row = todayItems.optJSONObject(i) ?: continue
+            var sMin = row.optInt("startMin", 0)
+            var eMin = row.optInt("endMin", 0)
+            if (sMin == 0 && eMin == 0) {
+              val parsed = parseMinutesFromTimeRange(row.optString("time", ""))
+              sMin = parsed.first
+              eMin = parsed.second
+            }
+            if (sMin > 0 && eMin > 0) {
+              if (nowMin in sMin until eMin && ongoing == null) {
+                ongoing = row
+                ongoingEnd = eMin
+              } else if (nowMin < sMin && upcoming == null) {
+                upcoming = row
+                upcomingStart = sMin
+              }
+            }
+          }
+          when {
+            ongoing != null -> {
+              headline = "上课中 · \${ongoing.optString("name", "")}"
+              subline = "\${ongoing.optString("location", "")} · \${ongoing.optString("sectionText", "")} · 距下课 \${maxOf(1, ongoingEnd - nowMin)} 分钟"
+            }
+            upcoming != null -> {
+              val startText = upcoming.optString("time", "").substringBefore("-")
+              headline = "下节 \$startText · \${upcoming.optString("name", "")}"
+              subline = "\${upcoming.optString("location", "")} · \${upcoming.optString("sectionText", "")} · 还有 \${formatCountdown(upcomingStart - nowMin)}"
+            }
+            else -> {
+              headline = "今日 \${todayItems.length()} 节课已结束"
+              if (nextClassDayItems.length() > 0) {
+                subline = "下个上课日：\$nextClassDayLabel（共 \${nextClassDayItems.length()} 节）"
+                listPrefix = "▸ \$nextClassDayLabel："
+                displayItems = nextClassDayItems
+              } else {
+                subline = "今日课程已全部结束，祝学习顺利"
+              }
+            }
+          }
+        } else if (isHoliday) {
+          headline = "\${holidayLabel.ifBlank { "法定节假日" }} · 今日停课"
+          if (nextClassDayItems.length() > 0) {
+            subline = "下个上课日：\$nextClassDayLabel（共 \${nextClassDayItems.length()} 节）"
+            listPrefix = "▸ \$nextClassDayLabel："
+            displayItems = nextClassDayItems
+          } else {
+            subline = "祝假期愉快，可打开海大课表查看调休安排"
+          }
+        } else {
+          headline = "今日无排课"
+          if (nextClassDayItems.length() > 0) {
+            subline = "下个上课日：\$nextClassDayLabel（共 \${nextClassDayItems.length()} 节）"
+            listPrefix = "▸ \$nextClassDayLabel："
+            displayItems = nextClassDayItems
+          } else {
+            subline = "第\${week}周 \$weekday · 自由安排时间"
+          }
+        }
+
         val nextExam = payload.optString("nextExamTitle", "")
         val nextExamCd = payload.optString("nextExamCountdown", "")
 
@@ -2298,11 +2728,14 @@ class GdouScheduleWidgetProvider : AppWidgetProvider() {
           }
         )
 
-        val items = payload.optJSONArray("todayItems") ?: JSONArray()
         val sb = StringBuilder()
-        val limit = minOf(items.length(), 4)
+        if (listPrefix.isNotEmpty()) {
+          sb.append(listPrefix)
+        }
+        val rowLimit = if (listPrefix.isNotEmpty()) 4 else 5
+        val limit = minOf(displayItems.length(), rowLimit)
         for (i in 0 until limit) {
-          val it = items.optJSONObject(i) ?: continue
+          val it = displayItems.optJSONObject(i) ?: continue
           val t = it.optString("time", "")
           val n = it.optString("name", "")
           val loc = it.optString("location", "")
@@ -2311,7 +2744,7 @@ class GdouScheduleWidgetProvider : AppWidgetProvider() {
         }
         views.setTextViewText(
           R.id.widget_items_list,
-          if (sb.isNotEmpty()) sb.toString() else "今日暂无排课，祝学习顺利！"
+          if (sb.isNotEmpty()) sb.toString() else "点击打开海大课表同步课程"
         )
       }
 
@@ -2623,7 +3056,7 @@ const ANDROID_WIDGET_LAYOUT_XML = `<?xml version="1.0" encoding="utf-8"?>
         android:textColor="#F8FAFC"
         android:textSize="11.5sp"
         android:lineSpacingExtra="2dp"
-        android:maxLines="4"
+        android:maxLines="5"
         android:ellipsize="end" />
 </LinearLayout>
 `;
@@ -2721,6 +3154,7 @@ public struct GdouScheduleActivityAttributes: ActivityAttributes {
 
 function buildIosWidgetExtensionSwift(appGroupId) {
   return `import Foundation
+import Security
 import SwiftUI
 import WidgetKit
 #if canImport(ActivityKit)
@@ -2733,11 +3167,118 @@ struct GdouWidgetCourseRow: Codable, Hashable, Sendable {
   let time: String
   let sectionText: String
   let status: String
+  let startMin: Int
+  let endMin: Int
+
+  init(
+    name: String,
+    location: String,
+    time: String,
+    sectionText: String,
+    status: String,
+    startMin: Int = 0,
+    endMin: Int = 0
+  ) {
+    self.name = name
+    self.location = location
+    self.time = time
+    self.sectionText = sectionText
+    self.status = status
+    self.startMin = startMin
+    self.endMin = endMin
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case name, location, time, sectionText, status, startMin, endMin
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
+    self.location = (try? c.decodeIfPresent(String.self, forKey: .location)) ?? ""
+    self.time = (try? c.decodeIfPresent(String.self, forKey: .time)) ?? ""
+    self.sectionText = (try? c.decodeIfPresent(String.self, forKey: .sectionText)) ?? ""
+    self.status = (try? c.decodeIfPresent(String.self, forKey: .status)) ?? "upcoming"
+    self.startMin = (try? c.decodeIfPresent(Int.self, forKey: .startMin)) ?? 0
+    self.endMin = (try? c.decodeIfPresent(Int.self, forKey: .endMin)) ?? 0
+  }
+
+  var resolvedStartMin: Int {
+    if startMin > 0 { return startMin }
+    return Self.parseRange(time).0
+  }
+
+  var resolvedEndMin: Int {
+    if endMin > 0 { return endMin }
+    return Self.parseRange(time).1
+  }
+
+  var startTimeText: String {
+    if let dash = time.firstIndex(of: "-") {
+      return String(time[..<dash]).trimmingCharacters(in: .whitespaces)
+    }
+    return time
+  }
+
+  private static func parseRange(_ range: String) -> (Int, Int) {
+    let parts = range.split(separator: "-")
+    guard parts.count == 2 else { return (0, 0) }
+    func toMin(_ s: Substring) -> Int {
+      let hm = s.trimmingCharacters(in: .whitespaces).split(separator: ":")
+      guard hm.count == 2, let h = Int(hm[0]), let m = Int(hm[1]) else { return 0 }
+      return h * 60 + m
+    }
+    return (toMin(parts[0]), toMin(parts[1]))
+  }
+}
+
+struct GdouWidgetDaySnapshot: Codable, Hashable, Sendable {
+  let dateStr: String
+  let week: Int
+  let weekdayLabel: String
+  let overrideBadge: String?
+  let isHoliday: Bool
+  let holidayLabel: String
+  let items: [GdouWidgetCourseRow]
+
+  init(
+    dateStr: String,
+    week: Int,
+    weekdayLabel: String,
+    overrideBadge: String?,
+    isHoliday: Bool,
+    holidayLabel: String,
+    items: [GdouWidgetCourseRow]
+  ) {
+    self.dateStr = dateStr
+    self.week = week
+    self.weekdayLabel = weekdayLabel
+    self.overrideBadge = overrideBadge
+    self.isHoliday = isHoliday
+    self.holidayLabel = holidayLabel
+    self.items = items
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case dateStr, week, weekdayLabel, overrideBadge, isHoliday, holidayLabel, items
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.dateStr = (try? c.decodeIfPresent(String.self, forKey: .dateStr)) ?? ""
+    self.week = (try? c.decodeIfPresent(Int.self, forKey: .week)) ?? 1
+    self.weekdayLabel = (try? c.decodeIfPresent(String.self, forKey: .weekdayLabel)) ?? ""
+    self.overrideBadge = try? c.decodeIfPresent(String.self, forKey: .overrideBadge)
+    self.isHoliday = (try? c.decodeIfPresent(Bool.self, forKey: .isHoliday)) ?? false
+    self.holidayLabel = (try? c.decodeIfPresent(String.self, forKey: .holidayLabel)) ?? ""
+    self.items = (try? c.decodeIfPresent([GdouWidgetCourseRow].self, forKey: .items)) ?? []
+  }
 }
 
 struct GdouWidgetPayload: Codable, Sendable {
   let updatedAtIso: String?
   let termLabel: String?
+  let totalCourseCount: Int?
   let dateStr: String?
   let week: Int?
   let weekdayLabel: String?
@@ -2749,19 +3290,96 @@ struct GdouWidgetPayload: Codable, Sendable {
   let activeCourseRoom: String?
   let activeCourseTime: String?
   let todayItems: [GdouWidgetCourseRow]?
+  let upcomingDays: [GdouWidgetDaySnapshot]?
+  let nextClassDayLabel: String?
+  let nextClassDayItems: [GdouWidgetCourseRow]?
   let nextExamTitle: String?
   let nextExamCountdown: String?
+
+  init(
+    updatedAtIso: String?,
+    termLabel: String?,
+    totalCourseCount: Int? = nil,
+    dateStr: String?,
+    week: Int?,
+    weekdayLabel: String?,
+    overrideBadge: String?,
+    state: String?,
+    headline: String?,
+    subline: String?,
+    activeCourseName: String?,
+    activeCourseRoom: String?,
+    activeCourseTime: String?,
+    todayItems: [GdouWidgetCourseRow]?,
+    upcomingDays: [GdouWidgetDaySnapshot]? = nil,
+    nextClassDayLabel: String? = nil,
+    nextClassDayItems: [GdouWidgetCourseRow]? = nil,
+    nextExamTitle: String?,
+    nextExamCountdown: String?
+  ) {
+    self.updatedAtIso = updatedAtIso
+    self.termLabel = termLabel
+    self.totalCourseCount = totalCourseCount
+    self.dateStr = dateStr
+    self.week = week
+    self.weekdayLabel = weekdayLabel
+    self.overrideBadge = overrideBadge
+    self.state = state
+    self.headline = headline
+    self.subline = subline
+    self.activeCourseName = activeCourseName
+    self.activeCourseRoom = activeCourseRoom
+    self.activeCourseTime = activeCourseTime
+    self.todayItems = todayItems
+    self.upcomingDays = upcomingDays
+    self.nextClassDayLabel = nextClassDayLabel
+    self.nextClassDayItems = nextClassDayItems
+    self.nextExamTitle = nextExamTitle
+    self.nextExamCountdown = nextExamCountdown
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case updatedAtIso, termLabel, totalCourseCount, dateStr, week, weekdayLabel
+    case overrideBadge, state, headline, subline
+    case activeCourseName, activeCourseRoom, activeCourseTime
+    case todayItems, upcomingDays, nextClassDayLabel, nextClassDayItems
+    case nextExamTitle, nextExamCountdown
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.updatedAtIso = try? c.decodeIfPresent(String.self, forKey: .updatedAtIso)
+    self.termLabel = try? c.decodeIfPresent(String.self, forKey: .termLabel)
+    self.totalCourseCount = try? c.decodeIfPresent(Int.self, forKey: .totalCourseCount)
+    self.dateStr = try? c.decodeIfPresent(String.self, forKey: .dateStr)
+    self.week = try? c.decodeIfPresent(Int.self, forKey: .week)
+    self.weekdayLabel = try? c.decodeIfPresent(String.self, forKey: .weekdayLabel)
+    self.overrideBadge = try? c.decodeIfPresent(String.self, forKey: .overrideBadge)
+    self.state = try? c.decodeIfPresent(String.self, forKey: .state)
+    self.headline = try? c.decodeIfPresent(String.self, forKey: .headline)
+    self.subline = try? c.decodeIfPresent(String.self, forKey: .subline)
+    self.activeCourseName = try? c.decodeIfPresent(String.self, forKey: .activeCourseName)
+    self.activeCourseRoom = try? c.decodeIfPresent(String.self, forKey: .activeCourseRoom)
+    self.activeCourseTime = try? c.decodeIfPresent(String.self, forKey: .activeCourseTime)
+    self.todayItems = try? c.decodeIfPresent([GdouWidgetCourseRow].self, forKey: .todayItems)
+    self.upcomingDays = try? c.decodeIfPresent([GdouWidgetDaySnapshot].self, forKey: .upcomingDays)
+    self.nextClassDayLabel = try? c.decodeIfPresent(String.self, forKey: .nextClassDayLabel)
+    self.nextClassDayItems = try? c.decodeIfPresent([GdouWidgetCourseRow].self, forKey: .nextClassDayItems)
+    self.nextExamTitle = try? c.decodeIfPresent(String.self, forKey: .nextExamTitle)
+    self.nextExamCountdown = try? c.decodeIfPresent(String.self, forKey: .nextExamCountdown)
+  }
 
   static let previewPlaceholder = GdouWidgetPayload(
     updatedAtIso: nil,
     termLabel: "海大课表",
+    totalCourseCount: 2,
     dateStr: nil,
     week: 1,
     weekdayLabel: "周一",
     overrideBadge: nil,
     state: "upcoming",
-    headline: "海洋科学导论",
-    subline: "08:10-09:45 · 钟海楼02018",
+    headline: "下节 08:10 · 海洋科学导论",
+    subline: "钟海楼02018 · 1-2节",
     activeCourseName: "海洋科学导论",
     activeCourseRoom: "钟海楼02018",
     activeCourseTime: "08:10-09:45",
@@ -2771,50 +3389,114 @@ struct GdouWidgetPayload: Codable, Sendable {
         location: "钟海楼02018",
         time: "08:10-09:45",
         sectionText: "1-2节",
-        status: "upcoming"
+        status: "upcoming",
+        startMin: 490,
+        endMin: 585
       ),
       GdouWidgetCourseRow(
         name: "高等数学（上）",
         location: "主教学楼305",
         time: "10:15-11:50",
         sectionText: "3-4节",
-        status: "upcoming"
+        status: "upcoming",
+        startMin: 615,
+        endMin: 710
       ),
     ],
+    upcomingDays: nil,
+    nextClassDayLabel: nil,
+    nextClassDayItems: nil,
     nextExamTitle: nil,
     nextExamCountdown: nil
   )
 }
 
 enum GdouWidgetGroupDiscovery {
-  private static func provisionedAppGroups() -> [String] {
-    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-          let data = try? Data(contentsOf: url),
+  static func parentAppBundleURL() -> URL? {
+    // WidgetKit extension lives at <App>.app/PlugIns/<Widget>.appex
+    let appUrl = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+    return appUrl.pathExtension == "app" ? appUrl : nil
+  }
+
+  static func hostBundleIdentifier() -> String? {
+    if let appUrl = parentAppBundleURL() {
+      let infoUrl = appUrl.appendingPathComponent("Info.plist")
+      if let data = try? Data(contentsOf: infoUrl),
+         let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+         let bid = plist["CFBundleIdentifier"] as? String,
+         !bid.isEmpty {
+        return bid
+      }
+    }
+    if let extBid = Bundle.main.bundleIdentifier, !extBid.isEmpty {
+      if let range = extBid.range(of: ".widget") {
+        let host = String(extBid[..<range.lowerBound])
+        if !host.isEmpty { return host }
+      }
+      if let dotIdx = extBid.lastIndex(of: ".") {
+        let host = String(extBid[..<dotIdx])
+        if !host.isEmpty { return host }
+      }
+    }
+    return nil
+  }
+
+  static func readMobileProvisionPlist(at url: URL) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: url),
           let raw = String(data: data, encoding: .isoLatin1),
           let startRange = raw.range(of: "<?xml"),
           let endRange = raw.range(of: "</plist>") else {
-      return []
+      return nil
     }
     let plistText = String(raw[startRange.lowerBound..<endRange.upperBound])
     guard let plistData = plistText.data(using: .utf8),
-          let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any],
-          let entitlements = plist["Entitlements"] as? [String: Any],
-          let groups = entitlements["com.apple.security.application-groups"] as? [String] else {
-      return []
+          let plist = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any] else {
+      return nil
     }
-    return groups.filter { !$0.isEmpty }
+    return plist
+  }
+
+  static func allProvisionPlists() -> [[String: Any]] {
+    var result: [[String: Any]] = []
+    if let extUrl = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+       let plist = readMobileProvisionPlist(at: extUrl) {
+      result.append(plist)
+    }
+    if let appUrl = parentAppBundleURL() {
+      let hostProv = appUrl.appendingPathComponent("embedded.mobileprovision")
+      if let plist = readMobileProvisionPlist(at: hostProv) {
+        result.append(plist)
+      }
+    }
+    return result
+  }
+
+  private static func provisionedAppGroups() -> [String] {
+    var out: [String] = []
+    for plist in allProvisionPlists() {
+      if let entitlements = plist["Entitlements"] as? [String: Any],
+         let groups = entitlements["com.apple.security.application-groups"] as? [String] {
+        for g in groups where !g.isEmpty && !g.contains("*") && !out.contains(g) {
+          out.append(g)
+        }
+      }
+    }
+    return out
   }
 
   static func candidateSuites(fallbackGroupId: String) -> [String] {
     var out: [String] = []
     let appendUnique: (String) -> Void = { candidate in
       let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmed.isEmpty && !out.contains(trimmed) {
+      if !trimmed.isEmpty && !trimmed.contains("*") && !out.contains(trimmed) {
         out.append(trimmed)
       }
     }
     for group in provisionedAppGroups() {
       appendUnique(group)
+    }
+    if let hostBid = hostBundleIdentifier() {
+      appendUnique("group." + hostBid)
     }
     if let extBid = Bundle.main.bundleIdentifier, !extBid.isEmpty {
       if extBid.hasSuffix(".widget") {
@@ -2826,6 +3508,432 @@ enum GdouWidgetGroupDiscovery {
     appendUnique(fallbackGroupId)
     appendUnique("group.cn.edu.gdou.schedule")
     return out
+  }
+}
+
+/// Companion Shared Keychain reader inside WidgetKit Extension (works on sideloaded builds even when
+/// App Groups are unavailable under Enterprise wildcard P12 / ESign / Feather / Free Apple ID).
+enum GdouWidgetKeychainStore {
+  static let service = "cn.edu.gdou.schedule.widget.snapshot.v1"
+  static let account = "schedule_payload_json"
+  private static let probeService = "cn.edu.gdou.schedule.widget.probe.v1"
+  private static let probeAccount = "team_prefix_probe"
+  private static let sharedGroupSuffix = "cn.edu.gdou.schedule.widgetshared"
+
+  private static func extractTeamPrefix(from group: String) -> String? {
+    let trimmed = group.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let dotIdx = trimmed.firstIndex(of: ".") else { return nil }
+    let prefix = String(trimmed[..<dotIdx])
+    return prefix.isEmpty || prefix.contains("*") ? nil : prefix
+  }
+
+  private static func discoverRuntimeTeamPrefix() -> String? {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: probeService,
+      kSecAttrAccount as String: probeAccount,
+      kSecAttrSynchronizable as String: false,
+      kSecReturnAttributes as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var item: CFTypeRef?
+    var status = SecItemCopyMatching(query as CFDictionary, &item)
+    if status == errSecItemNotFound {
+      let addQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: probeService,
+        kSecAttrAccount as String: probeAccount,
+        kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        kSecAttrSynchronizable as String: false,
+        kSecValueData as String: Data("1".utf8),
+      ]
+      let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+      if addStatus == errSecSuccess || addStatus == errSecDuplicateItem {
+        status = SecItemCopyMatching(query as CFDictionary, &item)
+      }
+    }
+    if status == errSecSuccess,
+       let dict = item as? [String: Any],
+       let accessGroup = dict[kSecAttrAccessGroup as String] as? String {
+      return extractTeamPrefix(from: accessGroup)
+    }
+    return nil
+  }
+
+  private static func candidateAccessGroups() -> [String] {
+    var groups: [String] = []
+    var prefixes: [String] = []
+    let appendGroup: (String) -> Void = { raw in
+      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty && !trimmed.contains("*") && !groups.contains(trimmed) {
+        groups.append(trimmed)
+      }
+    }
+    let appendPrefix: (String) -> Void = { raw in
+      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty && !trimmed.contains("*") && !prefixes.contains(trimmed) {
+        prefixes.append(trimmed)
+      }
+    }
+
+    for plist in GdouWidgetGroupDiscovery.allProvisionPlists() {
+      if let appPrefixes = plist["ApplicationIdentifierPrefix"] as? [String] {
+        for p in appPrefixes { appendPrefix(p) }
+      }
+      if let teamIds = plist["TeamIdentifier"] as? [String] {
+        for t in teamIds { appendPrefix(t) }
+      }
+      if let ent = plist["Entitlements"] as? [String: Any] {
+        if let appId = ent["application-identifier"] as? String,
+           let p = extractTeamPrefix(from: appId) {
+          appendPrefix(p)
+        }
+        if let kcGroups = ent["keychain-access-groups"] as? [String] {
+          for rawGroup in kcGroups {
+            if rawGroup.hasSuffix(".*"), let p = extractTeamPrefix(from: rawGroup) {
+              appendPrefix(p)
+            } else if !rawGroup.contains("*") {
+              appendGroup(rawGroup)
+              if let p = extractTeamPrefix(from: rawGroup) {
+                appendPrefix(p)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if let runtimePrefix = discoverRuntimeTeamPrefix() {
+      appendPrefix(runtimePrefix)
+    }
+
+    let hostBid = GdouWidgetGroupDiscovery.hostBundleIdentifier() ?? "cn.edu.gdou.schedule"
+    for p in prefixes {
+      appendGroup("\\(p).\\(sharedGroupSuffix)")
+      appendGroup("\\(p).\\(hostBid)")
+    }
+    return groups
+  }
+
+  static func readSanitizedPayloadData() -> Data? {
+    for group in candidateAccessGroups() {
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecAttrAccessGroup as String: group,
+        kSecAttrSynchronizable as String: false,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+      ]
+      var item: CFTypeRef?
+      if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+         let data = item as? Data,
+         !data.isEmpty {
+        return data
+      }
+    }
+    // Wildcard lookup across all Keychain access groups accessible to this extension
+    let anyGroupQuery: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+      kSecAttrSynchronizable as String: false,
+      kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var anyItem: CFTypeRef?
+    if SecItemCopyMatching(anyGroupQuery as CFDictionary, &anyItem) == errSecSuccess,
+       let data = anyItem as? Data,
+       !data.isEmpty {
+      return data
+    }
+    return nil
+  }
+}
+
+struct GdouResolvedWidgetState: Sendable {
+  let hasSyncedData: Bool
+  let week: Int
+  let weekdayLabel: String
+  let overrideBadge: String?
+  let headline: String
+  let subline: String
+  let activeRoom: String
+  let rowsBanner: String?
+  let displayRows: [GdouWidgetCourseRow]
+  let nextExamTitle: String
+  let nextExamCountdown: String
+
+  private static func formatDateStr(_ date: Date) -> String {
+    let comps = Calendar.current.dateComponents([.year, .month, .day], from: date)
+    return String(format: "%04d-%02d-%02d", comps.year ?? 2026, comps.month ?? 1, comps.day ?? 1)
+  }
+
+  private static func formatCountdown(_ mins: Int) -> String {
+    let safe = max(1, mins)
+    if safe >= 60 {
+      let h = safe / 60
+      let r = safe % 60
+      return r > 0 ? "\\(h)小时\\(r)分" : "\\(h)小时"
+    }
+    return "\\(safe)分钟"
+  }
+
+  private static func formatFutureLabel(_ snap: GdouWidgetDaySnapshot, today: Date) -> String {
+    let cal = Calendar.current
+    if let tomorrow = cal.date(byAdding: .day, value: 1, to: today),
+       formatDateStr(tomorrow) == snap.dateStr {
+      return "明天 \\(snap.weekdayLabel)"
+    }
+    if let dayAfter = cal.date(byAdding: .day, value: 2, to: today),
+       formatDateStr(dayAfter) == snap.dateStr {
+      return "后天 \\(snap.weekdayLabel)"
+    }
+    let parts = snap.dateStr.split(separator: "-")
+    if parts.count == 3, let m = Int(parts[1]), let d = Int(parts[2]) {
+      return "\\(m)月\\(d)日 \\(snap.weekdayLabel)"
+    }
+    return snap.weekdayLabel
+  }
+
+  static func resolve(payload: GdouWidgetPayload?, at date: Date) -> GdouResolvedWidgetState {
+    guard let p = payload else {
+      return GdouResolvedWidgetState(
+        hasSyncedData: false,
+        week: 1,
+        weekdayLabel: "",
+        overrideBadge: nil,
+        headline: "海大课表",
+        subline: "打开海大课表同步今日课程",
+        activeRoom: "",
+        rowsBanner: nil,
+        displayRows: [],
+        nextExamTitle: "",
+        nextExamCountdown: ""
+      )
+    }
+
+    let cal = Calendar.current
+    let todayStr = formatDateStr(date)
+    let comps = cal.dateComponents([.hour, .minute], from: date)
+    let nowMin = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+    let nextExamTitle = p.nextExamTitle ?? ""
+    let nextExamCountdown = p.nextExamCountdown ?? ""
+
+    let upcoming = p.upcomingDays ?? []
+    let matchedDay = upcoming.first(where: { $0.dateStr == todayStr })
+    let nextDaySnap = upcoming.first(where: { $0.dateStr > todayStr && !$0.items.isEmpty })
+
+    let week = matchedDay?.week ?? p.week ?? 1
+    let weekday = (matchedDay?.weekdayLabel.isEmpty == false ? matchedDay?.weekdayLabel : nil)
+      ?? p.weekdayLabel ?? ""
+    let badge = matchedDay?.overrideBadge ?? p.overrideBadge
+    let isHoliday = matchedDay?.isHoliday ?? (p.state == "holiday")
+    let holidayLabel = matchedDay?.holidayLabel ?? ""
+
+    let rawTodayRows: [GdouWidgetCourseRow]
+    if let matched = matchedDay {
+      rawTodayRows = matched.items
+    } else if p.dateStr == nil || p.dateStr == todayStr {
+      rawTodayRows = p.todayItems ?? []
+    } else {
+      rawTodayRows = []
+    }
+
+    let nextDayLabel: String
+    let nextDayRows: [GdouWidgetCourseRow]
+    if let nd = nextDaySnap {
+      nextDayLabel = formatFutureLabel(nd, today: date)
+      nextDayRows = nd.items
+    } else if let fallbackNext = p.nextClassDayItems, !fallbackNext.isEmpty {
+      nextDayLabel = (p.nextClassDayLabel?.isEmpty == false ? p.nextClassDayLabel : nil) ?? "下个上课日"
+      nextDayRows = fallbackNext
+    } else {
+      nextDayLabel = ""
+      nextDayRows = []
+    }
+
+    // Recompute live per-row status against current wall clock
+    let liveTodayRows: [GdouWidgetCourseRow] = rawTodayRows.map { row in
+      let sMin = row.resolvedStartMin
+      let eMin = row.resolvedEndMin
+      let liveStatus: String
+      if sMin > 0 && eMin > 0 {
+        if nowMin >= eMin {
+          liveStatus = "finished"
+        } else if nowMin >= sMin {
+          liveStatus = "ongoing"
+        } else {
+          liveStatus = "upcoming"
+        }
+      } else {
+        liveStatus = row.status
+      }
+      return GdouWidgetCourseRow(
+        name: row.name,
+        location: row.location,
+        time: row.time,
+        sectionText: row.sectionText,
+        status: liveStatus,
+        startMin: sMin,
+        endMin: eMin
+      )
+    }
+
+    if !liveTodayRows.isEmpty {
+      if let ongoing = liveTodayRows.first(where: { $0.status == "ongoing" }) {
+        let minsLeft = max(1, ongoing.resolvedEndMin - nowMin)
+        let remaining = liveTodayRows.filter { $0.status != "finished" }
+        let rowsToShow = remaining.count >= 2 ? remaining : liveTodayRows
+        return GdouResolvedWidgetState(
+          hasSyncedData: true,
+          week: week,
+          weekdayLabel: weekday,
+          overrideBadge: badge,
+          headline: "上课中 · \\(ongoing.name)",
+          subline: "\\(ongoing.location) · \\(ongoing.sectionText) · 距下课 \\(minsLeft) 分钟",
+          activeRoom: ongoing.location,
+          rowsBanner: nil,
+          displayRows: rowsToShow,
+          nextExamTitle: nextExamTitle,
+          nextExamCountdown: nextExamCountdown
+        )
+      }
+      if let up = liveTodayRows.first(where: { $0.status == "upcoming" }) {
+        let minsUntil = max(1, up.resolvedStartMin - nowMin)
+        let remaining = liveTodayRows.filter { $0.status != "finished" }
+        let rowsToShow = remaining.count >= 2 ? remaining : liveTodayRows
+        let sub: String
+        if up.resolvedStartMin > 0 && nowMin < up.resolvedStartMin {
+          sub = "\\(up.location) · \\(up.sectionText) · 还有 \\(formatCountdown(minsUntil))"
+        } else {
+          sub = "\\(up.location) · \\(up.sectionText)"
+        }
+        return GdouResolvedWidgetState(
+          hasSyncedData: true,
+          week: week,
+          weekdayLabel: weekday,
+          overrideBadge: badge,
+          headline: "下节 \\(up.startTimeText) · \\(up.name)",
+          subline: sub,
+          activeRoom: up.location,
+          rowsBanner: nil,
+          displayRows: rowsToShow,
+          nextExamTitle: nextExamTitle,
+          nextExamCountdown: nextExamCountdown
+        )
+      }
+      // All today's classes finished -> automatically preview next teaching day's courses!
+      if !nextDayRows.isEmpty {
+        return GdouResolvedWidgetState(
+          hasSyncedData: true,
+          week: week,
+          weekdayLabel: weekday,
+          overrideBadge: badge,
+          headline: "今日 \\(liveTodayRows.count) 节课已结束",
+          subline: "下个上课日：\\(nextDayLabel)（共 \\(nextDayRows.count) 节）",
+          activeRoom: nextDayRows[0].location,
+          rowsBanner: "下个上课日 · \\(nextDayLabel)",
+          displayRows: nextDayRows,
+          nextExamTitle: nextExamTitle,
+          nextExamCountdown: nextExamCountdown
+        )
+      }
+      return GdouResolvedWidgetState(
+        hasSyncedData: true,
+        week: week,
+        weekdayLabel: weekday,
+        overrideBadge: badge,
+        headline: "今日 \\(liveTodayRows.count) 节课已结束",
+        subline: "今日课程已全部结束，好好休息",
+        activeRoom: "",
+        rowsBanner: nil,
+        displayRows: liveTodayRows,
+        nextExamTitle: nextExamTitle,
+        nextExamCountdown: nextExamCountdown
+      )
+    }
+
+    // No classes today: check if user hasn't synced any courses yet
+    if (p.totalCourseCount ?? -1) == 0 && nextDayRows.isEmpty && (p.todayItems ?? []).isEmpty {
+      return GdouResolvedWidgetState(
+        hasSyncedData: true,
+        week: week,
+        weekdayLabel: weekday,
+        overrideBadge: badge,
+        headline: "尚未同步课表",
+        subline: "点击打开海大课表，一步登录教务同步课程",
+        activeRoom: "",
+        rowsBanner: nil,
+        displayRows: [],
+        nextExamTitle: nextExamTitle,
+        nextExamCountdown: nextExamCountdown
+      )
+    }
+
+    if isHoliday {
+      let title = holidayLabel.isEmpty ? "法定节假日 · 今日停课" : "\\(holidayLabel) · 今日停课"
+      if !nextDayRows.isEmpty {
+        return GdouResolvedWidgetState(
+          hasSyncedData: true,
+          week: week,
+          weekdayLabel: weekday,
+          overrideBadge: badge,
+          headline: title,
+          subline: "下个上课日：\\(nextDayLabel)（共 \\(nextDayRows.count) 节）",
+          activeRoom: nextDayRows[0].location,
+          rowsBanner: "下个上课日 · \\(nextDayLabel)",
+          displayRows: nextDayRows,
+          nextExamTitle: nextExamTitle,
+          nextExamCountdown: nextExamCountdown
+        )
+      }
+      return GdouResolvedWidgetState(
+        hasSyncedData: true,
+        week: week,
+        weekdayLabel: weekday,
+        overrideBadge: badge,
+        headline: title,
+        subline: "祝假期愉快，可打开海大课表查看调休安排",
+        activeRoom: "",
+        rowsBanner: nil,
+        displayRows: [],
+        nextExamTitle: nextExamTitle,
+        nextExamCountdown: nextExamCountdown
+      )
+    }
+
+    if !nextDayRows.isEmpty {
+      return GdouResolvedWidgetState(
+        hasSyncedData: true,
+        week: week,
+        weekdayLabel: weekday,
+        overrideBadge: badge,
+        headline: "今日无排课",
+        subline: "下个上课日：\\(nextDayLabel)（共 \\(nextDayRows.count) 节）",
+        activeRoom: nextDayRows[0].location,
+        rowsBanner: "下个上课日 · \\(nextDayLabel)",
+        displayRows: nextDayRows,
+        nextExamTitle: nextExamTitle,
+        nextExamCountdown: nextExamCountdown
+      )
+    }
+
+    let staleFallbackRows = p.todayItems ?? []
+    return GdouResolvedWidgetState(
+      hasSyncedData: true,
+      week: week,
+      weekdayLabel: weekday,
+      overrideBadge: badge,
+      headline: (p.headline?.isEmpty == false ? p.headline : nil) ?? "今日无排课",
+      subline: (p.subline?.isEmpty == false ? p.subline : nil) ?? "点击打开海大课表查看本周安排",
+      activeRoom: p.activeCourseRoom ?? "",
+      rowsBanner: nil,
+      displayRows: staleFallbackRows,
+      nextExamTitle: nextExamTitle,
+      nextExamCountdown: nextExamCountdown
+    )
   }
 }
 
@@ -2865,7 +3973,13 @@ struct GdouScheduleProvider: TimelineProvider {
       }
     }
 
-    // 3. Final fallback to UserDefaults.standard
+    // 3. Shared Keychain channel (works on sideloaded builds even when App Group entitlements are absent!)
+    if let kcData = GdouWidgetKeychainStore.readSanitizedPayloadData(),
+       let decoded = try? decoder.decode(GdouWidgetPayload.self, from: kcData) {
+      return decoded
+    }
+
+    // 4. Final fallback to UserDefaults.standard
     if let raw = UserDefaults.standard.string(forKey: storageKey),
        let data = raw.data(using: .utf8),
        let decoded = try? decoder.decode(GdouWidgetPayload.self, from: data) {
@@ -2887,15 +4001,39 @@ struct GdouScheduleProvider: TimelineProvider {
   func getTimeline(in context: Context, completion: @escaping (Timeline<GdouScheduleEntry>) -> Void) {
     let now = Date()
     let payload = loadPayload()
-    let entry = GdouScheduleEntry(date: now, payload: payload, isPlaceholder: false)
-    let next15Min = Calendar.current.date(byAdding: .minute, value: 15, to: now) ?? now.addingTimeInterval(900)
-    let nextMidnight = Calendar.current.nextDate(
+    let cal = Calendar.current
+    let startOfToday = cal.startOfDay(for: now)
+
+    var dates: [Date] = [now]
+    if let p = payload {
+      let comps = cal.dateComponents([.year, .month, .day], from: now)
+      let todayStr = String(format: "%04d-%02d-%02d", comps.year ?? 2026, comps.month ?? 1, comps.day ?? 1)
+      let todaySnap = p.upcomingDays?.first(where: { $0.dateStr == todayStr })
+      let todayRows = todaySnap?.items ?? ((p.dateStr == nil || p.dateStr == todayStr) ? (p.todayItems ?? []) : [])
+      for row in todayRows {
+        for boundaryMin in [row.resolvedStartMin, row.resolvedEndMin] where boundaryMin > 0 {
+          if let boundaryDate = cal.date(byAdding: .minute, value: boundaryMin, to: startOfToday),
+             boundaryDate > now.addingTimeInterval(30) {
+            dates.append(boundaryDate)
+          }
+        }
+      }
+      if let tomorrowMidnight = cal.date(byAdding: .day, value: 1, to: startOfToday)?.addingTimeInterval(60),
+         tomorrowMidnight > now {
+        dates.append(tomorrowMidnight)
+      }
+    }
+
+    let sortedUnique = Array(Set(dates)).sorted().prefix(10)
+    let entries = sortedUnique.map { GdouScheduleEntry(date: $0, payload: payload, isPlaceholder: false) }
+    let next20Min = cal.date(byAdding: .minute, value: 20, to: now) ?? now.addingTimeInterval(1200)
+    let nextMidnight = cal.nextDate(
       after: now,
       matching: DateComponents(hour: 0, minute: 2),
       matchingPolicy: .nextTime
     )
-    let refreshDate = min(next15Min, nextMidnight ?? next15Min)
-    completion(Timeline(entries: [entry], policy: .after(refreshDate)))
+    let refreshDate = min(next20Min, nextMidnight ?? next20Min)
+    completion(Timeline(entries: entries.isEmpty ? [GdouScheduleEntry(date: now, payload: payload, isPlaceholder: false)] : entries, policy: .after(refreshDate)))
   }
 }
 
@@ -2939,16 +4077,20 @@ struct GdouScheduleWidgetEntryView: View {
   @Environment(\\.widgetFamily) private var family
   @Environment(\\.widgetRenderingMode) private var renderingMode
 
+  private func statusDotColor(_ status: String, isFullColor: Bool) -> Color {
+    if !isFullColor { return .primary }
+    switch status {
+    case "ongoing":
+      return Color(red: 0.29, green: 0.94, blue: 0.62)
+    case "finished":
+      return Color.white.opacity(0.38)
+    default:
+      return Color(red: 0.49, green: 0.85, blue: 1.0)
+    }
+  }
+
   var body: some View {
-    let p = entry.payload
-    let week = p?.week ?? 1
-    let weekday = p?.weekdayLabel ?? ""
-    let headline = (p?.headline?.isEmpty == false ? p?.headline : nil) ?? "海大课表"
-    let subline = (p?.subline?.isEmpty == false ? p?.subline : nil) ?? "打开海大课表同步今日课程"
-    let activeRoom = p?.activeCourseRoom ?? ""
-    let items = p?.todayItems ?? []
-    let nextExamTitle = p?.nextExamTitle ?? ""
-    let nextExamCountdown = p?.nextExamCountdown ?? ""
+    let resolved = GdouResolvedWidgetState.resolve(payload: entry.payload, at: entry.date)
     let isFullColor = (renderingMode == .fullColor) && (family != .accessoryRectangular)
 
     let accentColor: Color = isFullColor ? Color(red: 0.73, green: 0.90, blue: 0.99) : .primary
@@ -2959,27 +4101,38 @@ struct GdouScheduleWidgetEntryView: View {
     Group {
       if family == .accessoryRectangular {
         VStack(alignment: .leading, spacing: 2) {
-          Text("海大 第\\(week)周 \\(weekday)")
+          Text(resolved.hasSyncedData ? "海大 第\\(resolved.week)周 \\(resolved.weekdayLabel)" : "海大课表")
             .font(.caption2).bold()
             .lineLimit(1)
-          Text(headline)
+          Text(resolved.headline)
             .font(.caption).bold()
             .lineLimit(1)
-          Text(activeRoom.isEmpty ? subline : "@\\(activeRoom)")
-            .font(.caption2)
-            .foregroundColor(.secondary)
-            .lineLimit(1)
+          if let firstRow = resolved.displayRows.first, resolved.rowsBanner != nil {
+            Text("\\(firstRow.startTimeText) \\(firstRow.name) @\\(firstRow.location)")
+              .font(.caption2)
+              .foregroundColor(.secondary)
+              .lineLimit(1)
+          } else {
+            Text(resolved.activeRoom.isEmpty ? resolved.subline : "@\\(resolved.activeRoom)")
+              .font(.caption2)
+              .foregroundColor(.secondary)
+              .lineLimit(1)
+          }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
       } else {
-        VStack(alignment: .leading, spacing: family == .systemLarge ? 7 : 5) {
+        VStack(alignment: .leading, spacing: family == .systemLarge ? 6 : 4) {
           HStack(spacing: 4) {
-            Text(p == nil ? "海大课表 · 今日课程" : "海大课表 · 第\\(week)周 \\(weekday)")
+            Text(
+              resolved.hasSyncedData
+                ? "海大课表 · 第\\(resolved.week)周 \\(resolved.weekdayLabel)"
+                : "海大课表 · 今日课程"
+            )
               .font(.caption2).bold()
               .foregroundColor(accentColor)
               .lineLimit(1)
             Spacer(minLength: 4)
-            if let badge = p?.overrideBadge, !badge.isEmpty {
+            if let badge = resolved.overrideBadge, !badge.isEmpty {
               Text(badge)
                 .font(.system(size: 9, weight: .bold))
                 .padding(.horizontal, 5)
@@ -2990,13 +4143,13 @@ struct GdouScheduleWidgetEntryView: View {
             }
           }
 
-          Text(headline)
+          Text(resolved.headline)
             .font(family == .systemLarge ? .headline : .subheadline)
             .bold()
             .foregroundColor(primaryColor)
             .lineLimit(family == .systemSmall ? 2 : 1)
 
-          Text(subline)
+          Text(resolved.subline)
             .font(.caption2)
             .foregroundColor(secondaryColor)
             .lineLimit(family == .systemSmall ? 2 : 1)
@@ -3007,15 +4160,31 @@ struct GdouScheduleWidgetEntryView: View {
               .frame(height: 0.75)
               .padding(.vertical, 1)
 
-            if items.isEmpty {
-              Text(p == nil ? "点击打开海大课表，一键同步课表与考试" : "今日暂无排课，适合自习或休息")
+            if let banner = resolved.rowsBanner, !banner.isEmpty, !resolved.displayRows.isEmpty {
+              Text(banner)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(accentColor)
+                .lineLimit(1)
+            }
+
+            if resolved.displayRows.isEmpty {
+              Text(
+                resolved.hasSyncedData
+                  ? "近期暂无排课，点击打开海大课表查看全部周次"
+                  : "点击打开海大课表，一步登录教务同步课表与考试"
+              )
                 .font(.caption2)
                 .foregroundColor(secondaryColor)
                 .lineLimit(2)
             } else {
-              let maxRows = family == .systemLarge ? 6 : 3
-              ForEach(Array(items.prefix(maxRows)), id: \\.self) { row in
-                HStack(spacing: 6) {
+              let maxRows = family == .systemLarge
+                ? (resolved.rowsBanner == nil ? 6 : 5)
+                : (resolved.rowsBanner == nil ? 3 : 2)
+              ForEach(Array(resolved.displayRows.prefix(maxRows).enumerated()), id: \\.offset) { _, row in
+                HStack(spacing: 5) {
+                  Circle()
+                    .fill(statusDotColor(row.status, isFullColor: isFullColor))
+                    .frame(width: 5, height: 5)
                   Text(row.time)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .foregroundColor(accentColor)
@@ -3032,7 +4201,7 @@ struct GdouScheduleWidgetEntryView: View {
               }
             }
 
-            if family == .systemLarge && !nextExamTitle.isEmpty && !nextExamCountdown.isEmpty {
+            if family == .systemLarge && !resolved.nextExamTitle.isEmpty && !resolved.nextExamCountdown.isEmpty {
               Spacer(minLength: 4)
               HStack(spacing: 6) {
                 Text("近期考试")
@@ -3042,24 +4211,62 @@ struct GdouScheduleWidgetEntryView: View {
                   .background(isFullColor ? Color.white.opacity(0.18) : Color.primary.opacity(0.12))
                   .foregroundColor(primaryColor)
                   .cornerRadius(5)
-                Text("\\(nextExamTitle) · \\(nextExamCountdown)")
+                Text("\\(resolved.nextExamTitle) · \\(resolved.nextExamCountdown)")
                   .font(.caption2).bold()
                   .foregroundColor(accentColor)
                   .lineLimit(1)
               }
             }
-          } else if !activeRoom.isEmpty {
-            Spacer(minLength: 2)
-            Text("@\\(activeRoom)")
-              .font(.caption).bold()
-              .foregroundColor(accentColor)
-              .lineLimit(1)
-          } else if !nextExamTitle.isEmpty && !nextExamCountdown.isEmpty {
-            Spacer(minLength: 2)
-            Text("考: \\(nextExamTitle) (\\(nextExamCountdown))")
-              .font(.caption2)
-              .foregroundColor(accentColor)
-              .lineLimit(1)
+          } else {
+            // systemSmall: show next teaching day's first class on free/done days, or follow-up class / room on active days
+            if let firstRow = resolved.displayRows.first, resolved.rowsBanner != nil {
+              Spacer(minLength: 2)
+              Rectangle()
+                .fill(dividerColor)
+                .frame(height: 0.75)
+              VStack(alignment: .leading, spacing: 2) {
+                Text("\\(firstRow.startTimeText) · \\(firstRow.name)")
+                  .font(.caption2).bold()
+                  .foregroundColor(primaryColor)
+                  .lineLimit(1)
+                if !firstRow.location.isEmpty {
+                  Text("@\\(firstRow.location)")
+                    .font(.caption2).bold()
+                    .foregroundColor(accentColor)
+                    .lineLimit(1)
+                }
+              }
+            } else if resolved.displayRows.count >= 2 {
+              let nextRow = resolved.displayRows[1]
+              Spacer(minLength: 2)
+              Rectangle()
+                .fill(dividerColor)
+                .frame(height: 0.75)
+              VStack(alignment: .leading, spacing: 2) {
+                Text("随后 \\(nextRow.startTimeText) · \\(nextRow.name)")
+                  .font(.caption2).bold()
+                  .foregroundColor(primaryColor)
+                  .lineLimit(1)
+                if !nextRow.location.isEmpty {
+                  Text("@\\(nextRow.location)")
+                    .font(.caption2)
+                    .foregroundColor(accentColor)
+                    .lineLimit(1)
+                }
+              }
+            } else if !resolved.activeRoom.isEmpty {
+              Spacer(minLength: 2)
+              Text("@\\(resolved.activeRoom)")
+                .font(.caption).bold()
+                .foregroundColor(accentColor)
+                .lineLimit(1)
+            } else if !resolved.nextExamTitle.isEmpty && !resolved.nextExamCountdown.isEmpty {
+              Spacer(minLength: 2)
+              Text("考: \\(resolved.nextExamTitle) (\\(resolved.nextExamCountdown))")
+                .font(.caption2)
+                .foregroundColor(accentColor)
+                .lineLimit(1)
+            }
           }
 
           Spacer(minLength: 0)

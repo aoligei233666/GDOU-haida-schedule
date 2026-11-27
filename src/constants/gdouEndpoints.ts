@@ -257,8 +257,31 @@ export function normalizeWfwAuthUrl(rawUrl: string): string | null {
   const match = trimmed.match(
     /^https?:\/\/wfw\.gdou\.edu\.cn\/https?:\/\/(?:authserver|jw)\.gdou\.edu\.cn(\/authserver\/.*)$/i
   );
-  if (!match) return null;
-  return `${GDOU_WFW_ORIGIN}${match[1]}`;
+  if (match) {
+    return `${GDOU_WFW_ORIGIN}${match[1]}`;
+  }
+  return null;
+}
+
+/**
+ * When off-campus WebVPN (`wfw.gdou.edu.cn`) 1-step auth is active, keep bare
+ * `http(s)://authserver.gdou.edu.cn/authserver/...` redirects/tabs inside
+ * `https://wfw.gdou.edu.cn/authserver/...` so `WFWSESSID` and `Path=/authserver`
+ * `JSESSIONID`/`route` cookies remain attached throughout login, SMS dynamic login, and MFA.
+ */
+export function keepAuthInsideWfw(rawUrl: string, isOffCampusWfw = false): string | null {
+  if (!isOffCampusWfw) return null;
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return null;
+  const bareAuthMatch = trimmed.match(
+    /^https?:\/\/authserver\.gdou\.edu\.cn(?::(?:80|443))?(\/authserver\/.*)$/i
+  );
+  if (!bareAuthMatch) return null;
+  // Do not rewrite explicit outer wfw-root portal ticket requests
+  if (trimmed.includes(encodeURIComponent(`${GDOU_WFW_ORIGIN}/`))) {
+    return null;
+  }
+  return `${GDOU_WFW_ORIGIN}${bareAuthMatch[1]}`;
 }
 
 /**

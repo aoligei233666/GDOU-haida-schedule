@@ -14,11 +14,12 @@ import {
 
 /**
  * Bump ONLY when native Swift / Kotlin / Pod / Gradle dependencies break JS ABI compatibility.
- * v2: adds fixed iOS WidgetKit containerBackground + dynamic App Group discovery + StoreKit in-app sheet.
+ * v3: adds iOS Shared Keychain widget transport (works without App Group entitlements on sideloaded builds),
+ *     parent `.app` bundle ID discovery, 7-day rolling native widget schedule & wfw `/authserver` redirect preservation.
  * Pure JS/TS/UI releases keep the same `NATIVE_OTA_RUNTIME_VERSION` so iOS & Android users
  * can hot-update directly inside the app without re-signing or computer!
  */
-export const NATIVE_OTA_RUNTIME_VERSION = 2;
+export const NATIVE_OTA_RUNTIME_VERSION = 3;
 
 const OTA_DIR_NAME = 'gdou-ota';
 const ACTIVE_STATE_FILE = 'active-ota.json';

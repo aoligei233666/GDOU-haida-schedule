@@ -228,7 +228,7 @@ function MainApp() {
     return () => sub.remove();
   }, [ready, appData.courses, appData.exams, appData.settings, appData.termLabel]);
 
-  // Silent EMS-style startup version check: automatically presents centered InAppUpdateModal
+  // Silent startup version check: automatically presents centered InAppUpdateModal
   // when a newer release is published (never blocks startup or pops errors when offline).
   useEffect(() => {
     if (!ready || autoUpdateCheckedRef.current) return;
@@ -550,18 +550,22 @@ function MainApp() {
       appData.settings,
       appData.termLabel
     );
-    const iosGroupNote =
-      Platform.OS === 'ios' && res.widgetSynced && res.appGroupAccessible === false
-        ? '\n\n⚠️ 检测到当前侧载签名未授予 App Group 共享容器，桌面小组件可能只能显示默认占位内容；建议覆盖安装最新 v1.5.1 IPA（已内置 App Group 权限）并使用 SideStore / TrollStore / 保留权限的重签方式安装，然后移除旧挂件重新添加。'
-        : Platform.OS === 'ios' && res.widgetSynced && res.appGroupAccessible
-          ? `\nApp Group 共享容器：已连通 (${res.widgetSuite || 'group'})`
-          : '';
+    const iosChannelNote =
+      Platform.OS === 'ios' && res.widgetSynced
+        ? res.appGroupAccessible
+          ? `\nApp Group 共享容器：已连通 (${res.widgetSuite || 'group'})${
+              res.keychainAccessible ? '\n共享钥匙串双通道：已同步' : ''
+            }`
+          : res.keychainAccessible
+            ? `\n共享钥匙串通道：已连通（无需 App Group，兼容侧载签名）`
+            : '\n\n⚠️ 当前签名未授予 App Group 且共享钥匙串不可用，桌面小组件可能无法读取课程；请覆盖安装最新 v1.5.2 IPA 并移除旧挂件重新添加。'
+        : '';
     Alert.alert(
       '桌面小组件与实时状态已刷新',
-      `桌面小组件推送：${res.widgetSynced ? '已同步' : '需安装含原生组件的新版安装包'}\n` +
+      `桌面小组件推送：${res.widgetSynced ? '已同步（含未来 7 天滚动课表）' : '需安装含原生组件的新版安装包'}\n` +
         `常驻通知 / 灵动岛：${
           res.ongoingSynced || res.liveActivitySynced ? '已更新' : '未开启或待新版原生底座生效'
-        }${iosGroupNote}`
+        }${iosChannelNote}`
     );
   };
 

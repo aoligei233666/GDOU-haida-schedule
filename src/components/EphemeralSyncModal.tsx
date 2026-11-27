@@ -19,12 +19,12 @@ import {
   extractSafeHostname,
   GDOU_AUTH_ORIGIN,
   GDOU_AUTH_PATHS,
-  GDOU_AUTH_WFW_BASE,
   GDOU_JW_SSO_SERVICE,
   GDOU_WFW_ORIGIN,
   healWfwWrongSsoUrl,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
+  keepAuthInsideWfw,
   normalizeWfwAuthUrl,
   upgradeGdouHttpToHttps,
 } from '../constants/gdouEndpoints';
@@ -144,7 +144,7 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const [probingWebViewRoute, setProbingWebViewRoute] = useState(false);
   const [bridgeToken, setBridgeToken] = useState<string>(() => generateSecureHex(16));
   const [webViewStatus, setWebViewStatus] = useState(
-    '只需认证一次：支持短信免密 / 企微扫码 / 账号密码（用完即删，自动同步）'
+    '一步直通教务：支持短信验证码免密 / 账号密码（用完即删，自动同步）'
   );
 
   const webViewRef = useRef<WebView<object> | null>(null);
@@ -297,20 +297,20 @@ export const EphemeralSyncModal: React.FC<Props> = ({
   const ensureWebViewRouteProbed = async () => {
     if (routePrefRef.current === 'wfw') {
       setProbedWebViewIsVpn(true);
-      setWebViewStatus('第 1 步（校外微门户）：请完成海大统一身份认证');
+      setWebViewStatus('校外一步直通：只需登录一次（支持短信免密 / 账号密码），自动同步');
       return;
     }
     if (routePrefRef.current === 'campus') {
       setProbedWebViewIsVpn(false);
-      setWebViewStatus('第 1 步（校园网直连）：请完成海大统一身份认证');
+      setWebViewStatus('校园网直连：请完成海大统一身份认证，通过后自动同步');
       return;
     }
     if (session !== null) {
       setProbedWebViewIsVpn(session.isWebVpn);
       setWebViewStatus(
         session.isWebVpn
-          ? '第 1 步（校外微门户）：请完成海大统一身份认证'
-          : '第 1 步（校园网直连）：请完成海大统一身份认证'
+          ? '校外一步直通：只需登录一次（支持短信免密 / 账号密码），自动同步'
+          : '校园网直连：请完成海大统一身份认证，通过后自动同步'
       );
       return;
     }
@@ -321,13 +321,13 @@ export const EphemeralSyncModal: React.FC<Props> = ({
       setProbedWebViewIsVpn(res.isWebVpn);
       setWebViewStatus(
         res.isWebVpn
-          ? '第 1 步（校外微门户）：请完成海大统一身份认证'
-          : '第 1 步（校园网直连）：请完成海大统一身份认证'
+          ? '校外一步直通：只需登录一次（支持短信免密 / 账号密码），自动同步'
+          : '校园网直连：请完成海大统一身份认证，通过后自动同步'
       );
     } catch {
       // Fall back safely to off-campus WebVPN entry if probe fails
       setProbedWebViewIsVpn(true);
-      setWebViewStatus('第 1 步：请完成海大统一身份认证（如在校园网可点上方切换“校园网直连”）');
+      setWebViewStatus('校外一步直通：只需登录一次（如在校园网可点上方切换“校园网直连”）');
     } finally {
       setProbingWebViewRoute(false);
     }
@@ -1053,15 +1053,18 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     [webViewRoutePref, probedWebViewIsVpn]
   );
 
-  const expectedWebViewServiceUrl = useMemo(() => {
-    return useCampusWebView ? GDOU_JW_SSO_SERVICE : `${GDOU_WFW_ORIGIN}/`;
-  }, [useCampusWebView]);
+  // TRUE 1-STEP LOGIN: Both off-campus (`wfw.gdou.edu.cn/authserver/login`) and campus-direct
+  // (`authserver.gdou.edu.cn/authserver/login`) authenticate directly for `GDOU_JW_SSO_SERVICE`
+  // in ONE single login, skipping the separate `wfw.gdou.edu.cn/` micro-portal detour completely!
+  const expectedWebViewServiceUrl = GDOU_JW_SSO_SERVICE;
 
   const effectiveWebViewUrl = useMemo(() => {
-    return `${GDOU_AUTH_ORIGIN}${GDOU_AUTH_PATHS.login}?service=${encodeURIComponent(
+    const authBase = useCampusWebView ? GDOU_AUTH_ORIGIN : GDOU_WFW_ORIGIN;
+    const typeParam = preferSmsLogin ? 'type=dynamicLogin&' : '';
+    return `${authBase}${GDOU_AUTH_PATHS.login}?${typeParam}service=${encodeURIComponent(
       expectedWebViewServiceUrl
     )}`;
-  }, [expectedWebViewServiceUrl]);
+  }, [useCampusWebView, preferSmsLogin, expectedWebViewServiceUrl]);
 
   // Keep source object strictly memoized per session so React/Fabric NEVER mutates `source` mid-login
   const initialWebViewSource = useMemo(
@@ -1085,18 +1088,25 @@ export const EphemeralSyncModal: React.FC<Props> = ({
     [xnmOverride, xqmOverride, bridgeToken, expectedWebViewServiceUrl, syncJob, preferSmsLogin]
   );
 
-  const reloadWebView = (nextPref?: WebViewRoutePref) => {
+  const reloadWebView = (nextPref?: WebViewRoutePref, nextPreferSms?: boolean) => {
     clearPendingWebViewRedirectTimer();
+    const resolvedSms = typeof nextPreferSms === 'boolean' ? nextPreferSms : preferSmsLogin;
+    if (typeof nextPreferSms === 'boolean') {
+      setPreferSmsLogin(nextPreferSms);
+    }
+    const resolvedPref = nextPref ?? webViewRoutePref;
     if (nextPref) {
       routePrefRef.current = nextPref;
       setWebViewRoutePref(nextPref);
-      if (nextPref === 'wfw') {
-        setWebViewStatus('第 1 步（校外微门户）：请完成海大统一身份认证');
-      } else if (nextPref === 'campus') {
-        setWebViewStatus('第 1 步（校园网直连）：请完成海大统一身份认证');
-      } else {
-        setWebViewStatus('第 1 步：请完成海大统一身份认证（自动探测通道）');
-      }
+    }
+    if (resolvedSms) {
+      setWebViewStatus('短信免密一步直通：输入手机号获取短信验证码，通过后自动拉取教务');
+    } else if (resolvedPref === 'wfw') {
+      setWebViewStatus('校外一步直通：只需登录一次（支持短信免密 / 账号密码），自动同步');
+    } else if (resolvedPref === 'campus') {
+      setWebViewStatus('校园网直连：请完成海大统一身份认证，通过后自动同步');
+    } else {
+      setWebViewStatus('一步直通教务：请完成海大统一身份认证（自动探测通道）');
     }
     setErrorText(null);
     lastRedirectRewriteRef.current = { url: '', ts: 0 };
@@ -1135,9 +1145,9 @@ export const EphemeralSyncModal: React.FC<Props> = ({
           <View style={styles.privacyBanner}>
             <Ionicons name="shield-checkmark" size={18} color={COLORS.emerald} />
             <View style={styles.privacyTextWrap}>
-              <Text style={styles.privacyTitle}>单次登录免密直通 · 凭据用完即删</Text>
+              <Text style={styles.privacyTitle}>一步直通教务 · 凭据用完即删</Text>
               <Text style={styles.privacyDesc}>
-                校内 / 校外均只需输一次密码（自动复用统一认证票据），双端纯内存隔离，同步完自动校验注销。
+                校外跳过微门户二次跳转，一步直签教务系统（支持手机短信免密）；双端纯内存隔离，同步完自动校验注销。
               </Text>
             </View>
           </View>
@@ -1161,18 +1171,19 @@ export const EphemeralSyncModal: React.FC<Props> = ({
               style={[styles.modeTabText, mode === 'direct' && styles.modeTabTextActive]}
               numberOfLines={1}
             >
-              极速直连（仅输一次）
+              极速直连（一步直通）
             </Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.modeTab, mode === 'webview' && styles.modeTabActive]}
             onPress={() => {
-              setPreferSmsLogin(false);
+              setPreferSmsLogin(true);
+              setWebViewStatus('短信免密一步直通：输入手机号获取短信验证码，通过后自动拉取教务');
               setMode('webview');
             }}
           >
             <Ionicons
-              name="globe-outline"
+              name="chatbox-ellipses-outline"
               size={15}
               color={mode === 'webview' ? COLORS.white : COLORS.textSecondary}
             />
@@ -1638,17 +1649,18 @@ export const EphemeralSyncModal: React.FC<Props> = ({
               style={styles.fallbackHint}
               onPress={() => {
                 setPreferSmsLogin(true);
+                setWebViewStatus('短信免密一步直通：输入手机号获取短信验证码，通过后自动拉取教务');
                 setMode('webview');
               }}
             >
               <Text style={styles.fallbackHintText}>
-                不想输密码？一键切到「手机短信验证码免密 / 企微扫码」登录（同样只需验证一次） →
+                不想输密码？一键切到「手机短信验证码免密」一步直通登录 →
               </Text>
             </TouchableOpacity>
           </ScrollView>
         ) : (
           <View style={styles.webViewWrap}>
-            {/* Route selector for campus-direct vs off-campus WebVPN */}
+            {/* Route selector for campus-direct vs off-campus WebVPN + 1-tap SMS / Password toggle */}
             <View style={styles.webViewRouteBar}>
               {(
                 [
@@ -1678,6 +1690,17 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   </TouchableOpacity>
                 );
               })}
+              <TouchableOpacity
+                style={[styles.smsTogglePill, preferSmsLogin && styles.smsTogglePillActive]}
+                onPress={() => reloadWebView(undefined, !preferSmsLogin)}
+              >
+                <Text
+                  style={[styles.smsToggleText, preferSmsLogin && styles.smsToggleTextActive]}
+                  numberOfLines={1}
+                >
+                  {preferSmsLogin ? '短信免密✓' : '切短信免密'}
+                </Text>
+              </TouchableOpacity>
             </View>
 
             <View style={styles.webViewStatusBar}>
@@ -1749,41 +1772,28 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   }
 
                   // 1) Seamlessly upgrade GDOU server cleartext redirects (e.g. http://authserver.gdou.edu.cn/authserver/reAuthCheck/...) to HTTPS
-                  // 2) Heal wrong off-campus wfw SSO paths & bare jw.gdou.edu.cn callbacks (post-Step-2 ticket -> wfw/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=...)
-                  // 3) Keep Step-2 authserver redirects inside wfw.gdou.edu.cn/authserver/... and normalize ONLY once urlss=authserver is active
+                  // 2) Heal wrong off-campus wfw SSO paths & bare jw.gdou.edu.cn callbacks (ticket -> wfw/https://jw.gdou.edu.cn/sso/jziotlogin?ticket=...)
+                  // 3) Keep ALL off-campus authserver tabs/redirects/MFA inside wfw.gdou.edu.cn/authserver/... in a single step
                   const upgradedHttps = upgradeGdouHttpToHttps(req.url);
                   const afterUpgrade = upgradedHttps ?? req.url;
                   const curUrl = webViewCurrentUrlRef.current || '';
                   const isCurrentlyOnWfw = curUrl.includes('wfw.gdou.edu.cn');
-                  const healedWfwSso = healWfwWrongSsoUrl(
-                    afterUpgrade,
-                    !useCampusWebView || isCurrentlyOnWfw
+                  const useWfwOffCampus = !useCampusWebView || isCurrentlyOnWfw;
+                  const healedWfwSso = healWfwWrongSsoUrl(afterUpgrade, useWfwOffCampus);
+                  const keptInWfwAuth = keepAuthInsideWfw(
+                    healedWfwSso ?? afterUpgrade,
+                    useWfwOffCampus
                   );
-                  const isCurrentlyInWfwAuth =
-                    curUrl.startsWith(`${GDOU_WFW_ORIGIN}/authserver/`) ||
-                    curUrl.includes(`${GDOU_WFW_ORIGIN}/https://authserver.gdou.edu.cn/authserver/`);
-                  let keptInWfwAuth: string | null = null;
-                  if (!useCampusWebView && isCurrentlyInWfwAuth) {
-                    const bareStep2Auth = afterUpgrade.match(
-                      /^https:\/\/authserver\.gdou\.edu\.cn(\/authserver\/(?:reAuthCheck|dynamicCode|login).*)$/i
-                    );
-                    if (
-                      bareStep2Auth &&
-                      !afterUpgrade.includes(encodeURIComponent(`${GDOU_WFW_ORIGIN}/`))
-                    ) {
-                      keptInWfwAuth = `${GDOU_WFW_ORIGIN}${bareStep2Auth[1]}`;
-                    }
-                  }
-                  const normalizedWfw = isCurrentlyInWfwAuth
+                  const normalizedWfw = useWfwOffCampus
                     ? normalizeWfwAuthUrl(keptInWfwAuth ?? healedWfwSso ?? afterUpgrade)
                     : null;
                   if (upgradedHttps || healedWfwSso || keptInWfwAuth || normalizedWfw) {
                     const rawTarget =
                       normalizedWfw ?? keptInWfwAuth ?? healedWfwSso ?? upgradedHttps!;
-                    const fallbackService = rawTarget.includes('wfw.gdou.edu.cn')
-                      ? GDOU_JW_SSO_SERVICE
-                      : expectedWebViewServiceUrl;
-                    const targetUrl = ensureAuthLoginServiceParam(rawTarget, fallbackService);
+                    const targetUrl = ensureAuthLoginServiceParam(
+                      rawTarget,
+                      expectedWebViewServiceUrl
+                    );
                     const nowTs = Date.now();
                     if (
                       lastRedirectRewriteRef.current.url !== targetUrl ||
@@ -1794,7 +1804,9 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                       if (targetUrl.includes('reAuthLoginView')) {
                         setWebViewStatus('请完成海大多因子二次安全验证（短信 / 企业微信）');
                       } else if (targetUrl.includes('jziotlogin') && targetUrl.includes('ticket=')) {
-                        setWebViewStatus('统一认证票据已自动复用，正在免密直通教务系统...');
+                        setWebViewStatus('统一认证已通过，正在一步直通教务系统拉取课表...');
+                      } else if (targetUrl.includes('type=dynamicLogin')) {
+                        setWebViewStatus('短信免密一步直通：请输入手机号并获取短信验证码');
                       }
                       // Let WKNavigationActionPolicyCancel settle first; navigate via JS location.replace without mutating `source` prop
                       scheduleWebViewLocationReplace(targetUrl);
@@ -1816,13 +1828,22 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   if (!startUrl) return;
                   webViewCurrentUrlRef.current = startUrl;
                   // Android WebView `shouldOverrideUrlLoading` has a 250ms JS-lock timeout.
-                  // If a bare `jw.gdou.edu.cn` or cleartext redirect slips through during off-campus login,
-                  // intercept immediately onLoadStart instead of waiting 30s for ERR_CONNECTION_TIMED_OUT.
+                  // If a bare `jw.gdou.edu.cn`, bare `authserver.gdou.edu.cn`, or cleartext redirect
+                  // slips through during off-campus 1-step login, intercept immediately onLoadStart.
                   const upgraded = upgradeGdouHttpToHttps(startUrl);
                   const afterUpgrade = upgraded ?? startUrl;
-                  const healed = healWfwWrongSsoUrl(afterUpgrade, !useCampusWebView);
-                  const target = healed ?? upgraded;
-                  if (target) {
+                  const useWfwOffCampus = !useCampusWebView;
+                  const healed = healWfwWrongSsoUrl(afterUpgrade, useWfwOffCampus);
+                  const kept = keepAuthInsideWfw(healed ?? afterUpgrade, useWfwOffCampus);
+                  const normalized = useWfwOffCampus
+                    ? normalizeWfwAuthUrl(kept ?? healed ?? afterUpgrade)
+                    : null;
+                  const rawTarget = normalized ?? kept ?? healed ?? upgraded;
+                  if (rawTarget) {
+                    const target = ensureAuthLoginServiceParam(
+                      rawTarget,
+                      expectedWebViewServiceUrl
+                    );
                     const nowTs = Date.now();
                     if (
                       lastRedirectRewriteRef.current.url !== target ||
@@ -1859,9 +1880,15 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                     /TIMED?_?OUT|TIMEOUT|ERR_CONNECTION_TIMED_OUT|ERR_ADDRESS_UNREACHABLE/i.test(
                       description || ''
                     );
-                  const healed = healWfwWrongSsoUrl(afterUpgrade, !useCampusWebView || isTimeoutErr);
-                  const recoveryTarget = healed ?? upgraded;
-                  if (recoveryTarget) {
+                  const useWfwRecovery = !useCampusWebView || isTimeoutErr;
+                  const healed = healWfwWrongSsoUrl(afterUpgrade, useWfwRecovery);
+                  const kept = keepAuthInsideWfw(healed ?? afterUpgrade, useWfwRecovery);
+                  const rawRecovery = kept ?? healed ?? upgraded;
+                  if (rawRecovery) {
+                    const recoveryTarget = ensureAuthLoginServiceParam(
+                      rawRecovery,
+                      expectedWebViewServiceUrl
+                    );
                     event.preventDefault();
                     const nowTs = Date.now();
                     if (
@@ -1870,8 +1897,8 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                     ) {
                       lastRedirectRewriteRef.current = { url: recoveryTarget, ts: nowTs };
                       setErrorText(null);
-                      if (healed && useCampusWebView) {
-                        setWebViewStatus('校园网直连超时，已自动切入校外微门户继续登录...');
+                      if ((healed || kept) && useCampusWebView) {
+                        setWebViewStatus('校园网直连超时，已自动切入校外微门户一步直通...');
                       }
                       scheduleWebViewLocationReplace(recoveryTarget);
                     }
@@ -1898,12 +1925,14 @@ export const EphemeralSyncModal: React.FC<Props> = ({
                   const rawUrl = url || '';
                   if (statusCode === 404 && rawUrl.includes('wfw.gdou.edu.cn')) {
                     const healed = healWfwWrongSsoUrl(rawUrl, !useCampusWebView);
+                    const normalized = normalizeWfwAuthUrl(healed ?? rawUrl);
                     const recoveryTarget =
+                      normalized ??
                       healed ??
                       (rawUrl.includes('/authserver/')
-                        ? `${GDOU_AUTH_WFW_BASE}/authserver/login?service=${encodeURIComponent(
-                            GDOU_JW_SSO_SERVICE
-                          )}`
+                        ? `${GDOU_WFW_ORIGIN}${GDOU_AUTH_PATHS.login}?${
+                            preferSmsLogin ? 'type=dynamicLogin&' : ''
+                          }service=${encodeURIComponent(GDOU_JW_SSO_SERVICE)}`
                         : null);
                     if (recoveryTarget) {
                       const nowTs = Date.now();
@@ -2320,6 +2349,29 @@ const styles = StyleSheet.create({
   },
   routePillTextActive: {
     color: COLORS.oceanPrimary,
+    fontWeight: '700',
+  },
+  smsTogglePill: {
+    paddingVertical: 5,
+    paddingHorizontal: 9,
+    borderRadius: 8,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  smsTogglePillActive: {
+    backgroundColor: COLORS.emeraldLight,
+    borderColor: COLORS.emerald,
+  },
+  smsToggleText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: COLORS.textSecondary,
+  },
+  smsToggleTextActive: {
+    color: '#065F46',
     fontWeight: '700',
   },
   webViewStatusBar: {

@@ -11,9 +11,11 @@ import {
   GDOU_AUTH_WFW_BASE,
   GDOU_JW_SSO_SERVICE,
   GDOU_JW_WFW_SSO_SERVICE,
+  GDOU_WFW_ORIGIN,
   healWfwWrongSsoUrl,
   isAllowedWebViewNavigationUrl,
   isTrustedWebViewMessageUrl,
+  keepAuthInsideWfw,
   normalizeWfwAuthUrl,
   upgradeGdouHttpToHttps,
 } from '../src/constants/gdouEndpoints';
@@ -41,6 +43,7 @@ import {
   buildIncognitoWebViewSyncScript,
   checkGdouCaptcha,
   completeWfwSubAuthAndSync,
+  executeOneShotGdouSync,
   fetchWithTimeout,
   isAccountLockedMessage,
   isNativeMobileRuntime,
@@ -51,6 +54,7 @@ import {
   probeGdouNetworkRoute,
   submitGdouMfaAndCompleteSync,
 } from '../src/services/gdouAuth';
+import { buildNativeWidgetPayload } from '../src/services/widgetPayloadBuilder';
 import {
   buildGdouCalendarCountdowns,
   buildTodayLiveSnapshot,
@@ -739,27 +743,127 @@ async function run() {
       'Unreachable bare jw.gdou.edu.cn must override netcheck and fall back to wfw'
     );
 
-    // Explicit routePref='wfw' skips netcheck completely
+    // Explicit routePref='wfw' skips netcheck completely AND opens TRUE 1-step wfw.gdou.edu.cn/authserver/login
+    // targeting GDOU_JW_SSO_SERVICE directly (zero wfw.gdou.edu.cn/ micro-portal detour!)
     let netcheckTouched = false;
-    globalThis.fetch = (async (input: unknown) => {
+    let observedDirectWfwInitUrl = '';
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('netcheck.gdou.edu.cn')) {
         netcheckTouched = true;
         throw new Error('netcheck should be skipped when routePref=wfw');
       }
-      if (url.startsWith('https://authserver.gdou.edu.cn/authserver/login')) {
+      if (url.startsWith(`${GDOU_WFW_ORIGIN}/authserver/login`) && (!init?.method || init.method === 'GET')) {
+        observedDirectWfwInitUrl = url;
         return makeMockResponse(
           200,
           '<input id="pwdEncryptSalt" value="DirectWfwSalt123"/><input name="execution" value="e9s1"/>',
           url
         );
       }
+      if (url.startsWith(`${GDOU_WFW_ORIGIN}/authserver/login`) && init?.method === 'POST') {
+        return {
+          ok: false,
+          status: 302,
+          url,
+          headers: new Headers({
+            location: `${GDOU_JW_SSO_SERVICE}?ticket=ST-TRUE-1STEP-777`,
+          }),
+          text: async () => '',
+        } as unknown as Response;
+      }
+      if (url === `${GDOU_JW_WFW_SSO_SERVICE}?ticket=ST-TRUE-1STEP-777`) {
+        return makeMockResponse(
+          200,
+          '<html><body>教学管理信息服务平台 index_initMenu</body></html>',
+          'https://wfw.gdou.edu.cn/https://jw.gdou.edu.cn/xtgl/index_initMenu.html'
+        );
+      }
+      if (url.includes('xskbcx_cxXskbcxIndex.html')) {
+        return makeMockResponse(
+          200,
+          '<select id="xnm"><option value="2026" selected>2026</option></select><select id="xqm"><option value="3" selected>1</option></select>',
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxXsgrkb.html')) {
+        return makeMockResponse(
+          200,
+          JSON.stringify({
+            kbList: [{ kcmc: '一步直通教务验证课', xqj: '1', jcs: '1-2', zcd: '1-16周', xqh_id: '1', xqmc: '湖光校区' }],
+          }),
+          url
+        );
+      }
+      if (url.includes('xskbcx_cxRjc.html')) {
+        return makeMockResponse(200, JSON.stringify([]), url);
+      }
+      if (url.includes('kscx_cxXsksxx') || url.includes('cjcx_cx')) {
+        return makeMockResponse(200, JSON.stringify({ items: [] }), url);
+      }
       return makeMockResponse(200, 'ok', url);
     }) as typeof fetch;
     const forcedWfwSession = await prepareGdouAuthSession({ routePref: 'wfw' });
     assert.equal(netcheckTouched, false, 'Explicit routePref=wfw must skip netcheck');
     assert.equal(forcedWfwSession.isWebVpn, true);
+    assert.equal(forcedWfwSession.authOrigin, GDOU_WFW_ORIGIN, 'Off-campus 1-step login must authenticate on wfw.gdou.edu.cn directly');
+    assert.equal(forcedWfwSession.serviceUrl, GDOU_JW_SSO_SERVICE, 'Off-campus 1-step login must target GDOU_JW_SSO_SERVICE directly');
+    assert.ok(
+      observedDirectWfwInitUrl.includes(encodeURIComponent(GDOU_JW_SSO_SERVICE)),
+      'Off-campus 1-step GET must pass jw.gdou.edu.cn/sso/jziotlogin service param'
+    );
     assert.equal(forcedWfwSession.pwdEncryptSalt, 'DirectWfwSalt123');
+
+    const oneStepCreds: EphemeralCredentials = { username: 'TEST_STUDENT_001', password: 'TempPassword123' };
+    const oneStepOutcome = await executeOneShotGdouSync(forcedWfwSession, oneStepCreds);
+    assert.equal(areCredentialsPurged(oneStepCreds), true, '1-step credentials must be purged');
+    assert.equal(oneStepOutcome.status, 'completed', 'True 1-step off-campus sync must complete directly in ONE login');
+    if (oneStepOutcome.status === 'completed') {
+      assert.equal(oneStepOutcome.result.courses[0]?.name, '一步直通教务验证课');
+      assert.equal(oneStepOutcome.result.receipt.sessionLoggedOut, true);
+    }
+
+    // 3g. Verify keepAuthInsideWfw helper keeps mobile SMS tabs & MFA redirects inside wfw.gdou.edu.cn/authserver
+    assert.equal(
+      keepAuthInsideWfw('https://authserver.gdou.edu.cn/authserver/login?type=dynamicLogin', true),
+      'https://wfw.gdou.edu.cn/authserver/login?type=dynamicLogin'
+    );
+    assert.equal(
+      keepAuthInsideWfw('http://authserver.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?t=1', true),
+      'https://wfw.gdou.edu.cn/authserver/reAuthCheck/reAuthLoginView.do?t=1'
+    );
+    assert.equal(
+      keepAuthInsideWfw('https://authserver.gdou.edu.cn/authserver/login?service=https%3A%2F%2Fwfw.gdou.edu.cn%2F', true),
+      null,
+      'Explicit wfw portal service URL must not be rewritten by keepAuthInsideWfw'
+    );
+    assert.equal(
+      keepAuthInsideWfw('https://authserver.gdou.edu.cn/authserver/login?type=dynamicLogin', false),
+      null,
+      'Campus-direct mode must leave authserver.gdou.edu.cn untouched'
+    );
+
+    // 3h. Verify mobile SMS login script & wfw preload script syntax and mobileTab selector
+    const smsWebViewJs = buildIncognitoWebViewSyncScript(
+      undefined,
+      'verify-sms-nonce',
+      GDOU_JW_SSO_SERVICE,
+      undefined,
+      true
+    );
+    new Function(smsWebViewJs);
+    assert.ok(
+      smsWebViewJs.includes('#mobileTab') &&
+        smsWebViewJs.includes('#dynamicLogin_a') &&
+        smsWebViewJs.includes('trySwitchToSmsTabOnce'),
+      'WebView SMS sync script must handle both mobile #mobileTab and desktop #dynamicLogin_a'
+    );
+    const preloadJs = buildIncognitoWebViewPreloadScript();
+    new Function(preloadJs);
+    assert.ok(
+      preloadJs.includes('authserver\\\\.gdou\\\\.edu\\\\.cn') || preloadJs.includes('authserver\\.gdou\\.edu\\.cn'),
+      'Preload script must rewrite bare authserver.gdou.edu.cn/authserver links to stay inside wfw'
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1605,6 +1709,50 @@ async function run() {
     })
   );
 
+  // 7b. Native Widget 7-day rolling payload, weekend next-teaching-day fallback & empty-course prompt
+  const activeWeekdayPayload = buildNativeWidgetPayload(
+    sampleForCluster.courses,
+    sampleForCluster.exams,
+    { ...settings, termStartDate: '2026-08-31' },
+    sampleForCluster.termLabel,
+    new Date('2026-09-07T08:30:00')
+  );
+  assert.equal(activeWeekdayPayload.state, 'ongoing');
+  assert.equal(activeWeekdayPayload.upcomingDays.length, 7, 'Widget payload must include 7-day rolling schedule');
+  assert.ok(activeWeekdayPayload.totalCourseCount > 0);
+  assert.ok(activeWeekdayPayload.todayItems.length > 0);
+  assert.equal(activeWeekdayPayload.todayItems[0]?.startMin, 490, '08:10 must equal 490 minutes');
+  assert.equal(activeWeekdayPayload.todayItems[0]?.endMin, 585, '09:45 must equal 585 minutes');
+  assert.deepEqual(findForbiddenCredentialKeys(activeWeekdayPayload), []);
+
+  const weekendWidgetPayload = buildNativeWidgetPayload(
+    sampleForCluster.courses,
+    sampleForCluster.exams,
+    { ...settings, termStartDate: '2026-08-31' },
+    sampleForCluster.termLabel,
+    new Date('2026-09-06T10:00:00')
+  );
+  assert.equal(weekendWidgetPayload.todayItems.length, 0, 'Sunday sample has 0 classes');
+  assert.ok(
+    weekendWidgetPayload.nextClassDayItems.length > 0 &&
+      weekendWidgetPayload.nextClassDayLabel.includes('明天'),
+    'Weekend widget payload must provide next teaching day courses (明天 周一)'
+  );
+  assert.ok(
+    weekendWidgetPayload.subline.includes('下个上课日'),
+    'Weekend widget subline must preview next teaching day'
+  );
+
+  const emptyWidgetPayload = buildNativeWidgetPayload(
+    [],
+    [],
+    { ...settings, termStartDate: '2026-08-31' },
+    sampleForCluster.termLabel,
+    new Date('2026-09-07T08:30:00')
+  );
+  assert.equal(emptyWidgetPayload.totalCourseCount, 0);
+  assert.equal(emptyWidgetPayload.headline, '尚未同步课表');
+
   // 8. Zero-retention check on all new persisted objects + native plugin Widget/Ongoing/Dynamic Island/SAF assertions
   assert.deepEqual(
     findForbiddenCredentialKeys({
@@ -1612,6 +1760,7 @@ async function run() {
       lastScheduleDiff: diffReport,
       emptyClassroomSnapshot: { rooms: parsedRooms, params: ecQuery },
       campusSearchHistory: { courses: campusFound },
+      widgetPayload: activeWeekdayPayload,
     }),
     [],
     'All new persisted structures must contain ZERO forbidden credential keys or values'
@@ -1626,6 +1775,15 @@ async function run() {
       pluginSrc.includes('DynamicIsland') &&
       pluginSrc.includes('NSSupportsLiveActivities') &&
       pluginSrc.includes('GdouIosWidgetBridge') &&
+      pluginSrc.includes('GdouSharedKeychainStore') &&
+      pluginSrc.includes('GdouWidgetKeychainStore') &&
+      pluginSrc.includes('parentAppBundleURL') &&
+      pluginSrc.includes('hostBundleIdentifier') &&
+      pluginSrc.includes('GdouResolvedWidgetState') &&
+      pluginSrc.includes('upcomingDays') &&
+      pluginSrc.includes('nextClassDayItems') &&
+      pluginSrc.includes('isInWfwAuthPath') &&
+      pluginSrc.includes('.commit()') &&
       pluginSrc.includes('PHPickerViewController') &&
       pluginSrc.includes('com.apple.security.application-groups') &&
       pluginSrc.includes('GdouScheduleWidgetExtension') &&
@@ -1640,7 +1798,7 @@ async function run() {
       pluginSrc.includes('PRODUCT_BUNDLE_PACKAGE_TYPE = \'"XPC!"\'') &&
       pluginSrc.includes('SKStoreProductViewController') &&
       pluginSrc.includes('dismiss(animated: false)'),
-    'Native plugin must include non-blank iOS 17/18/26 WidgetKit containerBackground, dynamic App Group discovery, XPC! package type, StoreKit in-app update sheet & clean OTA reload'
+    'Native plugin must include iOS Shared Keychain fallback, parent .app discovery, 7-day rolling widget state, Android commit+file mirror, wfw /authserver redirect guard & StoreKit in-app sheet'
   );
   const workflowSrc = nodeFs.readFileSync(
     nodePath.join(process.cwd(), '.github', 'workflows', 'build-mobile.yml'),
@@ -1649,9 +1807,11 @@ async function run() {
   assert.ok(
     workflowSrc.includes('--entitlements "$WIDGET_ENTITLEMENTS"') &&
       workflowSrc.includes('--entitlements "$MAIN_ENTITLEMENTS"') &&
+      workflowSrc.includes('GdouSharedKeychainStore') &&
+      workflowSrc.includes('GdouWidgetKeychainStore') &&
       workflowSrc.includes('generate-ota-manifest') &&
       workflowSrc.includes('ota-manifest.json'),
-    'CI workflow must embed App Group entitlements in ad-hoc IPA signing and generate ota-manifest.json'
+    'CI workflow must embed App Group entitlements, verify Shared Keychain widget transport, and generate ota-manifest.json'
   );
   const appTsxSrc = nodeFs.readFileSync(nodePath.join(process.cwd(), 'App.tsx'), 'utf8');
   assert.ok(
@@ -1665,12 +1825,30 @@ async function run() {
     'utf8'
   );
   assert.ok(
-    otaSvcSrc.includes('NATIVE_OTA_RUNTIME_VERSION = 2') &&
+    otaSvcSrc.includes('NATIVE_OTA_RUNTIME_VERSION = 3') &&
       otaSvcSrc.includes('openIosInAppStoreSheet') &&
       otaSvcSrc.includes('detectInstalledIosSigners'),
-    'otaUpdateService must bump runtime ABI to v2 and expose StoreKit sheet & signer detection'
+    'otaUpdateService must bump runtime ABI to v3 and expose StoreKit sheet & signer detection'
   );
-  console.log('   OK: All feature engines, single-password CAS bridge, iOS WidgetKit fix, EMS-style updater & CI workflow verified.');
+
+  // 9a. Guard against unwanted EMS / 邮政 wording in user-facing descriptions & configs
+  const userFacingFilesToCheck = [
+    nodePath.join(process.cwd(), 'src', 'services', 'updateService.ts'),
+    nodePath.join(process.cwd(), 'altstore-source.json'),
+    nodePath.join(process.cwd(), 'App.tsx'),
+    nodePath.join(process.cwd(), 'src', 'screens', 'SettingsScreen.tsx'),
+    nodePath.join(process.cwd(), 'src', 'components', 'InAppUpdateModal.tsx'),
+    nodePath.join(process.cwd(), 'src', 'components', 'EphemeralSyncModal.tsx'),
+  ];
+  for (const filePath of userFacingFilesToCheck) {
+    const text = nodeFs.readFileSync(filePath, 'utf8');
+    assert.equal(
+      /\bems\b|邮政/i.test(text),
+      false,
+      `User-facing file must NOT mention EMS/邮政: ${filePath}`
+    );
+  }
+  console.log('   OK: All feature engines, 1-step GDOU login, dual-channel iOS/Android widgets, clean updater & CI workflow verified.');
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

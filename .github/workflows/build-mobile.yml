@@ -171,6 +171,8 @@ jobs:
           grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
           grep -q "GdouIosAlarmBridge" "$SWIFT_FILE"
           grep -q "GdouIosWidgetBridge" "$SWIFT_FILE"
+          grep -q "GdouSharedKeychainStore" "$SWIFT_FILE"
+          grep -q "isInWfwAuthPath" "$SWIFT_FILE"
           grep -q "AlarmManager.shared" "$SWIFT_FILE"
           grep -q "GdouOtaBundle" "$SWIFT_FILE"
           grep -q "NSAlarmKitUsageDescription" ios/*/Info.plist
@@ -178,6 +180,9 @@ jobs:
           grep -q "GdouScheduleWidgetBundle" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "containerBackground(for: .widget)" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "GdouWidgetGroupDiscovery" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "GdouWidgetKeychainStore" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "parentAppBundleURL" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "upcomingDays" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "<string>XPC!</string>" ios/GdouScheduleWidgetExtension/Info.plist
           grep -q "SKStoreProductViewController" "$SWIFT_FILE"
           grep -q "ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider" "$SWIFT_FILE"
