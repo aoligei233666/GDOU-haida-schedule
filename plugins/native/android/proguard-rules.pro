@@ -1,0 +1,15 @@
+# GDOU Schedule R8 / ProGuard keep rules
+-keep class com.swmansion.reanimated.** { *; }
+-keep class com.facebook.react.** { *; }
+-keep class com.facebook.hermes.** { *; }
+-keep class com.facebook.jni.** { *; }
+-keep class expo.modules.** { *; }
+-keep class com.reactnativecommunity.** { *; }
+-keep class com.th3rdwave.safeareacontext.** { *; }
+-keep class cn.edu.gdou.schedule.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-dontwarn javax.annotation.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**

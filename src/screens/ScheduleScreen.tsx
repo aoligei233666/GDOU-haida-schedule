@@ -1,8 +1,9 @@
 import { Ionicons } from '@expo/vector-icons';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Image,
+  PanResponder,
   Platform,
   ScrollView,
   StyleSheet,
@@ -20,6 +21,7 @@ import { ManualCourseModal } from '../components/ManualCourseModal';
 import { ScheduleAppearanceModal } from '../components/ScheduleAppearanceModal';
 import { ScheduleDiffModal } from '../components/ScheduleDiffModal';
 import { SchedulePosterModal } from '../components/SchedulePosterModal';
+import { WeekPickerModal } from '../components/WeekPickerModal';
 import {
   DAY_LABELS,
   DEFAULT_SCHEDULE_APPEARANCE,
@@ -44,12 +46,14 @@ import {
   getTodayDayOfWeek,
   isCourseSchedulable,
 } from '../services/scheduleParser';
+import { buildTermArchiveKey } from '../services/storageService';
 import {
   buildTimetableClusters,
   computeCoupleScheduleInsights,
   TimetableSlotCluster,
 } from '../services/timetableCluster';
-import { COLORS, COURSE_PALETTE } from '../theme/colors';
+import { COLORS } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 import {
   AlarmRule,
   AppSettings,
@@ -62,6 +66,7 @@ import {
   ExamItem,
   ScheduleDiffReport,
   ScheduleViewMode,
+  TermArchiveSnapshot,
 } from '../types/models';
 
 const TIME_COL_WIDTH = 46;
@@ -97,6 +102,7 @@ interface Props {
   termLabel: string;
   academicYear: string;
   semesterCode: string;
+  termArchives?: TermArchiveSnapshot[];
   settings: AppSettings;
   lastScheduleDiff: ScheduleDiffReport | null;
   emptyClassroomSnapshot: EmptyClassroomSnapshot | null;
@@ -108,7 +114,9 @@ interface Props {
   onUpdateSettings: (next: AppSettings) => void;
   onSaveCoupleSchedule: (profile: CoupleScheduleProfile | null) => void;
   onAddManualCourse: (course: CourseItem) => void;
+  onUpdateCourse?: (updated: CourseItem) => void;
   onDeleteManualCourse: (courseId: string) => void;
+  onSwitchTermArchive?: (termKey: string) => void;
   onDismissScheduleDiff: () => void;
   onRequestEmptyClassroomQuery: (params: EmptyClassroomQueryParams) => void;
   onRequestCampusCourseSearch: (query: CampusCourseSearchQuery) => void;
@@ -122,6 +130,7 @@ export const ScheduleScreen: React.FC<Props> = ({
   termLabel,
   academicYear,
   semesterCode,
+  termArchives = [],
   settings,
   lastScheduleDiff,
   emptyClassroomSnapshot,
@@ -133,11 +142,14 @@ export const ScheduleScreen: React.FC<Props> = ({
   onUpdateSettings,
   onSaveCoupleSchedule,
   onAddManualCourse,
+  onUpdateCourse,
   onDeleteManualCourse,
+  onSwitchTermArchive,
   onDismissScheduleDiff,
   onRequestEmptyClassroomQuery,
   onRequestCampusCourseSearch,
 }) => {
+  const { colors, coursePalette, isDark } = useAppTheme();
   const { width: screenWidth } = useWindowDimensions();
   const currentWeek = useMemo(
     () => Math.min(settings.totalWeeks, Math.max(1, computeTermWeek(settings.termStartDate))),
@@ -146,7 +158,27 @@ export const ScheduleScreen: React.FC<Props> = ({
   const [selectedWeek, setSelectedWeek] = useState<number>(currentWeek);
   const [viewMode, setViewMode] = useState<ScheduleViewMode>('mine');
   const [activeModalCourses, setActiveModalCourses] = useState<CourseItem[]>([]);
+  const [weekPickerOpen, setWeekPickerOpen] = useState(false);
   const [coupleModalOpen, setCoupleModalOpen] = useState(false);
+  const totalWeeksRef = useRef(settings.totalWeeks);
+  totalWeeksRef.current = settings.totalWeeks;
+
+  // P1.6 Horizontal swipe gesture to switch weeks smoothly
+  const weekSwipeResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_evt, gesture) =>
+          Math.abs(gesture.dx) > 26 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.45,
+        onPanResponderRelease: (_evt, gesture) => {
+          if (gesture.dx < -45) {
+            setSelectedWeek((w) => Math.min(totalWeeksRef.current || 20, w + 1));
+          } else if (gesture.dx > 45) {
+            setSelectedWeek((w) => Math.max(1, w - 1));
+          }
+        },
+      }),
+    []
+  );
   const [emptyRoomModalOpen, setEmptyRoomModalOpen] = useState(false);
   const [campusSearchModalOpen, setCampusSearchModalOpen] = useState(false);
   const [calendarModalOpen, setCalendarModalOpen] = useState(false);
@@ -414,14 +446,22 @@ export const ScheduleScreen: React.FC<Props> = ({
     const width = colWidth - 4;
     const totalInSlot = items.length;
 
-    let theme = COURSE_PALETTE[primary.course.colorIndex % COURSE_PALETTE.length];
+    const resolvedColorIdx =
+      typeof primary.course.customColorIndex === 'number'
+        ? primary.course.customColorIndex
+        : primary.course.colorIndex;
+    let theme = coursePalette[Math.abs(resolvedColorIdx) % coursePalette.length];
     if (!primary.isCurrentWeek) {
-      theme = NON_CURRENT_THEME;
+      theme = isDark
+        ? { bg: '#1E293B', border: '#475569', text: '#94A3B8', subtext: '#64748B' }
+        : NON_CURRENT_THEME;
     } else if (cluster.isSameCourseTogether && viewMode === 'couple') {
       theme = COUPLE_TOGETHER_THEME;
     } else if (primary.owner === 'partner') {
       theme = PARTNER_CURRENT_THEME;
     }
+    const pendingTodoCount = (primary.course.todos ?? []).filter((t) => !t.completed).length;
+    const effectiveRoom = primary.course.customLocation?.trim() || primary.course.location;
 
     // In Couple Split Mode, check if BOTH mine & partner have courses in this cluster
     const myTopItem = items.find((i) => i.owner === 'mine');
@@ -587,7 +627,8 @@ export const ScheduleScreen: React.FC<Props> = ({
               numberOfLines={spanCount >= 3 ? 2 : 1}
               maxFontSizeMultiplier={1.1}
             >
-              @{primary.course.location}
+              @{effectiveRoom}
+              {pendingTodoCount > 0 ? ` · 📌${pendingTodoCount}` : ''}
             </Text>
 
             {!primary.isCurrentWeek && !secondCurrentWeekItem && (
@@ -641,30 +682,67 @@ export const ScheduleScreen: React.FC<Props> = ({
 
   const hasAnyCourses = courses.length > 0 || Boolean(coupleSchedule);
 
+  const activeTermKey = buildTermArchiveKey(academicYear, semesterCode);
+  const gridSurfaceDark = (activeWallpaperPreset.isDark || isDark) && !hasCustomPhotoBg;
+  const effectiveGridBg =
+    appearance.wallpaperPreset === 'none'
+      ? colors.bg
+      : activeWallpaperPreset.bgColor;
+
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, { backgroundColor: colors.bg }]}>
       {/* Top Ocean / Couple Header */}
-      <View style={[styles.header, viewMode !== 'mine' && styles.headerCoupleTint]}>
+      <View
+        style={[
+          styles.header,
+          { backgroundColor: colors.oceanDeep },
+          viewMode !== 'mine' && styles.headerCoupleTint,
+        ]}
+      >
         <View style={styles.headerTopRow}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.termSub}>
-              {viewMode === 'partner' && coupleSchedule
-                ? `${partnerName}的课表 · ${coupleSchedule.termLabel}`
-                : termLabel}
-            </Text>
+            <TouchableOpacity
+              onPress={() => setWeekPickerOpen(true)}
+              activeOpacity={0.75}
+              accessibilityRole="button"
+              accessibilityLabel="打开学期归档与教学周选择器"
+              style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}
+            >
+              <Text style={styles.termSub} numberOfLines={1}>
+                {viewMode === 'partner' && coupleSchedule
+                  ? `${partnerName}的课表 · ${coupleSchedule.termLabel}`
+                  : termLabel}
+              </Text>
+              {termArchives.length > 1 && (
+                <Ionicons name="swap-vertical" size={12} color="#BAE6FD" />
+              )}
+            </TouchableOpacity>
             <View style={styles.weekNavRow}>
               <TouchableOpacity
                 onPress={() => setSelectedWeek((w) => Math.max(1, w - 1))}
                 style={styles.weekArrow}
+                accessibilityRole="button"
+                accessibilityLabel="上一周"
               >
                 <Ionicons name="chevron-back" size={18} color={COLORS.white} />
               </TouchableOpacity>
-              <Text style={styles.weekTitle}>
-                第 {selectedWeek} 周{selectedWeek === currentWeek ? ' · 本周' : ''}
-              </Text>
+              <TouchableOpacity
+                onPress={() => setWeekPickerOpen(true)}
+                activeOpacity={0.75}
+                accessibilityRole="button"
+                accessibilityLabel={`当前第${selectedWeek}周，点击快速跳转任意周次或切换学期`}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 3 }}
+              >
+                <Text style={styles.weekTitle}>
+                  第 {selectedWeek} 周{selectedWeek === currentWeek ? ' · 本周' : ''}
+                </Text>
+                <Ionicons name="chevron-down" size={15} color="#BAE6FD" />
+              </TouchableOpacity>
               <TouchableOpacity
                 onPress={() => setSelectedWeek((w) => Math.min(settings.totalWeeks, w + 1))}
                 style={styles.weekArrow}
+                accessibilityRole="button"
+                accessibilityLabel="下一周"
               >
                 <Ionicons name="chevron-forward" size={18} color={COLORS.white} />
               </TouchableOpacity>
@@ -672,6 +750,8 @@ export const ScheduleScreen: React.FC<Props> = ({
                 <TouchableOpacity
                   onPress={() => setSelectedWeek(currentWeek)}
                   style={styles.backToNowBtn}
+                  accessibilityRole="button"
+                  accessibilityLabel="回到本周"
                 >
                   <Text style={styles.backToNowText}>回本周</Text>
                 </TouchableOpacity>
@@ -679,7 +759,12 @@ export const ScheduleScreen: React.FC<Props> = ({
             </View>
           </View>
 
-          <TouchableOpacity style={styles.syncHeaderBtn} onPress={onOpenSync}>
+          <TouchableOpacity
+            style={styles.syncHeaderBtn}
+            onPress={onOpenSync}
+            accessibilityRole="button"
+            accessibilityLabel="打开教务无痕同步弹窗"
+          >
             <Ionicons name="shield-checkmark-outline" size={15} color={COLORS.oceanDeep} />
             <Text style={styles.syncHeaderBtnText}>无痕同步</Text>
           </TouchableOpacity>
@@ -986,15 +1071,16 @@ export const ScheduleScreen: React.FC<Props> = ({
           <View
             style={[
               styles.dayHeaderRow,
-              activeWallpaperPreset.isDark &&
-                !hasCustomPhotoBg && { backgroundColor: '#0F172A', borderBottomColor: '#1E293B' },
+              { backgroundColor: colors.surface, borderBottomColor: colors.border },
+              gridSurfaceDark && { backgroundColor: '#0F172A', borderBottomColor: '#1E293B' },
             ]}
           >
             <View style={{ width: TIME_COL_WIDTH, alignItems: 'center', justifyContent: 'center' }}>
               <Text
                 style={[
                   styles.monthLabel,
-                  activeWallpaperPreset.isDark && !hasCustomPhotoBg && { color: '#94A3B8' },
+                  { color: colors.textMuted },
+                  gridSurfaceDark && { color: '#94A3B8' },
                 ]}
               >
                 {weekDates[0].getMonth() + 1}月
@@ -1012,14 +1098,15 @@ export const ScheduleScreen: React.FC<Props> = ({
                     styles.dayHeaderCell,
                     { width: colWidth },
                     isToday && styles.dayHeaderCellToday,
-                    res.isHoliday && !isToday && { backgroundColor: '#FEF2F2', borderRadius: 6 },
-                    res.isMakeup && !isToday && { backgroundColor: '#FFFBEB', borderRadius: 6 },
+                    res.isHoliday && !isToday && { backgroundColor: isDark ? '#450A0A' : '#FEF2F2', borderRadius: 6 },
+                    res.isMakeup && !isToday && { backgroundColor: isDark ? '#451A03' : '#FFFBEB', borderRadius: 6 },
                   ]}
                 >
                   <Text
                     style={[
                       styles.dayHeaderText,
-                      activeWallpaperPreset.isDark && !hasCustomPhotoBg && { color: '#F8FAFC' },
+                      { color: colors.textPrimary },
+                      gridSurfaceDark && { color: '#F8FAFC' },
                       isToday && styles.dayHeaderTextToday,
                       res.isHoliday && !isToday && { color: '#DC2626' },
                       res.isMakeup && !isToday && { color: '#D97706' },
@@ -1030,6 +1117,7 @@ export const ScheduleScreen: React.FC<Props> = ({
                   <Text
                     style={[
                       styles.dayDateText,
+                      { color: colors.textMuted },
                       isToday && styles.dayDateTextToday,
                       res.isHoliday && !isToday && { color: '#DC2626', fontWeight: '700' },
                       res.isMakeup && !isToday && { color: '#B45309', fontWeight: '700' },
@@ -1043,11 +1131,12 @@ export const ScheduleScreen: React.FC<Props> = ({
             })}
           </View>
 
-          {/* Timetable Grid with Custom Wallpaper / Preset Background */}
+          {/* Timetable Grid with Custom Wallpaper / Preset Background + Horizontal Week Swipe */}
           <View
+            {...weekSwipeResponder.panHandlers}
             style={[
               styles.gridContainerWrap,
-              { backgroundColor: activeWallpaperPreset.bgColor },
+              { backgroundColor: effectiveGridBg },
             ]}
           >
             {hasCustomPhotoBg && appearance.customBackgroundUri && (
@@ -1175,6 +1264,10 @@ export const ScheduleScreen: React.FC<Props> = ({
         existingAlarms={alarms}
         onClose={() => setActiveModalCourses([])}
         onAlarmCreated={(alarm) => onAlarmsAdded([alarm])}
+        onUpdateCourse={(updated) => {
+          onUpdateCourse?.(updated);
+          setActiveModalCourses((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+        }}
         onAddManualCourseInSlot={(day, startSec, endSec) =>
           setManualModalState({
             visible: true,
@@ -1184,6 +1277,19 @@ export const ScheduleScreen: React.FC<Props> = ({
           })
         }
         onDeleteManualCourse={onDeleteManualCourse}
+      />
+
+      <WeekPickerModal
+        visible={weekPickerOpen}
+        totalWeeks={settings.totalWeeks}
+        currentWeek={currentWeek}
+        selectedWeek={selectedWeek}
+        activeTermKey={activeTermKey}
+        termLabel={termLabel}
+        termArchives={termArchives}
+        onSelectWeek={(w) => setSelectedWeek(w)}
+        onSelectTermArchive={(key) => onSwitchTermArchive?.(key)}
+        onClose={() => setWeekPickerOpen(false)}
       />
 
       <ManualCourseModal

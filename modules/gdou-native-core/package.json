@@ -1,0 +1,7 @@
+{
+  "name": "gdou-native-core",
+  "version": "2.0.0",
+  "description": "Local Expo Native Module for GDOU Schedule typed native bridges (Widget, AlarmKit, System Clock, OTA, SAF Picker, MediaStore)",
+  "main": "index.ts",
+  "license": "GPL-3.0"
+}

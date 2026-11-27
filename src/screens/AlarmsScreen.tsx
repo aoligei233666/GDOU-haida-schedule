@@ -32,6 +32,7 @@ import {
 import { exportAndShareIcs } from '../services/icsExporter';
 import { computeTermWeek } from '../services/scheduleParser';
 import { COLORS } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 import { AlarmRule, AppSettings, CourseItem, ExamItem } from '../types/models';
 
 interface Props {
@@ -53,6 +54,7 @@ export const AlarmsScreen: React.FC<Props> = ({
   settings,
   onAlarmsUpdated,
 }) => {
+  const { colors } = useAppTheme();
   const currentWeek = useMemo(
     () => Math.min(settings.totalWeeks, Math.max(1, computeTermWeek(settings.termStartDate))),
     [settings.termStartDate, settings.totalWeeks]
@@ -285,8 +287,8 @@ export const AlarmsScreen: React.FC<Props> = ({
   };
 
   return (
-    <View style={styles.root}>
-      <View style={styles.header}>
+    <View style={[styles.root, { backgroundColor: colors.bg }]}>
+      <View style={[styles.header, { backgroundColor: colors.oceanDeep }]}>
         <Text style={styles.headerTitle}>闹钟与日历中心</Text>
         <Text style={styles.headerSub}>
           {Platform.OS === 'ios'

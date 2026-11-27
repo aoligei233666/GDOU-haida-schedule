@@ -55,6 +55,7 @@ import {
   submitGdouMfaAndCompleteSync,
 } from '../src/services/gdouAuth';
 import { buildNativeWidgetPayload } from '../src/services/widgetPayloadBuilder';
+import { runV2FeatureTests } from './tests/v2Features.test';
 import {
   buildGdouCalendarCountdowns,
   buildTodayLiveSnapshot,
@@ -1219,10 +1220,24 @@ async function run() {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pluginFn = require('../plugins/withGdouZeroRetention.js') as unknown;
   assert.equal(typeof pluginFn, 'function', 'Config plugin must export a function');
-  const pluginSrc = nodeFs.readFileSync(
-    nodePath.join(process.cwd(), 'plugins', 'withGdouZeroRetention.js'),
-    'utf8'
-  );
+  const nodeFsFull = require('fs') as {
+    existsSync(p: string): boolean;
+    readdirSync(p: string, opts: { withFileTypes: true }): Array<{ name: string; isDirectory(): boolean }>;
+    readFileSync(p: string, enc: string): string;
+  };
+  const readDirRecursive = (dir: string): string => {
+    if (!nodeFsFull.existsSync(dir)) return '';
+    let acc = '';
+    for (const entry of nodeFsFull.readdirSync(dir, { withFileTypes: true })) {
+      const full = nodePath.join(dir, entry.name);
+      if (entry.isDirectory()) acc += '\n' + readDirRecursive(full);
+      else acc += '\n' + nodeFsFull.readFileSync(full, 'utf8');
+    }
+    return acc;
+  };
+  const pluginSrc =
+    readDirRecursive(nodePath.join(process.cwd(), 'plugins')) +
+    readDirRecursive(nodePath.join(process.cwd(), 'modules', 'gdou-native-core'));
   assert.ok(
     pluginSrc.includes('ExpoFetchCustomExtension.setCustomURLSessionConfigurationProvider'),
     'iOS plugin must hook Expo SDK 58 ExpoFetchCustomExtension so global fetch uses GdouEphemeralURLProtocol'
@@ -1825,10 +1840,11 @@ async function run() {
     'utf8'
   );
   assert.ok(
-    otaSvcSrc.includes('NATIVE_OTA_RUNTIME_VERSION = 3') &&
+    otaSvcSrc.includes('NATIVE_OTA_RUNTIME_VERSION = 4') &&
+      otaSvcSrc.includes('verifyOtaManifestSignature') &&
       otaSvcSrc.includes('openIosInAppStoreSheet') &&
       otaSvcSrc.includes('detectInstalledIosSigners'),
-    'otaUpdateService must bump runtime ABI to v3 and expose StoreKit sheet & signer detection'
+    'otaUpdateService must bump runtime ABI to v4, enforce Ed25519 manifest signature check, and expose StoreKit sheet & signer detection'
   );
 
   // 9a. Guard against unwanted EMS / 邮政 wording in user-facing descriptions & configs
@@ -1849,6 +1865,7 @@ async function run() {
     );
   }
   console.log('   OK: All feature engines, 1-step GDOU login, dual-channel iOS/Android widgets, clean updater & CI workflow verified.');
+  runV2FeatureTests(pluginSrc);
 
   if (runLive) {
     console.log('9) [--live] Testing LIVE GDOU entry handshake (read-only, zero credentials)...');

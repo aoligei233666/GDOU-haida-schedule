@@ -1,42 +1,32 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  createDefaultSettings,
-  DEFAULT_SCHEDULE_APPEARANCE,
-  deriveCurrentTermParams,
-} from '../constants/gdouTimetable';
+import { DEFAULT_SCHEDULE_APPEARANCE } from '../constants/gdouTimetable';
 import { PersistedAppData } from '../types/models';
+import {
+  buildTermArchiveKey,
+  createInitialAppData,
+  mergeCourseCustomizations,
+  SCHEMA_VERSION,
+  snapshotActiveTermToArchive,
+  switchToArchivedTerm,
+} from './storageHelpers';
 import {
   findForbiddenCredentialKeys,
   FORBIDDEN_CREDENTIAL_KEYS,
   sanitizeForZeroRetention,
 } from './zeroRetentionSanitizer';
 
-export { FORBIDDEN_CREDENTIAL_KEYS, findForbiddenCredentialKeys, sanitizeForZeroRetention };
+export {
+  buildTermArchiveKey,
+  createInitialAppData,
+  findForbiddenCredentialKeys,
+  FORBIDDEN_CREDENTIAL_KEYS,
+  mergeCourseCustomizations,
+  sanitizeForZeroRetention,
+  snapshotActiveTermToArchive,
+  switchToArchivedTerm,
+};
 
 const STORAGE_KEY = '@gdou_schedule_data_v1';
-const SCHEMA_VERSION = 2;
-
-export function createInitialAppData(now: Date = new Date()): PersistedAppData {
-  const term = deriveCurrentTermParams(now);
-  return {
-    schemaVersion: SCHEMA_VERSION,
-    courses: [],
-    exams: [],
-    grades: [],
-    alarms: [],
-    coupleSchedule: null,
-    graduationAudit: null,
-    lastScheduleDiff: null,
-    emptyClassroomSnapshot: null,
-    campusSearchHistory: null,
-    termLabel: term.label,
-    academicYear: term.xnm,
-    semesterCode: term.xqm,
-    lastSyncedAt: null,
-    lastSyncReceipt: null,
-    settings: createDefaultSettings(now),
-  };
-}
 
 export async function loadPersistedData(): Promise<PersistedAppData> {
   try {
@@ -60,6 +50,7 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
     const mergedSettings = {
       ...defaults.settings,
       ...(parsed.settings ?? {}),
+      themePreference: parsed.settings?.themePreference ?? 'system',
       appearance: {
         ...DEFAULT_SCHEDULE_APPEARANCE,
         ...(parsed.settings?.appearance ?? {}),
@@ -68,12 +59,38 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
         ? parsed.settings.calendarOverrides
         : [],
     };
+    const courses = Array.isArray(parsed.courses) ? parsed.courses : [];
+    const exams = Array.isArray(parsed.exams) ? parsed.exams : [];
+    const academicYear = String(parsed.academicYear || defaults.academicYear);
+    const semesterCode = String(parsed.semesterCode || defaults.semesterCode);
+    const termLabel = String(parsed.termLabel || defaults.termLabel);
+
+    const rawArchives =
+      parsed.termArchives && typeof parsed.termArchives === 'object'
+        ? { ...parsed.termArchives }
+        : {};
+    if (courses.length > 0) {
+      const currentKey = buildTermArchiveKey(academicYear, semesterCode);
+      if (!rawArchives[currentKey]) {
+        rawArchives[currentKey] = {
+          termKey: currentKey,
+          termLabel,
+          academicYear,
+          semesterCode,
+          termStartDate: mergedSettings.termStartDate,
+          courses,
+          exams,
+          updatedAtIso: parsed.lastSyncedAt || new Date().toISOString(),
+        };
+      }
+    }
+
     return {
       ...defaults,
       ...parsed,
       schemaVersion: SCHEMA_VERSION,
-      courses: Array.isArray(parsed.courses) ? parsed.courses : [],
-      exams: Array.isArray(parsed.exams) ? parsed.exams : [],
+      courses,
+      exams,
       grades: Array.isArray(parsed.grades) ? parsed.grades : [],
       alarms: Array.isArray(parsed.alarms) ? parsed.alarms : [],
       coupleSchedule,
@@ -81,6 +98,10 @@ export async function loadPersistedData(): Promise<PersistedAppData> {
       lastScheduleDiff: parsed.lastScheduleDiff ?? null,
       emptyClassroomSnapshot: parsed.emptyClassroomSnapshot ?? null,
       campusSearchHistory: parsed.campusSearchHistory ?? null,
+      termLabel,
+      academicYear,
+      semesterCode,
+      termArchives: rawArchives,
       settings: mergedSettings,
     };
   } catch {
@@ -97,10 +118,6 @@ export async function clearAllLocalData(): Promise<void> {
   await AsyncStorage.removeItem(STORAGE_KEY);
 }
 
-/**
- * Audit helper shown in Settings -> Privacy Verification:
- * inspects actual persisted JSON keys recursively to prove zero credentials exist on disk.
- */
 export async function auditLocalStorageZeroCredentials(): Promise<{
   hasStoredData: boolean;
   byteSize: number;

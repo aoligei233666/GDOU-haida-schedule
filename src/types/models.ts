@@ -6,6 +6,16 @@ export interface PeriodTime {
 
 export type CampusPresetKey = 'huguang_0810' | 'huguang_0800' | 'yangjiang' | 'custom';
 
+export interface CourseTodoItem {
+  id: string;
+  title: string;
+  dueDate: string; // YYYY-MM-DD
+  dueTime?: string; // HH:mm
+  completed: boolean;
+  createdAtIso: string;
+  notificationId?: string;
+}
+
 export interface CourseItem {
   id: string;
   name: string;
@@ -26,6 +36,23 @@ export interface CourseItem {
   isAudit?: boolean; // true when added via 全校/教师/班级课表搜索（旁听/蹭课）
   sourceLabel?: string;
   ownerTag?: 'mine' | 'partner';
+  customNote?: string;
+  customLocation?: string;
+  customColorIndex?: number;
+  todos?: CourseTodoItem[];
+}
+
+export type ThemePreference = 'system' | 'light' | 'dark';
+
+export interface TermArchiveSnapshot {
+  termKey: string; // e.g. "2025-12"
+  termLabel: string;
+  academicYear: string;
+  semesterCode: string;
+  termStartDate: string;
+  courses: CourseItem[];
+  exams: ExamItem[];
+  updatedAtIso: string;
 }
 
 export type ScheduleViewMode = 'mine' | 'couple' | 'partner';
@@ -297,6 +324,7 @@ export interface AlarmRule {
 }
 
 export interface AppSettings {
+  themePreference?: ThemePreference;
   campusPreset: CampusPresetKey;
   customPeriods: PeriodTime[];
   termStartDate: string; // YYYY-MM-DD (Monday of Week 1)
@@ -357,6 +385,7 @@ export interface PersistedAppData {
   termLabel: string;
   academicYear: string; // e.g. "2025"
   semesterCode: string; // "3" (秋/第一学期) | "12" (春/第二学期) | "16" (第三学期)
+  termArchives?: Record<string, TermArchiveSnapshot>;
   lastSyncedAt: string | null;
   lastSyncReceipt: SyncReceipt | null;
   settings: AppSettings;

@@ -183,10 +183,21 @@ function snapAnchorToTermMonday(anchor: Date): string {
  * - `xqm='3'` (Fall term): Monday of the week of Sep 1 of `xnm` (e.g. 2025-3 -> 2025-09-01, 2026-3 -> 2026-08-31)
  * - `xqm='12'` (Spring term): first Monday of Mar of `xnm + 1` (e.g. 2025-12 -> 2026-03-02)
  */
+let remoteTermStartDatesMap: Record<string, string> = {};
+
+export function setDynamicTermStartDates(map: Record<string, string>): void {
+  remoteTermStartDatesMap = { ...map };
+}
+
 export function getDefaultTermStartDateForTerm(xnm: string, xqm: string): string | null {
   const startYear = parseInt(String(xnm ?? '').trim(), 10);
   if (!Number.isFinite(startYear) || startYear < 2000 || startYear > 2100) return null;
   const sem = String(xqm ?? '').trim();
+  const remoteKey = `${startYear}-${sem}`;
+  const remoteVal = remoteTermStartDatesMap[remoteKey];
+  if (remoteVal && /^\d{4}-\d{2}-\d{2}$/.test(remoteVal)) {
+    return remoteVal;
+  }
   if (sem === '3' || sem === '1') {
     return snapAnchorToTermMonday(new Date(startYear, 8, 1));
   }
@@ -232,6 +243,7 @@ export function deriveCurrentTermParams(now: Date = new Date()): {
 
 export function createDefaultSettings(now: Date = new Date()): AppSettings {
   return {
+    themePreference: 'system',
     campusPreset: 'huguang_0810',
     customPeriods: CAMPUS_PRESETS.huguang_0810.periods.map((p) => ({ ...p })),
     termStartDate: getDefaultTermStartDate(now),

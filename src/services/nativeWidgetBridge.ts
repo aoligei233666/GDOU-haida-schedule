@@ -2,6 +2,7 @@ import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { Platform } from 'react-native';
 import { AppSettings, CourseItem, ExamItem } from '../types/models';
+import { invokeNativeBridge } from './gdouNativeBridge';
 import {
   buildNativeWidgetPayload,
   NativeWidgetCourseRow,
@@ -14,6 +15,15 @@ export type { NativeWidgetCourseRow, NativeWidgetDaySnapshot, NativeWidgetPayloa
 
 const WIDGET_BRIDGE_BASE = 'https://gdou-widget-internal.local';
 
+const PATH_TO_NATIVE_ACTION: Record<string, string> = {
+  '/sync-widget': 'widget/sync',
+  '/ongoing-notification': 'widget/ongoing',
+  '/live-activity/upsert': 'widget/live-activity/upsert',
+  '/live-activity/stop': 'widget/live-activity/stop',
+  '/pick-background': 'widget/pick-background',
+  '/save-image': 'widget/save-image',
+};
+
 async function callNativeWidgetBridge(
   path: string,
   body?: unknown
@@ -21,20 +31,14 @@ async function callNativeWidgetBridge(
   if (Platform.OS !== 'android' && Platform.OS !== 'ios') {
     return { ok: false, error: '当前运行环境不支持原生小组件桥接' };
   }
-  try {
-    const resp = await fetch(`${WIDGET_BRIDGE_BASE}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body ?? {}),
-    });
-    const text = await resp.text();
-    return JSON.parse(text) as { ok: boolean; error?: string; uri?: string };
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
+  const action = PATH_TO_NATIVE_ACTION[path] || `widget${path}`;
+  return invokeNativeBridge({
+    action,
+    payload: body ?? {},
+    legacyUrl: `${WIDGET_BRIDGE_BASE}${path}`,
+    legacyMethod: 'POST',
+    timeoutMs: path === '/pick-background' ? 120_000 : 12_000,
+  }) as Promise<{ ok: boolean; error?: string; uri?: string; active?: boolean; [k: string]: unknown }>;
 }
 
 /**

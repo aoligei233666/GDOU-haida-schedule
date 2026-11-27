@@ -79,7 +79,7 @@ function buildDayCourseRows(
             : 'upcoming';
     return {
       name: String(c.name || '').trim() || '未命名课程',
-      location: String(c.location || '').trim() || '待定教室',
+      location: String(c.customLocation?.trim() || c.location || '').trim() || '待定教室',
       time: `${startText}-${endText}`,
       sectionText: `${c.startSection}-${c.endSection}节`,
       status,

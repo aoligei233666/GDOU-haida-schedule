@@ -1,6 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import React, { useMemo, useState } from 'react';
 import {
+  Alert,
   ScrollView,
   StyleSheet,
   Text,
@@ -13,7 +14,9 @@ import {
   computeGpaSummary,
   OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
 } from '../services/gradeParser';
+import { exportSanitizedTranscript } from '../services/transcriptExporter';
 import { COLORS } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 import { GradeItem, GraduationAuditReport, ScoreTierBucket } from '../types/models';
 
 interface Props {
@@ -41,7 +44,9 @@ function getGpaColor(gpa: number): { bg: string; text: string } {
 }
 
 export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenSync }) => {
+  const { colors } = useAppTheme();
   const [viewTab, setViewTab] = useState<ViewTab>('overview');
+  const [exporting, setExporting] = useState(false);
   const [selectedTerm, setSelectedTerm] = useState<string>('ALL');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -133,10 +138,39 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
     setViewTab('details');
   };
 
+  const handleExportTranscript = () => {
+    if (grades.length === 0) {
+      Alert.alert('暂无可导出成绩', '请先点击「教务同步」拉取历年成绩单。');
+      return;
+    }
+    const runExport = async (format: 'csv' | 'txt') => {
+      setExporting(true);
+      try {
+        const res = await exportSanitizedTranscript(grades, overallSummary, format);
+        if (!res.shared) {
+          Alert.alert('脱敏成绩单已生成', `文件已保存至：${res.fileUri}`);
+        }
+      } catch (err) {
+        Alert.alert('导出成绩单失败', err instanceof Error ? err.message : String(err));
+      } finally {
+        setExporting(false);
+      }
+    };
+    Alert.alert(
+      '导出脱敏成绩单',
+      '所有导出文件均严格不含学号与姓名，方便保存备份、发给导师或导入 Excel 分析：',
+      [
+        { text: '取消', style: 'cancel' },
+        { text: '表格文件 (.csv / Excel)', onPress: () => void runExport('csv') },
+        { text: '汇总文本 (.txt)', onPress: () => void runExport('txt') },
+      ]
+    );
+  };
+
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, { backgroundColor: colors.bg }]}>
       {/* Ocean Header + Hero KPI Dashboard */}
-      <View style={styles.header}>
+      <View style={[styles.header, { backgroundColor: colors.oceanDeep }]}>
         <View style={styles.headerRow}>
           <View style={{ flex: 1 }}>
             <Text style={styles.headerTitle}>成绩与学分总览</Text>
@@ -146,10 +180,31 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                 : '同步海大教务成绩单，自动汇总各学期绩点与学分'}
             </Text>
           </View>
-          <TouchableOpacity style={styles.syncPill} onPress={onOpenSync}>
-            <Ionicons name="sync" size={15} color={COLORS.oceanDeep} />
-            <Text style={styles.syncPillText}>教务同步</Text>
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', gap: 6 }}>
+            {grades.length > 0 && (
+              <TouchableOpacity
+                style={[styles.syncPill, { backgroundColor: 'rgba(255,255,255,0.16)' }]}
+                onPress={handleExportTranscript}
+                disabled={exporting}
+                accessibilityRole="button"
+                accessibilityLabel="导出脱敏成绩单"
+              >
+                <Ionicons name="share-outline" size={14} color={COLORS.white} />
+                <Text style={[styles.syncPillText, { color: COLORS.white }]}>
+                  {exporting ? '导出中' : '导出'}
+                </Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.syncPill}
+              onPress={onOpenSync}
+              accessibilityRole="button"
+              accessibilityLabel="同步海大教务成绩"
+            >
+              <Ionicons name="sync" size={15} color={COLORS.oceanDeep} />
+              <Text style={styles.syncPillText}>教务同步</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <View style={styles.heroGrid}>

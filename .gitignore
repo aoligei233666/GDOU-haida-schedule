@@ -41,3 +41,6 @@ yarn-error.*
 # generated native folders (reproduced deterministically via Expo CNG + plugins/withGdouZeroRetention.js)
 /ios
 /android
+modules/*/android/build/
+modules/*/android/.gradle/
+modules/*/ios/build/

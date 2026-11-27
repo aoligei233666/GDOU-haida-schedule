@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["GdouNativeCoreModule"]
+  },
+  "android": {
+    "modules": ["cn.edu.gdou.nativecore.GdouNativeCoreModule"]
+  }
+}

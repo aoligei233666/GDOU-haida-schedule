@@ -96,8 +96,11 @@ export const InAppUpdateModal: React.FC<Props> = ({
     if (updateResult.otaManifestUrl) {
       setCheckingManifest(true);
       void fetchOptionalOtaManifest(updateResult.otaManifestUrl)
-        .then((m) => {
-          if (!cancelled) setManifest(m);
+        .then((res) => {
+          if (!cancelled) setManifest(res?.manifest ?? null);
+        })
+        .catch(() => {
+          if (!cancelled) setManifest(null);
         })
         .finally(() => {
           if (!cancelled) setCheckingManifest(false);
@@ -255,6 +258,7 @@ export const InAppUpdateModal: React.FC<Props> = ({
       const res = await downloadAndOpenReleaseInstaller({
         downloadUrl: updateResult.downloadUrl,
         assetName,
+        otaManifestUrl: updateResult.otaManifestUrl,
         expectedSizeBytes: updateResult.assetSizeBytes,
         onProgress: (info) => setProgress(info),
         signal: ac.signal,

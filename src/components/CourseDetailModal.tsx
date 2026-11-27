@@ -19,8 +19,10 @@ import {
 import { openSystemClockOrGuide, showAlarmErrorAlert } from '../services/alarmUiHelper';
 import { addSingleCourseToCalendar } from '../services/calendarService';
 import { getCourseTimeSpan } from '../services/scheduleParser';
-import { COLORS, COURSE_PALETTE } from '../theme/colors';
+import { COLORS } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 import { AlarmRule, AppSettings, CourseItem } from '../types/models';
+import { CourseEditAndTodoSection } from './CourseEditAndTodoSection';
 
 interface Props {
   courses: CourseItem[];
@@ -30,6 +32,7 @@ interface Props {
   existingAlarms?: AlarmRule[];
   onClose: () => void;
   onAlarmCreated: (alarm: AlarmRule) => void;
+  onUpdateCourse?: (updated: CourseItem) => void;
   onAddManualCourseInSlot?: (dayOfWeek: number, startSection: number, endSection: number) => void;
   onDeleteManualCourse?: (courseId: string) => void;
 }
@@ -51,9 +54,11 @@ export const CourseDetailModal: React.FC<Props> = ({
   existingAlarms,
   onClose,
   onAlarmCreated,
+  onUpdateCourse,
   onAddManualCourseInSlot,
   onDeleteManualCourse,
 }) => {
+  const { colors, coursePalette } = useAppTheme();
   const [activeIndex, setActiveIndex] = useState(0);
   const [leadMinutes, setLeadMinutes] = useState(settings.defaultClassAlarmMinutes || 20);
   const [busy, setBusy] = useState(false);
@@ -68,9 +73,12 @@ export const CourseDetailModal: React.FC<Props> = ({
   const course = courses[safeIndex];
   const isPartnerCourse = course.ownerTag === 'partner';
   const isCurrentWeek = course.weeks.includes(selectedWeek);
+  const resolvedColorIdx =
+    typeof course.customColorIndex === 'number' ? course.customColorIndex : course.colorIndex;
   const theme = isPartnerCourse
     ? PARTNER_THEME
-    : COURSE_PALETTE[course.colorIndex % COURSE_PALETTE.length];
+    : coursePalette[Math.abs(resolvedColorIdx) % coursePalette.length];
+  const effectiveLocation = course.customLocation?.trim() || course.location;
 
   const periods = getActivePeriods(settings);
   const { startText, endText } = getCourseTimeSpan(course, periods);
@@ -224,7 +232,11 @@ export const CourseDetailModal: React.FC<Props> = ({
   return (
     <Modal visible={courses.length > 0} transparent animationType="fade" onRequestClose={onClose}>
       <TouchableOpacity style={styles.backdrop} activeOpacity={1} onPress={onClose}>
-        <TouchableOpacity style={styles.sheet} activeOpacity={1}>
+        <TouchableOpacity
+          style={[styles.sheet, { backgroundColor: colors.surface, maxHeight: '88%' }]}
+          activeOpacity={1}
+        >
+          <ScrollView showsVerticalScrollIndicator={false} bounces={false}>
           {/* Multi-Course Overlap Switcher Header when >= 2 courses occupy this slot */}
           {courses.length > 1 && (
             <View style={styles.multiWrap}>
@@ -405,7 +417,13 @@ export const CourseDetailModal: React.FC<Props> = ({
             <MetaRow
               icon="location-outline"
               label="上课地点"
-              value={[course.campus, course.location].filter(Boolean).join(' · ')}
+              value={[
+                course.campus,
+                effectiveLocation,
+                course.customLocation?.trim() ? `（原：${course.location}）` : '',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             />
             <MetaRow icon="person-outline" label="授课教师" value={course.teacher} />
             <MetaRow
@@ -418,7 +436,15 @@ export const CourseDetailModal: React.FC<Props> = ({
             ) : null}
           </View>
 
-          <Text style={styles.leadTitle}>闹钟提前时间</Text>
+          <CourseEditAndTodoSection
+            course={course}
+            readOnly={isPartnerCourse || !onUpdateCourse}
+            onUpdateCourse={(updated) => onUpdateCourse?.(updated)}
+          />
+
+          <Text style={[styles.leadTitle, { color: colors.textSecondary, marginTop: 12 }]}>
+            闹钟提前时间
+          </Text>
           <View style={styles.leadRow}>
             {LEAD_OPTIONS.map((m) => (
               <TouchableOpacity
@@ -494,6 +520,7 @@ export const CourseDetailModal: React.FC<Props> = ({
               )}
             </View>
           </View>
+          </ScrollView>
         </TouchableOpacity>
       </TouchableOpacity>
     </Modal>

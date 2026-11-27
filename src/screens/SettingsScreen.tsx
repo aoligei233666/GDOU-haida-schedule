@@ -15,6 +15,8 @@ import {
   View,
 } from 'react-native';
 import appConfig from '../../app.json';
+import { BackupRestoreCard } from '../components/BackupRestoreCard';
+import { ThemeSelectorCard } from '../components/ThemeSelectorCard';
 import {
   CAMPUS_PRESETS,
   GDOU_ENTRY_URL,
@@ -22,6 +24,7 @@ import {
   isValidHHMM,
 } from '../constants/gdouTimetable';
 import { openAndroidExactAlarmSettings } from '../services/alarmService';
+import { refreshRemoteCampusCalendar } from '../services/remoteCalendarService';
 import {
   ActiveOtaState,
   clearOtaAndRollbackToEmbedded,
@@ -51,7 +54,14 @@ import {
   UpdateCheckResult,
 } from '../services/updateService';
 import { COLORS } from '../theme/colors';
-import { AppSettings, CampusPresetKey, PeriodTime, SyncReceipt } from '../types/models';
+import { useAppTheme } from '../theme/ThemeContext';
+import {
+  AppSettings,
+  CampusPresetKey,
+  PeriodTime,
+  PersistedAppData,
+  SyncReceipt,
+} from '../types/models';
 
 const APP_VERSION = appConfig.expo.version;
 const APP_BUILD_NUMBER =
@@ -64,24 +74,30 @@ const IS_APPLE_OFFICIAL_STORE =
 const IOS_APP_STORE_ID = (process.env.EXPO_PUBLIC_IOS_APP_STORE_ID || '').trim();
 
 interface Props {
+  appData: PersistedAppData;
   settings: AppSettings;
   lastSyncReceipt: SyncReceipt | null;
   onUpdateSettings: (next: AppSettings) => void;
   onClearAllData: () => void;
+  onRestoreBackupData: (restored: PersistedAppData) => void;
   onOpenSync: () => void;
   onSyncWidgetsNow?: () => void;
   onPresentUpdateModal?: (result: UpdateCheckResult) => void;
 }
 
 export const SettingsScreen: React.FC<Props> = ({
+  appData,
   settings,
   lastSyncReceipt,
   onUpdateSettings,
   onClearAllData,
+  onRestoreBackupData,
   onOpenSync,
   onSyncWidgetsNow,
   onPresentUpdateModal,
 }) => {
+  const { colors } = useAppTheme();
+  const [refreshingCalendar, setRefreshingCalendar] = useState(false);
   const [termDateInput, setTermDateInput] = useState(settings.termStartDate);
   const [auditInfo, setAuditInfo] = useState<{
     hasStoredData: boolean;
@@ -319,6 +335,7 @@ export const SettingsScreen: React.FC<Props> = ({
       const res = await downloadAndOpenReleaseInstaller({
         downloadUrl: updateResult.downloadUrl,
         assetName,
+        otaManifestUrl: updateResult.otaManifestUrl,
         expectedSizeBytes: updateResult.assetSizeBytes,
         onProgress: (info) => setDownloadProgress(info),
         signal: ac.signal,
@@ -387,9 +404,26 @@ export const SettingsScreen: React.FC<Props> = ({
     );
   };
 
+  const handleRefreshRemoteCalendar = async () => {
+    setRefreshingCalendar(true);
+    try {
+      const cfg = await refreshRemoteCampusCalendar();
+      if (cfg) {
+        Alert.alert(
+          '海大云端校历已同步',
+          `已加载最新校历配置（更新日期：${cfg.updatedAt || '最新'}，含 ${cfg.overrides.length} 条节假日/调休规则与 ${Object.keys(cfg.termStartDates).length} 个学期开学基准日）。`
+        );
+      } else {
+        Alert.alert('暂未获取到云端校历', '当前网络不可达，应用将继续使用内置 2026–2027 本地校历兜底。');
+      }
+    } finally {
+      setRefreshingCalendar(false);
+    }
+  };
+
   return (
-    <View style={styles.root}>
-      <View style={styles.header}>
+    <View style={[styles.root, { backgroundColor: colors.bg }]}>
+      <View style={[styles.header, { backgroundColor: colors.oceanDeep }]}>
         <Text style={styles.headerTitle}>设置与关于</Text>
         <Text style={styles.headerSub}>海大课表 · 作息校历 · 隐私核验 · powered by 种果仁</Text>
       </View>
@@ -408,6 +442,20 @@ export const SettingsScreen: React.FC<Props> = ({
             </Text>
           </View>
         </View>
+
+        {/* P1.1 Global Dark Mode Selector */}
+        <ThemeSelectorCard
+          preference={settings.themePreference ?? 'system'}
+          onChange={(nextPref) =>
+            onUpdateSettings({ ...settings, themePreference: nextPref })
+          }
+        />
+
+        {/* P1.5 Pure Local Zero-Credential Full Backup & Restore */}
+        <BackupRestoreCard
+          appData={appData}
+          onRestoreBackupData={onRestoreBackupData}
+        />
 
         {/* Version & Direct GitHub Update Card */}
         {IS_APPLE_OFFICIAL_STORE ? (
@@ -926,6 +974,18 @@ export const SettingsScreen: React.FC<Props> = ({
               <Text style={styles.saveDateBtnText}>保存</Text>
             </TouchableOpacity>
           </View>
+          <TouchableOpacity
+            style={[styles.updateSecondaryBtn, { marginTop: 10 }]}
+            disabled={refreshingCalendar}
+            onPress={() => void handleRefreshRemoteCalendar()}
+            accessibilityRole="button"
+            accessibilityLabel="刷新海大云端校历与节假日调休配置"
+          >
+            <Ionicons name="cloud-download-outline" size={15} color={COLORS.oceanPrimary} />
+            <Text style={styles.updateSecondaryBtnText}>
+              {refreshingCalendar ? '正在拉取云端校历...' : '刷新云端海大校历与法定调休表（免发版）'}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         {/* Campus Bell Schedule Presets + Custom Period Time Editor */}

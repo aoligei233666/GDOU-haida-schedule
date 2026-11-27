@@ -20,6 +20,7 @@ import { openSystemClockOrGuide, showAlarmErrorAlert } from '../services/alarmUi
 import { syncExamsToCalendar } from '../services/calendarService';
 import { getExamCountdown, parseExamIsoLocal } from '../services/examParser';
 import { COLORS } from '../theme/colors';
+import { useAppTheme } from '../theme/ThemeContext';
 import { AlarmRule, AppSettings, ExamItem } from '../types/models';
 
 interface Props {
@@ -41,6 +42,7 @@ export const ExamsScreen: React.FC<Props> = ({
   onDeleteExam,
   onAlarmsAdded,
 }) => {
+  const { colors } = useAppTheme();
   const [filter, setFilter] = useState<'upcoming' | 'all'>('all');
   const [addModalVisible, setAddModalVisible] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -248,9 +250,9 @@ export const ExamsScreen: React.FC<Props> = ({
   };
 
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, { backgroundColor: colors.bg }]}>
       {/* Header */}
-      <View style={styles.header}>
+      <View style={[styles.header, { backgroundColor: colors.oceanDeep }]}>
         <View style={styles.headerRow}>
           <View>
             <Text style={styles.headerTitle}>考试查询</Text>

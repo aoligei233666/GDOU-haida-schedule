@@ -5,6 +5,7 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  Linking,
   Platform,
   StyleSheet,
   Text,
@@ -38,15 +39,24 @@ import {
   confirmActiveOtaBootIfNeeded,
   getEffectiveRunningVersion,
 } from './src/services/otaUpdateService';
+import {
+  hydrateCachedRemoteCalendar,
+  refreshRemoteCampusCalendar,
+} from './src/services/remoteCalendarService';
 import { computeScheduleDiff } from './src/services/scheduleDiff';
 import {
+  buildTermArchiveKey,
   clearAllLocalData,
   createInitialAppData,
   loadPersistedData,
+  mergeCourseCustomizations,
   savePersistedData,
+  snapshotActiveTermToArchive,
+  switchToArchivedTerm,
 } from './src/services/storageService';
 import { checkForAppUpdate, normalizeVersionTag, UpdateCheckResult } from './src/services/updateService';
 import { COLORS } from './src/theme/colors';
+import { AppThemeProvider, useAppTheme } from './src/theme/ThemeContext';
 import {
   AlarmRule,
   AppSettings,
@@ -160,6 +170,11 @@ function MainApp() {
         console.warn('Alarm init warning:', err);
       }
       try {
+        await hydrateCachedRemoteCalendar();
+      } catch {
+        // Non-fatal offline fallback
+      }
+      try {
         const loaded = await loadPersistedData();
         if (mounted) {
           setAppData(loaded);
@@ -172,6 +187,7 @@ function MainApp() {
           confirmActiveOtaBootIfNeeded();
         }
       }
+      void refreshRemoteCampusCalendar().catch(() => {});
     })();
     return () => {
       mounted = false;
@@ -258,6 +274,25 @@ function MainApp() {
       ac.abort();
     };
   }, [ready, appData.settings.dismissedUpdateVersion]);
+
+  // P2.1 Handle incoming `gdouschedule://` deep links from Android/iOS Home Widgets & Live Activity
+  useEffect(() => {
+    const routeDeepLink = (rawUrl?: string | null) => {
+      if (!rawUrl) return;
+      const lower = rawUrl.toLowerCase();
+      if (!lower.startsWith('gdouschedule://')) return;
+      const target = lower.replace(/^gdouschedule:\/\//, '').split(/[/?#]/)[0];
+      const validTabs: TabKey[] = ['schedule', 'exams', 'grades', 'alarms', 'settings'];
+      if (validTabs.includes(target as TabKey)) {
+        const tab = target as TabKey;
+        setActiveTab(tab);
+        setVisitedTabs((prev) => (prev[tab] ? prev : { ...prev, [tab]: true }));
+      }
+    };
+    void Linking.getInitialURL().then(routeDeepLink).catch(() => {});
+    const sub = Linking.addEventListener('url', ({ url }) => routeDeepLink(url));
+    return () => sub.remove();
+  }, []);
 
   const mutateAppData = (updater: (prev: PersistedAppData) => PersistedAppData) => {
     dirtyVersionRef.current += 1;
@@ -370,8 +405,20 @@ function MainApp() {
     );
 
     mutateAppData((prev) => {
-      const manualCourses = prev.courses.filter((c) => c.isManual);
-      const manualExams = prev.exams.filter((e) => e.isManual);
+      const nextArchives = snapshotActiveTermToArchive(prev);
+      const termChanged =
+        prev.academicYear !== result.academicYear ||
+        prev.semesterCode !== result.semesterCode ||
+        prev.courses.length === 0;
+      const targetKey = buildTermArchiveKey(result.academicYear, result.semesterCode);
+      const priorCoursesForTerm = termChanged
+        ? (nextArchives[targetKey]?.courses ?? [])
+        : prev.courses;
+      const manualCourses = priorCoursesForTerm.filter((c) => c.isManual);
+      const priorExamsForTerm = termChanged ? (nextArchives[targetKey]?.exams ?? []) : prev.exams;
+      const manualExams = priorExamsForTerm.filter((e) => e.isManual);
+      const mergedOfficialCourses = mergeCourseCustomizations(priorCoursesForTerm, result.courses);
+
       const nextSettings: AppSettings = { ...prev.settings };
 
       // 1. Apply authoritative section bell schedule fetched from 正方 /kbcx/xskbcx_cxRjc.html when available
@@ -388,10 +435,6 @@ function MainApp() {
       }
 
       // 2. Align termStartDate automatically whenever the synced term changes (or first sync)
-      const termChanged =
-        prev.academicYear !== result.academicYear ||
-        prev.semesterCode !== result.semesterCode ||
-        prev.courses.length === 0;
       if (termChanged) {
         const alignedMonday = getDefaultTermStartDateForTerm(
           result.academicYear,
@@ -402,10 +445,23 @@ function MainApp() {
         }
       }
 
+      const combinedCourses = [...mergedOfficialCourses, ...manualCourses];
+      const combinedExams = [...result.exams, ...manualExams];
+      nextArchives[targetKey] = {
+        termKey: targetKey,
+        termLabel: result.termLabel,
+        academicYear: result.academicYear,
+        semesterCode: result.semesterCode,
+        termStartDate: nextSettings.termStartDate,
+        courses: combinedCourses,
+        exams: combinedExams,
+        updatedAtIso: result.receipt.syncedAtIso,
+      };
+
       return {
         ...prev,
-        courses: [...result.courses, ...manualCourses],
-        exams: [...result.exams, ...manualExams],
+        courses: combinedCourses,
+        exams: combinedExams,
         grades: result.grades.length > 0 ? result.grades : prev.grades,
         graduationAudit: result.graduationAudit ?? prev.graduationAudit,
         emptyClassroomSnapshot: result.emptyClassroomSnapshot ?? prev.emptyClassroomSnapshot,
@@ -413,6 +469,7 @@ function MainApp() {
         termLabel: result.termLabel,
         academicYear: result.academicYear,
         semesterCode: result.semesterCode,
+        termArchives: nextArchives,
         lastSyncedAt: result.receipt.syncedAtIso,
         lastSyncReceipt: result.receipt,
         settings: nextSettings,
@@ -484,6 +541,30 @@ function MainApp() {
       ...prev,
       courses: [...prev.courses, course],
     }));
+  };
+
+  const handleUpdateCourse = (updated: CourseItem) => {
+    mutateAppData((prev) => {
+      const nextCourses = prev.courses.map((c) => (c.id === updated.id ? updated : c));
+      const key = buildTermArchiveKey(prev.academicYear, prev.semesterCode);
+      const nextArchives = { ...(prev.termArchives ?? {}) };
+      if (nextArchives[key]) {
+        nextArchives[key] = { ...nextArchives[key], courses: nextCourses };
+      }
+      return {
+        ...prev,
+        courses: nextCourses,
+        termArchives: nextArchives,
+      };
+    });
+  };
+
+  const handleSwitchTermArchive = (termKey: string) => {
+    mutateAppData((prev) => switchToArchivedTerm(prev, termKey));
+  };
+
+  const handleRestoreBackupData = (restored: PersistedAppData) => {
+    mutateAppData(() => restored);
   };
 
   const handleDeleteManualCourse = (courseId: string) => {
@@ -623,11 +704,124 @@ function MainApp() {
   }
 
   return (
-    <SafeAreaView style={styles.safeRoot} edges={['top', 'left', 'right']}>
+    <AppThemeProvider preference={appData.settings.themePreference}>
+      <ThemedMainShell
+        appData={appData}
+        activeTab={activeTab}
+        visitedTabs={visitedTabs}
+        syncModalOpen={syncModalOpen}
+        syncTargetMode={syncTargetMode}
+        updateModalVisible={updateModalVisible}
+        pendingUpdate={pendingUpdate}
+        onSelectTab={handleSelectTab}
+        onOpenSelfSync={handleOpenSelfSync}
+        onOpenPartnerSync={handleOpenPartnerSync}
+        onLoadSample={handleLoadSample}
+        onAddAlarms={handleAddAlarms}
+        onReplaceAlarms={handleReplaceAlarms}
+        onUpdateSettings={handleUpdateSettings}
+        onSaveCoupleSchedule={handleSaveCoupleSchedule}
+        onAddManualCourse={handleAddManualCourse}
+        onUpdateCourse={handleUpdateCourse}
+        onDeleteManualCourse={handleDeleteManualCourse}
+        onSwitchTermArchive={handleSwitchTermArchive}
+        onDismissScheduleDiff={handleDismissScheduleDiff}
+        onRequestEmptyClassroomQuery={handleRequestEmptyClassroomQuery}
+        onRequestCampusCourseSearch={handleRequestCampusCourseSearch}
+        onAddManualExam={handleAddManualExam}
+        onDeleteExam={handleDeleteExam}
+        onClearAll={handleClearAll}
+        onRestoreBackupData={handleRestoreBackupData}
+        onSyncWidgetsNow={handleSyncWidgetsNow}
+        onPresentUpdateModal={handlePresentUpdateModal}
+        onCloseSyncModal={() => setSyncModalOpen(false)}
+        onSyncSuccess={handleSyncSuccess}
+        onCloseUpdateModal={() => setUpdateModalVisible(false)}
+        onDismissUpdateVersion={handleDismissUpdateVersion}
+      />
+    </AppThemeProvider>
+  );
+}
+
+const ThemedMainShell: React.FC<{
+  appData: PersistedAppData;
+  activeTab: TabKey;
+  visitedTabs: Record<TabKey, boolean>;
+  syncModalOpen: boolean;
+  syncTargetMode: {
+    target: 'self' | 'partner' | 'empty_classroom' | 'campus_search';
+    partnerNickname: string;
+    job?: AuxiliarySyncJob;
+  };
+  updateModalVisible: boolean;
+  pendingUpdate: UpdateCheckResult | null;
+  onSelectTab: (key: TabKey) => void;
+  onOpenSelfSync: () => void;
+  onOpenPartnerSync: (partnerNickname: string) => void;
+  onLoadSample: () => void;
+  onAddAlarms: (alarms: AlarmRule[]) => void;
+  onReplaceAlarms: (alarms: AlarmRule[]) => void;
+  onUpdateSettings: (next: AppSettings) => void;
+  onSaveCoupleSchedule: (profile: CoupleScheduleProfile | null) => void;
+  onAddManualCourse: (course: CourseItem) => void;
+  onUpdateCourse: (updated: CourseItem) => void;
+  onDeleteManualCourse: (courseId: string) => void;
+  onSwitchTermArchive: (termKey: string) => void;
+  onDismissScheduleDiff: () => void;
+  onRequestEmptyClassroomQuery: (params: EmptyClassroomQueryParams) => void;
+  onRequestCampusCourseSearch: (query: CampusCourseSearchQuery) => void;
+  onAddManualExam: (exam: ExamItem) => void;
+  onDeleteExam: (examId: string) => void;
+  onClearAll: () => void;
+  onRestoreBackupData: (restored: PersistedAppData) => void;
+  onSyncWidgetsNow: () => void;
+  onPresentUpdateModal: (res: UpdateCheckResult) => void;
+  onCloseSyncModal: () => void;
+  onSyncSuccess: (result: SyncResult) => void;
+  onCloseUpdateModal: () => void;
+  onDismissUpdateVersion: (version: string) => void;
+}> = ({
+  appData,
+  activeTab,
+  visitedTabs,
+  syncModalOpen,
+  syncTargetMode,
+  updateModalVisible,
+  pendingUpdate,
+  onSelectTab,
+  onOpenSelfSync,
+  onOpenPartnerSync,
+  onLoadSample,
+  onAddAlarms,
+  onReplaceAlarms,
+  onUpdateSettings,
+  onSaveCoupleSchedule,
+  onAddManualCourse,
+  onUpdateCourse,
+  onDeleteManualCourse,
+  onSwitchTermArchive,
+  onDismissScheduleDiff,
+  onRequestEmptyClassroomQuery,
+  onRequestCampusCourseSearch,
+  onAddManualExam,
+  onDeleteExam,
+  onClearAll,
+  onRestoreBackupData,
+  onSyncWidgetsNow,
+  onPresentUpdateModal,
+  onCloseSyncModal,
+  onSyncSuccess,
+  onCloseUpdateModal,
+  onDismissUpdateVersion,
+}) => {
+  const { colors } = useAppTheme();
+
+  return (
+    <SafeAreaView style={[styles.safeRoot, { backgroundColor: colors.oceanDeep }]} edges={['top', 'left', 'right']}>
       <StatusBar style="light" />
 
       {/* Keep visited tabs mounted (display toggle) to preserve scroll & filter state */}
-      <View style={styles.screenContainer}>
+      <View style={[styles.screenContainer, { backgroundColor: colors.bg }]}>
         {visitedTabs.schedule && (
           <View style={[styles.tabPane, activeTab !== 'schedule' && styles.tabPaneHidden]}>
             <ScheduleScreen
@@ -638,21 +832,26 @@ function MainApp() {
               termLabel={appData.termLabel}
               academicYear={appData.academicYear}
               semesterCode={appData.semesterCode}
+              termArchives={Object.values(appData.termArchives ?? {}).sort((a, b) =>
+                b.termKey.localeCompare(a.termKey)
+              )}
               settings={appData.settings}
               lastScheduleDiff={appData.lastScheduleDiff}
               emptyClassroomSnapshot={appData.emptyClassroomSnapshot}
               campusSearchHistory={appData.campusSearchHistory}
-              onOpenSync={handleOpenSelfSync}
-              onOpenPartnerSync={handleOpenPartnerSync}
-              onLoadSampleData={handleLoadSample}
-              onAlarmsAdded={handleAddAlarms}
-              onUpdateSettings={handleUpdateSettings}
-              onSaveCoupleSchedule={handleSaveCoupleSchedule}
-              onAddManualCourse={handleAddManualCourse}
-              onDeleteManualCourse={handleDeleteManualCourse}
-              onDismissScheduleDiff={handleDismissScheduleDiff}
-              onRequestEmptyClassroomQuery={handleRequestEmptyClassroomQuery}
-              onRequestCampusCourseSearch={handleRequestCampusCourseSearch}
+              onOpenSync={onOpenSelfSync}
+              onOpenPartnerSync={onOpenPartnerSync}
+              onLoadSampleData={onLoadSample}
+              onAlarmsAdded={onAddAlarms}
+              onUpdateSettings={onUpdateSettings}
+              onSaveCoupleSchedule={onSaveCoupleSchedule}
+              onAddManualCourse={onAddManualCourse}
+              onUpdateCourse={onUpdateCourse}
+              onDeleteManualCourse={onDeleteManualCourse}
+              onSwitchTermArchive={onSwitchTermArchive}
+              onDismissScheduleDiff={onDismissScheduleDiff}
+              onRequestEmptyClassroomQuery={onRequestEmptyClassroomQuery}
+              onRequestCampusCourseSearch={onRequestCampusCourseSearch}
             />
           </View>
         )}
@@ -663,10 +862,10 @@ function MainApp() {
               exams={appData.exams}
               alarms={appData.alarms}
               settings={appData.settings}
-              onOpenSync={handleOpenSelfSync}
-              onAddManualExam={handleAddManualExam}
-              onDeleteExam={handleDeleteExam}
-              onAlarmsAdded={handleAddAlarms}
+              onOpenSync={onOpenSelfSync}
+              onAddManualExam={onAddManualExam}
+              onDeleteExam={onDeleteExam}
+              onAlarmsAdded={onAddAlarms}
             />
           </View>
         )}
@@ -676,7 +875,7 @@ function MainApp() {
             <GradesScreen
               grades={appData.grades}
               graduationAudit={appData.graduationAudit}
-              onOpenSync={handleOpenSelfSync}
+              onOpenSync={onOpenSelfSync}
             />
           </View>
         )}
@@ -689,7 +888,7 @@ function MainApp() {
               alarms={appData.alarms}
               termLabel={appData.termLabel}
               settings={appData.settings}
-              onAlarmsUpdated={handleReplaceAlarms}
+              onAlarmsUpdated={onReplaceAlarms}
             />
           </View>
         )}
@@ -697,35 +896,46 @@ function MainApp() {
         {visitedTabs.settings && (
           <View style={[styles.tabPane, activeTab !== 'settings' && styles.tabPaneHidden]}>
             <SettingsScreen
+              appData={appData}
               settings={appData.settings}
               lastSyncReceipt={appData.lastSyncReceipt}
-              onUpdateSettings={handleUpdateSettings}
-              onClearAllData={handleClearAll}
-              onOpenSync={handleOpenSelfSync}
-              onSyncWidgetsNow={handleSyncWidgetsNow}
-              onPresentUpdateModal={handlePresentUpdateModal}
+              onUpdateSettings={onUpdateSettings}
+              onClearAllData={onClearAll}
+              onRestoreBackupData={onRestoreBackupData}
+              onOpenSync={onOpenSelfSync}
+              onSyncWidgetsNow={onSyncWidgetsNow}
+              onPresentUpdateModal={onPresentUpdateModal}
             />
           </View>
         )}
       </View>
 
       {/* Bottom Tab Bar */}
-      <SafeAreaView style={styles.tabBarSafe} edges={['bottom']}>
-        <View style={styles.tabBar}>
+      <SafeAreaView style={[styles.tabBarSafe, { backgroundColor: colors.surface }]} edges={['bottom']}>
+        <View style={[styles.tabBar, { backgroundColor: colors.surface, borderTopColor: colors.border }]}>
           {TABS.map((tab) => {
             const focused = activeTab === tab.key;
             return (
               <TouchableOpacity
                 key={tab.key}
                 style={styles.tabItem}
-                onPress={() => handleSelectTab(tab.key)}
+                accessibilityRole="tab"
+                accessibilityState={{ selected: focused }}
+                accessibilityLabel={tab.label}
+                onPress={() => onSelectTab(tab.key)}
               >
                 <Ionicons
                   name={focused ? tab.activeIcon : tab.icon}
                   size={21}
-                  color={focused ? COLORS.oceanPrimary : COLORS.textMuted}
+                  color={focused ? colors.oceanPrimary : colors.textMuted}
                 />
-                <Text style={[styles.tabLabel, focused && styles.tabLabelActive]}>
+                <Text
+                  style={[
+                    styles.tabLabel,
+                    { color: focused ? colors.oceanPrimary : colors.textMuted },
+                    focused && styles.tabLabelActive,
+                  ]}
+                >
                   {tab.label}
                 </Text>
               </TouchableOpacity>
@@ -746,8 +956,8 @@ function MainApp() {
                 ? '无痕检索全校 / 教师 / 班级课表'
                 : undefined
         }
-        onClose={() => setSyncModalOpen(false)}
-        onSyncSuccess={handleSyncSuccess}
+        onClose={onCloseSyncModal}
+        onSyncSuccess={onSyncSuccess}
       />
 
       <InAppUpdateModal
@@ -757,12 +967,12 @@ function MainApp() {
         fallbackNativeBuild={NATIVE_APP_BUILD}
         isAppleOfficialStore={IS_APPLE_OFFICIAL_STORE}
         appStoreId={IOS_APP_STORE_ID}
-        onClose={() => setUpdateModalVisible(false)}
-        onDismissVersion={handleDismissUpdateVersion}
+        onClose={onCloseUpdateModal}
+        onDismissVersion={onDismissUpdateVersion}
       />
     </SafeAreaView>
   );
-}
+};
 
 export default function App() {
   return (

@@ -1,6 +1,5 @@
-import { getActivePeriods } from '../constants/gdouTimetable';
 import { AppSettings, CourseItem, ExamItem } from '../types/models';
-import { getCourseWallClockOccurrences } from './scheduleParser';
+import { getEffectiveCourseWallClockOccurrences } from './academicCalendar';
 
 const pad2 = (n: number) => String(n).padStart(2, '0');
 
@@ -125,7 +124,6 @@ export function buildGdouIcsContent(
   termLabel: string,
   now: Date = new Date()
 ): string {
-  const periods = getActivePeriods(settings);
   const dtStamp = formatIcsUtcStamp(now);
   const reminderMin = Math.max(5, settings.defaultCalendarReminderMinutes || 15);
   const safeTermStart = sanitizeUidSegment(settings.termStartDate);
@@ -149,24 +147,29 @@ export function buildGdouIcsContent(
   ];
 
   for (const course of courses) {
-    const occurrences = getCourseWallClockOccurrences(course, settings.termStartDate, periods);
+    const occurrences = getEffectiveCourseWallClockOccurrences(course, settings);
     const courseKey = sanitizeUidSegment(course.id || `${course.name}-${course.dayOfWeek}-${course.startSection}`);
+    const effectiveRoom = course.customLocation?.trim() || course.location;
     for (const occ of occurrences) {
-      const uid = `gdou-course-${courseKey}-w${occ.week}-${safeTermStart}@schedule.gdou.edu.cn`;
-      const location = [course.campus, course.location].filter(Boolean).join(' ');
-      const desc = `教师: ${course.teacher} | 第${course.startSection}-${course.endSection}节 | 第${occ.week}周 (${course.weekText})`;
+      const occKey = occ.isMakeup ? `m${sanitizeUidSegment(occ.dateStr)}` : `w${occ.week}`;
+      const uid = `gdou-course-${courseKey}-${occKey}-${safeTermStart}@schedule.gdou.edu.cn`;
+      const location = [course.campus, effectiveRoom].filter(Boolean).join(' ');
+      const makeupSuffix = occ.isMakeup && occ.overrideLabel ? ` | 调休: ${occ.overrideLabel}` : '';
+      const noteSuffix = course.customNote?.trim() ? ` | 备注: ${course.customNote.trim()}` : '';
+      const desc = `教师: ${course.teacher} | 第${course.startSection}-${course.endSection}节 | 第${occ.effectiveWeek}周 (${course.weekText})${makeupSuffix}${noteSuffix}`;
+      const summary = occ.isMakeup ? `[调休] ${course.name}` : course.name;
       rawLines.push(
         'BEGIN:VEVENT',
         `UID:${uid}`,
         `DTSTAMP:${dtStamp}`,
         `DTSTART;TZID=Asia/Shanghai:${formatWallClockParts(occ.year, occ.month, occ.day, occ.startHour, occ.startMinute)}`,
         `DTEND;TZID=Asia/Shanghai:${formatWallClockParts(occ.year, occ.month, occ.day, occ.endHour, occ.endMinute)}`,
-        `SUMMARY:${escapeIcsText(course.name)}`,
+        `SUMMARY:${escapeIcsText(summary)}`,
         `LOCATION:${escapeIcsText(location)}`,
         `DESCRIPTION:${escapeIcsText(desc)}`,
         'BEGIN:VALARM',
         'ACTION:DISPLAY',
-        `DESCRIPTION:${escapeIcsText(`${course.name} 即将上课 (${location})`)}`,
+        `DESCRIPTION:${escapeIcsText(`${summary} 即将上课 (${location})`)}`,
         `TRIGGER:-PT${reminderMin}M`,
         'END:VALARM',
         'END:VEVENT'

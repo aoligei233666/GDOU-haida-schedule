@@ -2,8 +2,17 @@ name: Build Android APK & iOS IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish GitHub Release & auto-sync altstore-source.json IPA size'
+        type: boolean
+        default: false
   push:
     branches: [ main, master ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
 
 jobs:
   quality-gate:
@@ -21,6 +30,9 @@ jobs:
 
       - name: Install dependencies (strict lockfile)
         run: npm ci
+
+      - name: Static code quality lint
+        run: npm run lint
 
       - name: TypeScript strict typecheck
         run: npm run typecheck
@@ -57,11 +69,17 @@ jobs:
       - name: Verify Android zero-retention native code & hardened manifest survived prebuild
         run: |
           grep -q "GdouEphemeralCookieJar" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
+          grep -q "GdouNativeCoreRegistry" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q "GdouOtaBundle" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q "GdouScheduleWidgetProvider" android/app/src/main/java/cn/edu/gdou/schedule/GdouScheduleWidgetProvider.kt
+          grep -q "GdouWeeklyWidgetProvider" android/app/src/main/java/cn/edu/gdou/schedule/GdouWeeklyWidgetProvider.kt
+          grep -q "GdouWidgetRefreshReceiver" android/app/src/main/java/cn/edu/gdou/schedule/GdouWidgetRefreshReceiver.kt
           grep -q "GdouOngoingNotificationHelper" android/app/src/main/java/cn/edu/gdou/schedule/GdouScheduleWidgetProvider.kt
           grep -q "GdouMediaPickerActivity" android/app/src/main/java/cn/edu/gdou/schedule/GdouMediaPickerActivity.kt
           grep -q "GdouScheduleWidgetProvider" android/app/src/main/AndroidManifest.xml
+          grep -q "GdouWeeklyWidgetProvider" android/app/src/main/AndroidManifest.xml
+          grep -q "GdouWidgetRefreshReceiver" android/app/src/main/AndroidManifest.xml
+          grep -q "gdouschedule" android/app/src/main/AndroidManifest.xml
           grep -q "X-Gdou-Clear-Cookies-After" android/app/src/main/java/cn/edu/gdou/schedule/MainApplication.kt
           grep -q 'android:allowBackup="false"' android/app/src/main/AndroidManifest.xml
           grep -q 'android:usesCleartextTraffic="false"' android/app/src/main/AndroidManifest.xml
@@ -103,6 +121,12 @@ jobs:
             echo "No release signing secrets configured; building unsigned release APK (never debug.keystore)."
             echo "APK_SIGNED=false" >> "$GITHUB_ENV"
           fi
+
+      - name: Run Android native JUnit zero-retention tests
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --no-daemon
 
       - name: Build Android Release APK
         working-directory: android
@@ -171,13 +195,19 @@ jobs:
           grep -q "GdouEphemeralURLProtocol" "$SWIFT_FILE"
           grep -q "GdouIosAlarmBridge" "$SWIFT_FILE"
           grep -q "GdouIosWidgetBridge" "$SWIFT_FILE"
+          grep -q "GdouNativeCoreRegistry" "$SWIFT_FILE"
+          grep -q "GdouBackgroundRefreshManager" "$SWIFT_FILE"
           grep -q "GdouSharedKeychainStore" "$SWIFT_FILE"
           grep -q "isInWfwAuthPath" "$SWIFT_FILE"
           grep -q "AlarmManager.shared" "$SWIFT_FILE"
           grep -q "GdouOtaBundle" "$SWIFT_FILE"
           grep -q "NSAlarmKitUsageDescription" ios/*/Info.plist
           grep -q "NSSupportsLiveActivities" ios/*/Info.plist
+          grep -q "BGTaskSchedulerPermittedIdentifiers" ios/*/Info.plist
+          grep -q "gdouschedule" ios/*/Info.plist
+          grep -q "GetTodayGdouScheduleIntent" ios/*/GdouScheduleAppIntents.swift
           grep -q "GdouScheduleWidgetBundle" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
+          grep -q "gdouschedule://schedule" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "containerBackground(for: .widget)" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "GdouWidgetGroupDiscovery" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
           grep -q "GdouWidgetKeychainStore" ios/GdouScheduleWidgetExtension/GdouScheduleWidget.swift
@@ -201,7 +231,7 @@ jobs:
             const xcodeproj = fs.readdirSync("ios").find((d) => d.endsWith(".xcodeproj"));
             const pbx = fs.readFileSync(path.join("ios", xcodeproj, "project.pbxproj"), "utf8");
             const phases = pbx.match(/\/\* Begin PBXSourcesBuildPhase section \*\/[\s\S]*?\/\* End PBXSourcesBuildPhase section \*\//);
-            for (const f of ["GdouEphemeralNetworking.swift", "GdouScheduleActivityAttributes.swift", "GdouScheduleWidget.swift", "GdouWidgetActivityAttributes.swift"]) {
+            for (const f of ["GdouEphemeralNetworking.swift", "GdouScheduleActivityAttributes.swift", "GdouScheduleAppIntents.swift", "GdouScheduleWidget.swift", "GdouWidgetActivityAttributes.swift"]) {
               if (!phases || !phases[0].includes(f)) {
                 console.error("ERROR: " + f + " is NOT compiled in PBXSourcesBuildPhase!");
                 process.exit(1);
@@ -343,7 +373,9 @@ jobs:
           name: haida-schedule-ios-unsigned-ipa
           path: dist
 
-      - name: Build haida-schedule-vX.Y.Z-ota-manifest.json
+      - name: Build & Sign haida-schedule-vX.Y.Z-ota-manifest.json
+        env:
+          OTA_SIGNING_PRIVATE_KEY_PEM: ${{ secrets.OTA_SIGNING_PRIVATE_KEY_PEM }}
         run: |
           node -e '
             const fs = require("fs");
@@ -352,9 +384,12 @@ jobs:
             const version = appJson.expo.version;
             const otaSrc = fs.readFileSync("src/services/otaUpdateService.ts", "utf8");
             const rtMatch = otaSrc.match(/NATIVE_OTA_RUNTIME_VERSION\s*=\s*(\d+)/);
-            const minNativeRuntimeVersion = rtMatch ? Number(rtMatch[1]) : 1;
+            const minNativeRuntimeVersion = rtMatch ? Number(rtMatch[1]) : 4;
             const iosName = `haida-schedule-v${version}-ios-ota.jsbundle`;
             const androidName = `haida-schedule-v${version}-android-ota.jsbundle`;
+            const iosIpaName = `haida-schedule-v${version}-ios-unsigned.ipa`;
+            const androidApkSigned = `haida-schedule-v${version}-android.apk`;
+            const androidApkUnsigned = `haida-schedule-v${version}-android-unsigned.apk`;
             const hashAndSize = (fname) => {
               const p = `dist/${fname}`;
               if (!fs.existsSync(p)) return null;
@@ -366,6 +401,8 @@ jobs:
             };
             const iosInfo = hashAndSize(iosName);
             const androidInfo = hashAndSize(androidName);
+            const ipaInfo = hashAndSize(iosIpaName);
+            const apkInfo = hashAndSize(androidApkSigned) || hashAndSize(androidApkUnsigned);
             const manifest = {
               version,
               minNativeRuntimeVersion,
@@ -386,11 +423,15 @@ jobs:
                     android: { fileName: androidName, sha256: androidInfo.sha256, size: androidInfo.size },
                   }
                 : {}),
+              ...(ipaInfo ? { iosIpaSha256: ipaInfo.sha256, iosIpaSize: ipaInfo.size } : {}),
+              ...(apkInfo ? { androidApkSha256: apkInfo.sha256, androidApkSize: apkInfo.size } : {}),
             };
             const outPath = `dist/haida-schedule-v${version}-ota-manifest.json`;
             fs.writeFileSync(outPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
             console.log("Generated", outPath, manifest);
           '
+          APP_VERSION=$(node -p "require('./app.json').expo.version")
+          node scripts/sign-ota-manifest.mjs "dist/haida-schedule-v${APP_VERSION}-ota-manifest.json"
 
       - name: Upload OTA manifest artifact
         uses: actions/upload-artifact@v4
@@ -398,3 +439,74 @@ jobs:
           name: haida-schedule-ota-manifest
           path: dist/haida-schedule-v*-ota-manifest.json
           if-no-files-found: error
+
+  publish-github-release:
+    name: Publish GitHub Release & Sync AltStore IPA Size
+    needs: [ build-android-apk, build-ios-ipa, generate-ota-manifest ]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Sync exact IPA size into altstore-source.json & commit [skip ci]
+        run: |
+          APP_VERSION=$(node -p "require('./app.json').expo.version")
+          TAG="v${APP_VERSION}"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          IPA_PATH="dist/haida-schedule-${TAG}-ios-unsigned.ipa"
+          if [ -f "$IPA_PATH" ]; then
+            IPA_SIZE=$(stat -c%s "$IPA_PATH")
+            echo "Exact IPA size: $IPA_SIZE"
+            node -e '
+              const fs = require("fs");
+              const size = Number(process.argv[1]);
+              const ver = process.argv[2];
+              const src = JSON.parse(fs.readFileSync("altstore-source.json", "utf8"));
+              if (src.apps && src.apps[0]) {
+                src.apps[0].size = size;
+                const entry = (src.apps[0].versions || []).find((v) => v.version === ver);
+                if (entry) entry.size = size;
+              }
+              fs.writeFileSync("altstore-source.json", JSON.stringify(src, null, 2) + "\n", "utf8");
+            ' "$IPA_SIZE" "$APP_VERSION"
+            if ! git diff --quiet altstore-source.json; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add altstore-source.json
+              git commit -m "chore(release): sync exact ${TAG} IPA size (${IPA_SIZE}) in altstore-source.json [skip ci]"
+              git push origin main
+            fi
+          fi
+
+      - name: Create or update GitHub Release with APK, IPA, OTA bundles & manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -lh dist/
+          NOTES=$(node -e '
+            const fs = require("fs");
+            const src = JSON.parse(fs.readFileSync("altstore-source.json", "utf8"));
+            const desc = src.apps?.[0]?.versionDescription || "海大课表新版本发布";
+            console.log(desc);
+          ')
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --title "海大课表 ${RELEASE_TAG}" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "海大课表 ${RELEASE_TAG}" \
+              --notes "$NOTES"
+          fi

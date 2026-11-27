@@ -27,31 +27,43 @@ export function buildLiveContainerDirectInstallUrl(ipaUrl: string): string {
   return `livecontainer://install?url=${encodeURIComponent(ipaUrl)}`;
 }
 
+export const CAMPUS_GITHUB_MIRROR_PREFIXES: readonly string[] = [
+  'https://gh-proxy.com/',
+  'https://ghfast.top/',
+  'https://mirror.ghproxy.com/',
+];
+
+export function buildCampusMirrorDownloadUrls(githubUrl: string): string[] {
+  const clean = String(githubUrl ?? '').trim();
+  if (!clean) return [];
+  return CAMPUS_GITHUB_MIRROR_PREFIXES.map((prefix) => `${prefix}${clean}`);
+}
+
 /**
- * Concise summary of current v1.5.2 improvements & bug fixes shown directly in Settings -> Update Card.
+ * Concise summary of current v2.0.0 improvements & bug fixes shown directly in Settings -> Update Card.
  */
 export const CURRENT_VERSION_HIGHLIGHTS: string[] = [
-  '真正一步直通教务登录：校外跳过微门户二次跳转，直接签发教务系统票据（只需输一次密码或手机短信验证码免密登录），并新增网页内一键切短信免密开关',
-  '彻底修复双端桌面小组件不显示课程：iOS 新增共享钥匙串双通道（无 App Group 侧载签名也能读取课表）与宿主包自动识别；双端均支持未来 7 天滚动课表、跨日自动刷新与无课日自动预览下个上课日课程',
-  '升级软件内更新体验：启动自动静默检测并弹出居中更新卡片，支持实时进度条热更新原地无感重启，后续常规更新无需跳出 App',
-  '完整保留 9 大校园工具：查询空教室、全校蹭课搜索、培养方案学分核对、成绩分项明细、课表变动 Diff、海大校历调休与高清课表图导出',
+  '节假日与调休全链路贯通：系统日历、.ics 导出、起床与课前闹钟统一按海大校历跳过法定放假、自动补排调休课程，并支持云端静态校历配置自动对齐未来学年',
+  '全局深色模式 + 多学期归档 + 课程编辑与作业 DDL：支持跟随系统/深色/浅色切换、多学期课表自由切换、单课备注/调教室/换色与课程作业截止提醒，新增脱敏成绩单 CSV/文本导出与本地无凭据全量备份换机',
+  '双端原生能力大升级：桌面挂件与灵动岛支持点击直达课表/考试（gdouschedule://）、Android 新增 4×4 一周滚动大挂件与课节边界自刷新、iOS 新增 Siri/快捷指令 AppIntents 与后台定时刷新，并引入离线教学楼速查字典',
+  '架构与安全全面演进：OTA 热更引入 Ed25519 数字签名强制验签与校园网加速镜像兜底；本地原生桥接迁移至标准 Expo Native Module，并完成插件与认证核心模块化重构',
 ];
 
 export function getPlatformVersionHighlights(platformOs: string): string[] {
   if (platformOs === 'android') {
     return [
-      '真正一步直通教务登录：校外跳过微门户二次跳转，直接签发教务系统票据（只需输一次密码），支持一键手机短信验证码免密登录',
-      '修复桌面小组件不显示课程：同步写入并增加文件双备份，支持实时计算当前/下节课程、未来 7 天跨日自动滚动与无课日自动展示下个上课日课程',
-      '升级软件内更新体验：启动自动静默检测并弹出软件内更新卡片，支持进度条热更新或直接下载 APK 调起系统安装',
-      '完整保留查询空教室、全校蹭课搜索、培养方案学分核对、成绩分项明细、课表换肤与通知栏常驻今日课表',
+      '节假日/调休贯通日历、.ics 与系统闹钟：放假自动停响、调休自动补排，支持云端海大校历静默同步',
+      '全局深色模式 + 多学期切换 + 课程编辑与作业 DDL + 脱敏成绩单导出 + 本地无凭据全量备份换机',
+      '新增 4×4「一周滚动课表」大挂件、挂件深链直达与课节边界后台自动刷新，新增离线教学楼定位速查与手势左右滑动切周',
+      'OTA 热更新升级 Ed25519 强制验签与校园网加速镜像兜底，原生桥接全面升级为本地 Expo Module（JSI）',
     ];
   }
   if (platformOs === 'ios') {
     return [
-      '真正一步直通教务登录：校外跳过微门户二次跳转直接签发教务票据，告别反复跳转与二次登录；支持 iOS 短信验证码一键自动填充与一键短信免密登录',
-      '彻底修复 iOS 桌面小组件不显示课程：新增共享钥匙串通道（兼容无 App Group 的侧载/企业签名）与宿主包自动识别，支持未来 7 天滚动课表、跨日自动刷新及无课日自动显示下个上课日课程',
-      '升级软件内更新体验：启动自动检测并居中弹出更新卡片，支持软件内进度条热更新原地无感重启（免电脑免重签）、应用内商店卡片与自动识别已装签名器一键升级',
-      '完整保留 iOS 26 AlarmKit 系统闹钟、灵动岛实时课表、查询空教室、蹭课搜索与高清课表图导出',
+      '节假日/调休贯通 iOS 日历、.ics 与 AlarmKit 闹钟：放假自动停响、调休自动补排，支持云端海大校历静默同步',
+      '全局深色模式 + 多学期切换 + 课程编辑与作业 DDL + 脱敏成绩单导出 + 本地无凭据全量备份换机',
+      'iOS 桌面挂件与灵动岛支持点击深链直达，新增 Siri 语音问课与快捷指令自动化（每天早 7 点自动开启灵动岛）及 BGAppRefreshTask 后台刷新',
+      'OTA 免重签热更新升级 Ed25519 强制验签与校园网加速镜像兜底，原生桥接升级为本地 Expo Module（JSI）',
     ];
   }
   return CURRENT_VERSION_HIGHLIGHTS;
@@ -334,9 +346,24 @@ async function fallbackCheckViaAltStoreSource(
   platformOs: string,
   options: { timeoutMs?: number; signal?: AbortSignal } = {}
 ): Promise<UpdateCheckResult | null> {
+  const candidates = [IOS_ALTSTORE_SOURCE_URL, ...buildCampusMirrorDownloadUrls(IOS_ALTSTORE_SOURCE_URL)];
+  let resp: Response | null = null;
+  for (const url of candidates) {
+    try {
+      const attempt = await fetchGithubJson(url, currentVersion, {
+        ...options,
+        timeoutMs: Math.min(options.timeoutMs ?? UPDATE_CHECK_TIMEOUT_MS, 7_000),
+      });
+      if (attempt.ok) {
+        resp = attempt;
+        break;
+      }
+    } catch {
+      // Try next mirror candidate
+    }
+  }
+  if (!resp) return null;
   try {
-    const resp = await fetchGithubJson(IOS_ALTSTORE_SOURCE_URL, currentVersion, options);
-    if (!resp.ok) return null;
     const data = (await resp.json()) as {
       apps?: Array<{
         version?: string;
@@ -408,7 +435,18 @@ export async function checkForAppUpdate(
 ): Promise<UpdateCheckResult> {
   let release: GitHubReleasePayload | null = null;
 
-  const latestResp = await fetchGithubJson(GITHUB_LATEST_RELEASE_API_URL, currentVersion, options);
+  let latestResp: Response | null = null;
+  try {
+    latestResp = await fetchGithubJson(GITHUB_LATEST_RELEASE_API_URL, currentVersion, options);
+  } catch (networkErr) {
+    // On campus NAT/firewall timeout, try AltStore source + campus mirrors before surfacing error
+    const fallback = await fallbackCheckViaAltStoreSource(currentVersion, platformOs, options);
+    if (fallback) {
+      return fallback;
+    }
+    throw networkErr;
+  }
+
   if (latestResp.ok) {
     release = (await latestResp.json()) as GitHubReleasePayload;
   } else if (latestResp.status === 404) {

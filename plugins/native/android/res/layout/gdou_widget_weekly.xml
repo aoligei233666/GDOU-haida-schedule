@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/weekly_widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/gdou_widget_bg"
+    android:orientation="vertical"
+    android:padding="13dp">
+
+    <TextView
+        android:id="@+id/weekly_header_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:text="海大课表 · 一周滚动"
+        android:textColor="#E0F2FE"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/weekly_subline"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:text="未来 7 天滚动课表"
+        android:textColor="#BAE6FD"
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/weekly_body"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:lineSpacingExtra="2dp"
+        android:maxLines="14"
+        android:text="点击打开海大课表同步课程"
+        android:textColor="#F8FAFC"
+        android:textSize="11.5sp" />
+</LinearLayout>

@@ -4,6 +4,10 @@ import { Linking, Platform } from 'react-native';
 import { DAY_FULL_LABELS, DAY_LABELS, getActivePeriods } from '../constants/gdouTimetable';
 import { AlarmRule, AlarmSystemEngine, AppSettings, CourseItem, ExamItem } from '../types/models';
 import {
+  getEffectiveFirstClassPerDayInWeek,
+  resolveEffectiveScheduleDate,
+} from './academicCalendar';
+import {
   buildClassAlarmDedupeKey,
   buildExamAlarmDedupeKey,
   buildWakeupAlarmDedupeKey,
@@ -12,11 +16,11 @@ import {
 } from './alarmDedupe';
 import { generateSecureHex } from './cryptoAes';
 import { parseExamIsoLocal } from './examParser';
+import { invokeNativeBridge } from './gdouNativeBridge';
 import {
   applyTimeToDate,
   getCourseTimeSpan,
   getDateForWeekAndDay,
-  getFirstClassPerDayInWeek,
   isCourseSchedulable,
   parseLocalDateStrict,
 } from './scheduleParser';
@@ -67,23 +71,30 @@ function isoWeekdayToCalendarDay(isoDay: number): number {
   return isoDay === 7 ? 1 : isoDay + 1;
 }
 
+const ALARM_PATH_TO_ACTION: Record<string, string> = {
+  '/alarm-capabilities': 'alarm/capabilities',
+  '/set-system-alarms': 'alarm/set',
+  '/cancel-system-alarms': 'alarm/cancel',
+  '/clear-system-alarms': 'alarm/clear',
+  '/show-alarms': 'alarm/show',
+};
+
 async function fetchAlarmBridge(
   path: string,
   options?: { method?: 'GET' | 'POST'; body?: unknown; timeoutMs?: number }
-): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutMs = options?.timeoutMs ?? 12_000;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(`https://gdou-alarm-internal.local${path}`, {
-      method: options?.method ?? 'POST',
-      headers: options?.body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
-      body: options?.body !== undefined ? JSON.stringify(options.body) : undefined,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+): Promise<{ ok: boolean; json: () => Promise<Record<string, unknown>> }> {
+  const action = ALARM_PATH_TO_ACTION[path] || `alarm${path}`;
+  const res = await invokeNativeBridge({
+    action,
+    payload: options?.body,
+    legacyUrl: `https://gdou-alarm-internal.local${path}`,
+    legacyMethod: options?.method ?? 'POST',
+    timeoutMs: options?.timeoutMs ?? 12_000,
+  });
+  return {
+    ok: res.ok || typeof res.engine === 'string' || typeof res.supported === 'boolean',
+    json: async () => res,
+  };
 }
 
 export async function openAppSystemSettings(): Promise<boolean> {
@@ -371,7 +382,42 @@ export async function createClassAlarm(
 
   const periods = getActivePeriods(settings);
   const { startText } = getCourseTimeSpan(course, periods);
-  const dayDate = getDateForWeekAndDay(settings.termStartDate, week, course.dayOfWeek);
+  let targetDayOfWeek = course.dayOfWeek;
+  let dayDate = getDateForWeekAndDay(settings.termStartDate, week, course.dayOfWeek);
+  const resolvedNatural = resolveEffectiveScheduleDate(
+    dayDate,
+    settings.termStartDate,
+    settings.totalWeeks,
+    settings.calendarOverrides
+  );
+  if (resolvedNatural.isHoliday) {
+    // Check if there is a makeup day in the same week mapped to this course's weekday
+    let foundMakeupDay: { colDay: number; date: Date } | null = null;
+    for (let d = 1; d <= 7; d++) {
+      const candidateDate = getDateForWeekAndDay(settings.termStartDate, week, d);
+      const candidateRes = resolveEffectiveScheduleDate(
+        candidateDate,
+        settings.termStartDate,
+        settings.totalWeeks,
+        settings.calendarOverrides
+      );
+      if (candidateRes.isMakeup && candidateRes.effectiveDayOfWeek === course.dayOfWeek) {
+        foundMakeupDay = { colDay: d, date: candidateDate };
+        break;
+      }
+    }
+    if (foundMakeupDay) {
+      targetDayOfWeek = foundMakeupDay.colDay;
+      dayDate = foundMakeupDay.date;
+    } else {
+      throw new Error(
+        `第 ${week} 周周${DAY_LABELS[course.dayOfWeek - 1] ?? course.dayOfWeek} 为「${
+          resolvedNatural.override?.label || '法定节假日'
+        }」停课，无需设置上课闹钟`
+      );
+    }
+  }
+  const effectiveLocation = course.customLocation?.trim() || course.location;
   const classStart = applyTimeToDate(dayDate, startText);
   const triggerDate = new Date(classStart.getTime() - advanceMinutes * 60 * 1000);
   const isFuture = triggerDate.getTime() > Date.now() + 2000;
@@ -382,7 +428,7 @@ export async function createClassAlarm(
   const hour = triggerDate.getHours();
   const minute = triggerDate.getMinutes();
   const title = `⏰ 上课提醒：${course.name}`;
-  const body = `${advanceMinutes} 分钟后上课（${startText}）· 地点：${course.location} · 教师：${course.teacher}`;
+  const body = `${advanceMinutes} 分钟后上课（${startText}）· 地点：${effectiveLocation} · 教师：${course.teacher}`;
 
   let systemClockWritten = false;
   let systemAlarmId: string | undefined;
@@ -393,8 +439,8 @@ export async function createClassAlarm(
     systemClockWritten = await setNativeAndroidSystemClockAlarm({
       hour,
       minute,
-      message: `${course.name} (${course.location})`,
-      isoWeekdays: [course.dayOfWeek],
+      message: `${course.name} (${effectiveLocation})`,
+      isoWeekdays: [targetDayOfWeek],
       skipUi: true,
     });
     if (systemClockWritten) {
@@ -407,10 +453,10 @@ export async function createClassAlarm(
           dedupeKey,
           hour,
           minute,
-          message: `上课：${course.name} (${course.location})`,
+          message: `上课：${course.name} (${effectiveLocation})`,
           mode: isFuture ? 'fixed' : 'relative',
           triggerEpochMs: triggerDate.getTime(),
-          isoWeekdays: isFuture ? undefined : [course.dayOfWeek],
+          isoWeekdays: isFuture ? undefined : [targetDayOfWeek],
         },
       ],
       cancelledSystemIds
@@ -496,7 +542,7 @@ export async function createWeeklyMorningWakeupAlarms(
     throw new Error(`开学基准日期无效（${settings.termStartDate}），请先在设置页修正`);
   }
   const periods = getActivePeriods(settings);
-  const firstPerDay = getFirstClassPerDayInWeek(courses, week);
+  const effectiveFirstPerDay = getEffectiveFirstClassPerDayInWeek(courses, week, settings);
   const nowMs = Date.now();
 
   let skippedPast = 0;
@@ -514,9 +560,10 @@ export async function createWeeklyMorningWakeupAlarms(
     body: string;
   }[] = [];
 
-  for (const [dayOfWeek, firstCourse] of firstPerDay.entries()) {
+  for (const entry of effectiveFirstPerDay) {
+    const { dayOfWeek, date: dayDate, course: firstCourse, resolved } = entry;
     const { startText } = getCourseTimeSpan(firstCourse, periods);
-    const dayDate = getDateForWeekAndDay(settings.termStartDate, week, dayOfWeek);
+    const effectiveLocation = firstCourse.customLocation?.trim() || firstCourse.location;
     const classStart = applyTimeToDate(dayDate, startText);
     const triggerDate = new Date(classStart.getTime() - wakeupMinutesBefore * 60 * 1000);
     const isFutureInWeek = triggerDate.getTime() > nowMs + 5000;
@@ -525,8 +572,9 @@ export async function createWeeklyMorningWakeupAlarms(
     }
 
     const dayLabel = DAY_FULL_LABELS[dayOfWeek - 1] ?? `周${dayOfWeek}`;
-    const title = `🌅 ${dayLabel}早起闹钟（首课 ${startText}）`;
-    const body = `第 ${week} 周首节课：${firstCourse.name} · 教室 ${firstCourse.location}，距离上课还有 ${wakeupMinutesBefore} 分钟`;
+    const makeupTag = resolved.isMakeup ? `·${resolved.badgeText || '调休补课'}` : '';
+    const title = `🌅 ${dayLabel}早起闹钟${makeupTag}（首课 ${startText}）`;
+    const body = `第 ${week} 周首节课：${firstCourse.name} · 教室 ${effectiveLocation}，距离上课还有 ${wakeupMinutesBefore} 分钟`;
     tasks.push({
       dayOfWeek,
       dedupeKey: buildWakeupAlarmDedupeKey(week, dayOfWeek),

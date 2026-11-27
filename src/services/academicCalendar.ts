@@ -7,7 +7,9 @@ import {
 } from '../types/models';
 import {
   computeTermWeek,
+  CourseWallClockOccurrence,
   getCourseTimeSpan,
+  getDateForWeekAndDay,
   isCourseSchedulable,
   parseLocalDateStrict,
 } from './scheduleParser';
@@ -55,12 +57,22 @@ export function formatIsoLocalDate(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+let dynamicPresetCalendarOverrides: CalendarDayOverride[] = [];
+
+export function setDynamicCalendarPresets(overrides: CalendarDayOverride[]): void {
+  dynamicPresetCalendarOverrides = Array.isArray(overrides) ? [...overrides] : [];
+}
+
 export function getEffectiveCalendarOverrides(
   userOverrides: CalendarDayOverride[] = []
 ): CalendarDayOverride[] {
   const byDate = new Map<string, CalendarDayOverride>();
   for (const preset of GDOU_PRESET_CALENDAR_OVERRIDES) {
     byDate.set(preset.date, preset);
+  }
+  for (const remotePreset of dynamicPresetCalendarOverrides) {
+    if (!remotePreset || !remotePreset.date) continue;
+    byDate.set(remotePreset.date, { ...remotePreset, isPreset: true });
   }
   for (const custom of userOverrides) {
     if (!custom || !custom.date) continue;
@@ -181,6 +193,142 @@ export function getCoursesForDate(
     )
     .sort((a, b) => a.startSection - b.startSection);
   return { resolved, courses: active };
+}
+
+export interface EffectiveCourseWallClockOccurrence extends CourseWallClockOccurrence {
+  dateStr: string;
+  effectiveWeek: number;
+  isMakeup: boolean;
+  overrideLabel?: string;
+}
+
+/**
+ * Unified holiday- & makeup-aware Asia/Shanghai wall-clock occurrence expander.
+ * Shared as the single source of truth across System Calendar, RFC 5545 .ics export, and Alarms:
+ * - Skips legal/school holidays completely (no bogus calendar events or wakeup alarms on holidays).
+ * - Automatically maps makeup workdays (e.g. Saturday following Tuesday schedule) to the real date.
+ */
+export function getEffectiveCourseWallClockOccurrences(
+  course: CourseItem,
+  settings: AppSettings
+): EffectiveCourseWallClockOccurrence[] {
+  if (!isCourseSchedulable(course)) return [];
+  const startMatch = String(settings.termStartDate ?? '').trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!startMatch) return [];
+  const baseYear = parseInt(startMatch[1], 10);
+  const baseMonth = parseInt(startMatch[2], 10);
+  const baseDay = parseInt(startMatch[3], 10);
+  const check = new Date(Date.UTC(baseYear, baseMonth - 1, baseDay));
+  if (
+    check.getUTCFullYear() !== baseYear ||
+    check.getUTCMonth() !== baseMonth - 1 ||
+    check.getUTCDate() !== baseDay
+  ) {
+    return [];
+  }
+
+  const periods = getActivePeriods(settings);
+  const { startText, endText } = getCourseTimeSpan(course, periods);
+  const [sh, sm] = startText.split(':').map((v) => parseInt(v, 10));
+  const [eh, em] = endText.split(':').map((v) => parseInt(v, 10));
+  const startHour = Number.isFinite(sh) ? sh : 8;
+  const startMinute = Number.isFinite(sm) ? sm : 10;
+  const endHour = Number.isFinite(eh) ? eh : 9;
+  const endMinute = Number.isFinite(em) ? em : 50;
+
+  const overrides = getEffectiveCalendarOverrides(settings.calendarOverrides);
+  const overrideMap = new Map<string, CalendarDayOverride>();
+  for (const ov of overrides) {
+    overrideMap.set(ov.date, ov);
+  }
+
+  const totalDays = Math.max(7, Math.min(240, (settings.totalWeeks || 20) * 7));
+  const results: EffectiveCourseWallClockOccurrence[] = [];
+
+  for (let dayOffset = 0; dayOffset < totalDays; dayOffset++) {
+    const dt = new Date(Date.UTC(baseYear, baseMonth - 1, baseDay + dayOffset));
+    const year = dt.getUTCFullYear();
+    const month = dt.getUTCMonth() + 1;
+    const day = dt.getUTCDate();
+    const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const naturalWeek = Math.floor(dayOffset / 7) + 1;
+    const rawDow = dt.getUTCDay();
+    const naturalDow = rawDow === 0 ? 7 : rawDow;
+
+    const ov = overrideMap.get(dateStr) ?? null;
+    if (ov?.kind === 'holiday') {
+      continue;
+    }
+
+    let effectiveWeek = naturalWeek;
+    let effectiveDow = naturalDow;
+    let isMakeup = false;
+    let overrideLabel: string | undefined;
+
+    if (
+      ov?.kind === 'makeup' &&
+      ov.mappedDayOfWeek &&
+      ov.mappedDayOfWeek >= 1 &&
+      ov.mappedDayOfWeek <= 7
+    ) {
+      effectiveDow = ov.mappedDayOfWeek;
+      if (ov.mappedWeek && ov.mappedWeek >= 1 && ov.mappedWeek <= settings.totalWeeks) {
+        effectiveWeek = ov.mappedWeek;
+      }
+      isMakeup = true;
+      overrideLabel = ov.label;
+    }
+
+    if (course.dayOfWeek === effectiveDow && course.weeks.includes(effectiveWeek)) {
+      results.push({
+        week: naturalWeek,
+        effectiveWeek,
+        dateStr,
+        year,
+        month,
+        day,
+        startHour,
+        startMinute,
+        endHour,
+        endMinute,
+        isMakeup,
+        overrideLabel,
+      });
+    }
+  }
+
+  return results;
+}
+
+export interface EffectiveDailyFirstClass {
+  dayOfWeek: number; // actual calendar weekday 1..7
+  date: Date;
+  course: CourseItem;
+  resolved: ResolvedScheduleDate;
+}
+
+/**
+ * Holiday- & makeup-aware earliest class per day in a teaching week.
+ * Skips holidays completely and includes makeup-day classes on the shifted calendar weekday.
+ */
+export function getEffectiveFirstClassPerDayInWeek(
+  courses: CourseItem[],
+  week: number,
+  settings: AppSettings
+): EffectiveDailyFirstClass[] {
+  const result: EffectiveDailyFirstClass[] = [];
+  for (let colDay = 1; colDay <= 7; colDay++) {
+    const date = getDateForWeekAndDay(settings.termStartDate, week, colDay);
+    const { resolved, courses: dayCourses } = getCoursesForDate(courses, date, settings);
+    if (resolved.isHoliday || dayCourses.length === 0) continue;
+    result.push({
+      dayOfWeek: colDay,
+      date,
+      course: dayCourses[0],
+      resolved,
+    });
+  }
+  return result;
 }
 
 export interface TodayClassLiveItem {

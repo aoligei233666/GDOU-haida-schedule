@@ -1,10 +1,9 @@
 import * as Calendar from 'expo-calendar/legacy';
 import { Platform } from 'react-native';
-import { getActivePeriods } from '../constants/gdouTimetable';
 import { AppSettings, CourseItem, ExamItem } from '../types/models';
+import { getEffectiveCourseWallClockOccurrences } from './academicCalendar';
 import { parseExamIsoLocal } from './examParser';
 import {
-  getCourseWallClockOccurrences,
   isCourseSchedulable,
   parseLocalDateStrict,
 } from './scheduleParser';
@@ -607,7 +606,6 @@ export async function syncAllCoursesToCalendar(
   }
 
   const { target, fallback } = await ensureGdouCalendarTarget();
-  const periods = getActivePeriods(settings);
   const nowMs = Date.now();
   const reminderOffset = -Math.abs(settings.defaultCalendarReminderMinutes || 15);
   const alarms = buildReminderAlarms([reminderOffset]);
@@ -621,7 +619,7 @@ export async function syncAllCoursesToCalendar(
       skippedUnparsed++;
       continue;
     }
-    const occurrences = getCourseWallClockOccurrences(course, settings.termStartDate, periods);
+    const occurrences = getEffectiveCourseWallClockOccurrences(course, settings);
     for (const occ of occurrences) {
       const startDate = shanghaiWallClockToDate(
         occ.year,
@@ -641,15 +639,20 @@ export async function syncAllCoursesToCalendar(
         skippedPast++;
         continue;
       }
-      const tag = `${COURSE_TAG_PREFIX}${course.id}:w${occ.week}]`;
+      const tag = occ.isMakeup
+        ? `${COURSE_TAG_PREFIX}${course.id}:m${occ.dateStr}]`
+        : `${COURSE_TAG_PREFIX}${course.id}:w${occ.week}]`;
+      const effectiveLocation = course.customLocation?.trim() || course.location;
+      const makeupNote = occ.isMakeup && occ.overrideLabel ? `\n调休说明：${occ.overrideLabel}` : '';
+      const customNote = course.customNote?.trim() ? `\n个人备注：${course.customNote.trim()}` : '';
       desired.push({
         tag,
         details: {
-          title: course.name,
-          location: [course.campus, course.location].filter(Boolean).join(' · '),
-          notes: `授课教师：${course.teacher}\n节次：第 ${course.startSection}-${course.endSection} 节\n周次：第 ${occ.week} 周（${course.weekText}）${
+          title: occ.isMakeup ? `[调休] ${course.name}` : course.name,
+          location: [course.campus, effectiveLocation].filter(Boolean).join(' · '),
+          notes: `授课教师：${course.teacher}\n节次：第 ${course.startSection}-${course.endSection} 节\n周次：第 ${occ.effectiveWeek} 周（${course.weekText}）${
             course.credit ? `\n学分：${course.credit}` : ''
-          }\n${tag}`,
+          }${makeupNote}${customNote}\n${tag}`,
           startDate,
           endDate,
           timeZone: 'Asia/Shanghai',
@@ -709,13 +712,15 @@ export async function addSingleCourseToCalendar(
   }
 
   const { target, fallback } = await ensureGdouCalendarTarget();
-  const periods = getActivePeriods(settings);
   const reminderOffset = -Math.abs(settings.defaultCalendarReminderMinutes || 15);
   const alarms = buildReminderAlarms([reminderOffset]);
-  const occurrences = getCourseWallClockOccurrences(course, settings.termStartDate, periods);
+  const occurrences = getEffectiveCourseWallClockOccurrences(course, settings);
+  const effectiveLocation = course.customLocation?.trim() || course.location;
 
   const desired: DesiredCalendarEvent[] = occurrences.map((occ) => {
-    const tag = `${COURSE_TAG_PREFIX}${course.id}:w${occ.week}]`;
+    const tag = occ.isMakeup
+      ? `${COURSE_TAG_PREFIX}${course.id}:m${occ.dateStr}]`
+      : `${COURSE_TAG_PREFIX}${course.id}:w${occ.week}]`;
     const startDate = shanghaiWallClockToDate(
       occ.year,
       occ.month,
@@ -730,12 +735,14 @@ export async function addSingleCourseToCalendar(
       occ.endHour,
       occ.endMinute
     );
+    const makeupNote = occ.isMakeup && occ.overrideLabel ? `\n调休说明：${occ.overrideLabel}` : '';
+    const customNote = course.customNote?.trim() ? `\n个人备注：${course.customNote.trim()}` : '';
     return {
       tag,
       details: {
-        title: course.name,
-        location: [course.campus, course.location].filter(Boolean).join(' · '),
-        notes: `授课教师：${course.teacher}\n节次：第 ${course.startSection}-${course.endSection} 节\n周次：第 ${occ.week} 周（${course.weekText}）\n${tag}`,
+        title: occ.isMakeup ? `[调休] ${course.name}` : course.name,
+        location: [course.campus, effectiveLocation].filter(Boolean).join(' · '),
+        notes: `授课教师：${course.teacher}\n节次：第 ${course.startSection}-${course.endSection} 节\n周次：第 ${occ.effectiveWeek} 周（${course.weekText}）${makeupNote}${customNote}\n${tag}`,
         startDate,
         endDate,
         timeZone: 'Asia/Shanghai',

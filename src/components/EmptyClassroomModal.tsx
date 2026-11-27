@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { lookupGdouBuildingGuide } from '../constants/gdouBuildings';
 import { DAY_FULL_LABELS } from '../constants/gdouTimetable';
 import { getTodayDayOfWeek, isCourseSchedulable } from '../services/scheduleParser';
 import { COLORS } from '../theme/colors';
@@ -403,21 +404,29 @@ export const EmptyClassroomModal: React.FC<Props> = ({
                 <Text style={styles.emptySmall}>当前筛选条件下暂无匹配空教室，可放宽座位数或点击上方重新查询。</Text>
               ) : (
                 <View style={styles.roomGrid}>
-                  {filteredRooms.map((room) => (
-                    <View key={room.id} style={styles.roomItem}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.roomName}>{room.roomName}</Text>
-                        <Text style={styles.roomSub}>
-                          {room.campus} · {room.building} · {room.roomType}
-                        </Text>
+                  {filteredRooms.map((room) => {
+                    const guide = lookupGdouBuildingGuide(room.roomName || room.building, room.campus);
+                    return (
+                      <View key={room.id} style={styles.roomItem}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.roomName}>{room.roomName}</Text>
+                          <Text style={styles.roomSub}>
+                            {room.campus} · {room.building} · {room.roomType}
+                          </Text>
+                          {guide && (
+                            <Text style={[styles.roomSub, { color: COLORS.oceanPrimary, marginTop: 2 }]} numberOfLines={1}>
+                              📍 {guide.zone}
+                            </Text>
+                          )}
+                        </View>
+                        <View style={styles.seatBadge}>
+                          <Text style={styles.seatBadgeText}>
+                            {room.seats > 0 ? `${room.seats} 座` : '可用'}
+                          </Text>
+                        </View>
                       </View>
-                      <View style={styles.seatBadge}>
-                        <Text style={styles.seatBadgeText}>
-                          {room.seats > 0 ? `${room.seats} 座` : '可用'}
-                        </Text>
-                      </View>
-                    </View>
-                  ))}
+                    );
+                  })}
                 </View>
               )}
             </View>

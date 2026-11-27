@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="@drawable/gdou_widget_bg">
+
+    <TextView
+        android:id="@+id/widget_header_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="海大课表 · 今日课程"
+        android:textColor="#BAE6FD"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/widget_headline"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="打开海大课表同步课表"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/widget_subline"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="点击进入海大课表查看全部安排"
+        android:textColor="#E0F2FE"
+        android:textSize="11sp"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
+    <TextView
+        android:id="@+id/widget_items_list"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="6dp"
+        android:text="支持桌面直看今日课表与考试倒计时"
+        android:textColor="#F8FAFC"
+        android:textSize="11.5sp"
+        android:lineSpacingExtra="2dp"
+        android:maxLines="5"
+        android:ellipsize="end" />
+</LinearLayout>
