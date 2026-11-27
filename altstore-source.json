@@ -25,7 +25,7 @@
       "versionDate": "2026-11-27",
       "versionDescription": "v1.5.2：\n1. 真正实现一步直通教务登录：校外访问直接通过 wfw.gdou.edu.cn/authserver/login 签发教务系统票据，彻底跳过旧版微门户首页与二次跳转；修复移动端短信免密标签与站内跳转，网页同步新增一键切换「短信免密 / 密码登录」开关；\n2. 彻底修复双端桌面小组件无法显示课程：iOS 新增共享钥匙串双通道（无 App Group 的自签/企业签名也能正常读取课表）、自动读取宿主 .app Bundle ID（兼容 Sideloadly / ESign / Feather 重签）、容错 JSON 解码与按课节边界自动刷新；双端同步未来 7 天滚动课表，周末/下课后/跨零点自动显示下个上课日课程；\n3. 优化软件内更新体验与版本说明文案。",
       "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.2/haida-schedule-v1.5.2-ios-unsigned.ipa",
-      "size": 12480000,
+      "size": 12289756,
       "minOSVersion": "16.4",
       "versions": [
         {
@@ -34,7 +34,7 @@
           "date": "2026-11-27",
           "localizedDescription": "v1.5.2：\n1. 真正实现一步直通教务登录：校外直接签发教务系统票据跳过微门户二次跳转，修复移动端手机短信免密登录与一键切换；\n2. 彻底修复双端桌面小组件无法显示课程：iOS 新增共享钥匙串双通道兼容各类侧载重签并自动识别宿主包名，双端支持未来 7 天滚动课表、跨日自动刷新及无课日自动展示下个上课日课程；\n3. 优化软件内更新与说明文案。",
           "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v1.5.2/haida-schedule-v1.5.2-ios-unsigned.ipa",
-          "size": 12480000,
+          "size": 12289756,
           "minOSVersion": "16.4"
         },
         {
