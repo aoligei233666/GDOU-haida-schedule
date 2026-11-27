@@ -31,7 +31,7 @@ import {
 } from '../services/calendarService';
 import { exportAndShareIcs } from '../services/icsExporter';
 import { computeTermWeek } from '../services/scheduleParser';
-import { COLORS } from '../theme/colors';
+import { AppColorPalette, COLORS } from '../theme/colors';
 import { useAppTheme } from '../theme/ThemeContext';
 import { AlarmRule, AppSettings, CourseItem, ExamItem } from '../types/models';
 
@@ -54,7 +54,8 @@ export const AlarmsScreen: React.FC<Props> = ({
   settings,
   onAlarmsUpdated,
 }) => {
-  const { colors } = useAppTheme();
+  const { colors, isDark } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors, isDark), [colors, isDark]);
   const currentWeek = useMemo(
     () => Math.min(settings.totalWeeks, Math.max(1, computeTermWeek(settings.termStartDate))),
     [settings.termStartDate, settings.totalWeeks]
@@ -303,7 +304,7 @@ export const AlarmsScreen: React.FC<Props> = ({
         {/* System Calendar Card */}
         <View style={styles.card}>
           <View style={styles.cardHeader}>
-            <Ionicons name="calendar" size={20} color={COLORS.oceanPrimary} />
+            <Ionicons name="calendar" size={20} color={colors.oceanPrimary} />
             <Text style={styles.cardTitle}>系统日历同步</Text>
           </View>
           <Text style={styles.cardDesc}>
@@ -329,18 +330,18 @@ export const AlarmsScreen: React.FC<Props> = ({
               onPress={handleExportIcs}
               disabled={busy !== null}
             >
-              <Ionicons name="share-outline" size={16} color={COLORS.oceanPrimary} />
+              <Ionicons name="share-outline" size={16} color={colors.oceanPrimary} />
               <Text style={styles.outlineBtnText}>
                 {busy === 'ics' ? '生成中...' : '导出 .ics 通用日历'}
               </Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.outlineBtn, { borderColor: COLORS.dangerLight }]}
+              style={[styles.outlineBtn, { borderColor: isDark ? '#7F1D1D' : colors.dangerLight }]}
               onPress={handleClearGdouCalendar}
             >
-              <Ionicons name="trash-outline" size={15} color={COLORS.danger} />
-              <Text style={[styles.outlineBtnText, { color: COLORS.danger }]}>移除专属日历</Text>
+              <Ionicons name="trash-outline" size={15} color={colors.danger} />
+              <Text style={[styles.outlineBtnText, { color: colors.danger }]}>移除专属日历</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -348,7 +349,7 @@ export const AlarmsScreen: React.FC<Props> = ({
         {/* Smart Morning Wake-up Alarm Card */}
         <View style={styles.card}>
           <View style={styles.cardHeader}>
-            <Ionicons name="alarm" size={20} color={COLORS.coral} />
+            <Ionicons name="alarm" size={20} color={colors.coral} />
             <Text style={styles.cardTitle}>智能每日首课起床闹钟</Text>
           </View>
           <Text style={styles.cardDesc}>
@@ -362,14 +363,14 @@ export const AlarmsScreen: React.FC<Props> = ({
                 style={styles.stepBtn}
                 onPress={() => setTargetWeek((w) => Math.max(1, w - 1))}
               >
-                <Ionicons name="remove" size={16} color={COLORS.oceanDeep} />
+                <Ionicons name="remove" size={16} color={colors.textPrimary} />
               </TouchableOpacity>
               <Text style={styles.stepValue}>第 {targetWeek} 周</Text>
               <TouchableOpacity
                 style={styles.stepBtn}
                 onPress={() => setTargetWeek((w) => Math.min(settings.totalWeeks, w + 1))}
               >
-                <Ionicons name="add" size={16} color={COLORS.oceanDeep} />
+                <Ionicons name="add" size={16} color={colors.textPrimary} />
               </TouchableOpacity>
             </View>
           </View>
@@ -409,7 +410,12 @@ export const AlarmsScreen: React.FC<Props> = ({
             <TouchableOpacity
               style={[
                 styles.outlineBtn,
-                { flex: 0, paddingHorizontal: 12, height: 44, borderColor: COLORS.coralLight },
+                {
+                  flex: 0,
+                  paddingHorizontal: 12,
+                  height: 44,
+                  borderColor: isDark ? '#7C2D12' : colors.coralLight,
+                },
               ]}
               onPress={() =>
                 Platform.OS === 'ios'
@@ -420,9 +426,9 @@ export const AlarmsScreen: React.FC<Props> = ({
               <Ionicons
                 name={Platform.OS === 'ios' ? 'settings-outline' : 'time-outline'}
                 size={16}
-                color={COLORS.coral}
+                color={colors.coral}
               />
-              <Text style={[styles.outlineBtnText, { color: COLORS.coral }]}>
+              <Text style={[styles.outlineBtnText, { color: colors.coral }]}>
                 {Platform.OS === 'ios' ? '闹钟权限' : '系统闹钟'}
               </Text>
             </TouchableOpacity>
@@ -449,7 +455,7 @@ export const AlarmsScreen: React.FC<Props> = ({
 
         {alarms.length === 0 ? (
           <View style={styles.emptyAlarms}>
-            <Ionicons name="notifications-off-outline" size={32} color={COLORS.textMuted} />
+            <Ionicons name="notifications-off-outline" size={32} color={colors.textMuted} />
             <Text style={styles.emptyAlarmsText}>
               暂未设置闹钟。可在上方一键生成本周起床闹钟，或在课表/考试页点击单条记录设定。
             </Text>
@@ -493,8 +499,8 @@ export const AlarmsScreen: React.FC<Props> = ({
                     value={alarm.enabled && !isExpired}
                     disabled={isExpired}
                     onValueChange={(v) => handleToggleAlarm(alarm, v)}
-                    trackColor={{ false: COLORS.border, true: COLORS.oceanLight }}
-                    thumbColor={alarm.enabled ? COLORS.oceanPrimary : COLORS.textMuted}
+                    trackColor={{ false: colors.border, true: colors.oceanLight }}
+                    thumbColor={alarm.enabled ? colors.oceanPrimary : colors.textMuted}
                   />
                 </View>
 
@@ -503,7 +509,7 @@ export const AlarmsScreen: React.FC<Props> = ({
                     style={styles.miniAction}
                     onPress={() => handleWriteAndroidClock(alarm)}
                   >
-                    <Ionicons name="time-outline" size={14} color={COLORS.oceanPrimary} />
+                    <Ionicons name="time-outline" size={14} color={colors.oceanPrimary} />
                     <Text style={styles.miniActionText}>
                       {Platform.OS === 'android' ? '在系统闹钟中编辑/修改' : '系统闹钟说明/权限'}
                     </Text>
@@ -512,8 +518,8 @@ export const AlarmsScreen: React.FC<Props> = ({
                     style={[styles.miniAction, { marginLeft: 'auto' }]}
                     onPress={() => handleDeleteAlarm(alarm)}
                   >
-                    <Ionicons name="trash-outline" size={14} color={COLORS.danger} />
-                    <Text style={[styles.miniActionText, { color: COLORS.danger }]}>删除</Text>
+                    <Ionicons name="trash-outline" size={14} color={colors.danger} />
+                    <Text style={[styles.miniActionText, { color: colors.danger }]}>删除</Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -525,270 +531,271 @@ export const AlarmsScreen: React.FC<Props> = ({
   );
 };
 
-const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: COLORS.bg,
-  },
-  header: {
-    backgroundColor: COLORS.oceanDeep,
-    paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 14,
-  },
-  headerTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: COLORS.white,
-  },
-  headerSub: {
-    fontSize: 12,
-    color: '#93C5FD',
-    marginTop: 3,
-  },
-  content: {
-    padding: 14,
-    paddingBottom: 32,
-    gap: 14,
-  },
-  card: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 16,
-    padding: 15,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  cardHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 6,
-  },
-  cardTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: COLORS.oceanDeep,
-  },
-  cardDesc: {
-    fontSize: 12.5,
-    color: COLORS.textSecondary,
-    lineHeight: 18,
-    marginBottom: 12,
-  },
-  btnRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  primaryBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: COLORS.oceanPrimary,
-    height: 44,
-    borderRadius: 12,
-    gap: 6,
-  },
-  primaryBtnText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: COLORS.white,
-  },
-  secondaryRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 10,
-  },
-  outlineBtn: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: 38,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: COLORS.oceanLight,
-    backgroundColor: COLORS.bg,
-    gap: 5,
-  },
-  outlineBtnText: {
-    fontSize: 12.5,
-    fontWeight: '600',
-    color: COLORS.oceanPrimary,
-  },
-  weekPickRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 10,
-  },
-  inlineLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: COLORS.textPrimary,
-    marginBottom: 6,
-  },
-  stepper: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: COLORS.bg,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    padding: 3,
-    gap: 10,
-  },
-  stepBtn: {
-    width: 30,
-    height: 28,
-    borderRadius: 7,
-    backgroundColor: COLORS.surface,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  stepValue: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: COLORS.oceanDeep,
-    minWidth: 56,
-    textAlign: 'center',
-  },
-  chipRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  chip: {
-    paddingHorizontal: 11,
-    paddingVertical: 6,
-    borderRadius: 999,
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  chipActive: {
-    backgroundColor: COLORS.coralLight,
-    borderColor: COLORS.coral,
-  },
-  chipText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: COLORS.textSecondary,
-  },
-  chipTextActive: {
-    color: COLORS.coral,
-  },
-  platformNote: {
-    fontSize: 11.5,
-    color: COLORS.textMuted,
-    marginTop: 10,
-    lineHeight: 16,
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginTop: 4,
-  },
-  sectionTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  clearAllText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: COLORS.danger,
-  },
-  emptyAlarms: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 14,
-    padding: 24,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  emptyAlarmsText: {
-    fontSize: 12.5,
-    color: COLORS.textMuted,
-    textAlign: 'center',
-    marginTop: 8,
-    lineHeight: 18,
-  },
-  alarmItem: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 14,
-    padding: 13,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  alarmTop: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  timeBadge: {
-    backgroundColor: COLORS.oceanTint,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 10,
-    alignItems: 'center',
-    minWidth: 74,
-  },
-  timeBig: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: COLORS.oceanDeep,
-  },
-  timeDate: {
-    fontSize: 10,
-    color: COLORS.oceanPrimary,
-    marginTop: 2,
-    fontWeight: '600',
-  },
-  alarmTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  alarmBody: {
-    fontSize: 12,
-    color: COLORS.textSecondary,
-    marginTop: 2,
-    lineHeight: 16,
-  },
-  engineTag: {
-    fontSize: 10.5,
-    color: COLORS.oceanPrimary,
-    marginTop: 3,
-    fontWeight: '700',
-  },
-  expiredTag: {
-    fontSize: 11,
-    color: COLORS.textMuted,
-    marginTop: 3,
-    fontWeight: '600',
-  },
-  alarmFooter: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 10,
-    paddingTop: 8,
-    borderTopWidth: 1,
-    borderTopColor: COLORS.borderLight,
-    gap: 8,
-  },
-  miniAction: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 8,
-    backgroundColor: COLORS.bg,
-  },
-  miniActionText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: COLORS.oceanPrimary,
-  },
-});
+const createStyles = (colors: AppColorPalette, isDark: boolean) =>
+  StyleSheet.create({
+    root: {
+      flex: 1,
+      backgroundColor: colors.bg,
+    },
+    header: {
+      backgroundColor: colors.oceanDeep,
+      paddingHorizontal: 16,
+      paddingTop: 12,
+      paddingBottom: 14,
+    },
+    headerTitle: {
+      fontSize: 20,
+      fontWeight: '700',
+      color: COLORS.white,
+    },
+    headerSub: {
+      fontSize: 12,
+      color: '#93C5FD',
+      marginTop: 3,
+    },
+    content: {
+      padding: 14,
+      paddingBottom: 32,
+      gap: 14,
+    },
+    card: {
+      backgroundColor: colors.surface,
+      borderRadius: 16,
+      padding: 15,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    cardHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      marginBottom: 6,
+    },
+    cardTitle: {
+      fontSize: 16,
+      fontWeight: '700',
+      color: isDark ? colors.textPrimary : colors.oceanDeep,
+    },
+    cardDesc: {
+      fontSize: 12.5,
+      color: colors.textSecondary,
+      lineHeight: 18,
+      marginBottom: 12,
+    },
+    btnRow: {
+      flexDirection: 'row',
+      gap: 8,
+    },
+    primaryBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: COLORS.oceanPrimary,
+      height: 44,
+      borderRadius: 12,
+      gap: 6,
+    },
+    primaryBtnText: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: COLORS.white,
+    },
+    secondaryRow: {
+      flexDirection: 'row',
+      gap: 8,
+      marginTop: 10,
+    },
+    outlineBtn: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      height: 38,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: isDark ? colors.border : colors.oceanLight,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      gap: 5,
+    },
+    outlineBtnText: {
+      fontSize: 12.5,
+      fontWeight: '600',
+      color: colors.oceanPrimary,
+    },
+    weekPickRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: 10,
+    },
+    inlineLabel: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: colors.textPrimary,
+      marginBottom: 6,
+    },
+    stepper: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: colors.border,
+      padding: 3,
+      gap: 10,
+    },
+    stepBtn: {
+      width: 30,
+      height: 28,
+      borderRadius: 7,
+      backgroundColor: colors.surface,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    stepValue: {
+      fontSize: 13,
+      fontWeight: '700',
+      color: colors.textPrimary,
+      minWidth: 56,
+      textAlign: 'center',
+    },
+    chipRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 8,
+    },
+    chip: {
+      paddingHorizontal: 11,
+      paddingVertical: 6,
+      borderRadius: 999,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    chipActive: {
+      backgroundColor: colors.coralLight,
+      borderColor: colors.coral,
+    },
+    chipText: {
+      fontSize: 12,
+      fontWeight: '600',
+      color: colors.textSecondary,
+    },
+    chipTextActive: {
+      color: colors.coral,
+    },
+    platformNote: {
+      fontSize: 11.5,
+      color: colors.textMuted,
+      marginTop: 10,
+      lineHeight: 16,
+    },
+    sectionHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginTop: 4,
+    },
+    sectionTitle: {
+      fontSize: 15,
+      fontWeight: '700',
+      color: colors.textPrimary,
+    },
+    clearAllText: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: colors.danger,
+    },
+    emptyAlarms: {
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 24,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    emptyAlarmsText: {
+      fontSize: 12.5,
+      color: colors.textMuted,
+      textAlign: 'center',
+      marginTop: 8,
+      lineHeight: 18,
+    },
+    alarmItem: {
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 13,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    alarmTop: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+    },
+    timeBadge: {
+      backgroundColor: colors.oceanTint,
+      paddingHorizontal: 10,
+      paddingVertical: 8,
+      borderRadius: 10,
+      alignItems: 'center',
+      minWidth: 74,
+    },
+    timeBig: {
+      fontSize: 18,
+      fontWeight: '800',
+      color: isDark ? colors.textPrimary : colors.oceanDeep,
+    },
+    timeDate: {
+      fontSize: 10,
+      color: colors.oceanPrimary,
+      marginTop: 2,
+      fontWeight: '600',
+    },
+    alarmTitle: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: colors.textPrimary,
+    },
+    alarmBody: {
+      fontSize: 12,
+      color: colors.textSecondary,
+      marginTop: 2,
+      lineHeight: 16,
+    },
+    engineTag: {
+      fontSize: 10.5,
+      color: colors.oceanPrimary,
+      marginTop: 3,
+      fontWeight: '700',
+    },
+    expiredTag: {
+      fontSize: 11,
+      color: colors.textMuted,
+      marginTop: 3,
+      fontWeight: '600',
+    },
+    alarmFooter: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginTop: 10,
+      paddingTop: 8,
+      borderTopWidth: 1,
+      borderTopColor: colors.borderLight,
+      gap: 8,
+    },
+    miniAction: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+      paddingVertical: 4,
+      paddingHorizontal: 8,
+      borderRadius: 8,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+    },
+    miniActionText: {
+      fontSize: 12,
+      fontWeight: '600',
+      color: colors.oceanPrimary,
+    },
+  });

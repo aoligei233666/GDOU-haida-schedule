@@ -68,7 +68,7 @@
 ```text
 GDOU-haida-schedule/
 ├── App.tsx                             # 应用主入口、ThemeProvider、gdouschedule:// 深链与 5 Tab 导航
-├── app.json                            # 单一版本号来源 (2.0.0) 与 Expo 插件配置
+├── app.json                            # 单一版本号来源 (2.0.1) 与 Expo 插件配置
 ├── campus-calendar.json                # 2025–2028 海大校历与法定调休云端静态配置（免发版更新）
 ├── altstore-source.json                # iOS 软件源（CI 发版自动同步精确 IPA 字节数）
 ├── modules/
@@ -123,10 +123,10 @@ npm start              # 启动 Expo 开发服务
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-android-apk.ps1 -CleanPrebuild
 ```
-产物输出至 `dist/haida-schedule-v2.0.0-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
+产物输出至 `dist/haida-schedule-v2.0.1-android.apk`（若未配置私有密钥，将安全产出未签名包 `*-unsigned.apk`，绝不使用公开 `debug.keystore` 签名正式版）。
 
 ### 3. 构建 iOS IPA 与自动发布 Release
-- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码或发布标签（如 `git tag v2.0.0 && git push origin v2.0.0`）后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`lint` + `typecheck` + `verify`），再并行构建 Android APK（含原生 JUnit 单元测试）与 `macos-26` iOS 未签名 `haida-schedule-v2.0.0-ios-unsigned.ipa`（含 `GdouNativeCore`、`GdouEphemeralURLProtocol`、`GdouScheduleWidgetExtension` 与 `AppIntents`），生成并签名 `ota-manifest.json`，并在 Tag 触发时自动发布 GitHub Release 与同步 `altstore-source.json` 精确字节数。
+- **GitHub Actions 云端自动构建（推荐，无需本机 Mac）**：推送代码或发布标签（如 `git tag v2.0.1 && git push origin v2.0.1`）后，`.github/workflows/build-mobile.yml` 先执行 `quality-gate`（`lint` + `typecheck` + `verify`），再并行构建 Android APK（含原生 JUnit 单元测试）与 `macos-26` iOS 未签名 `haida-schedule-v2.0.1-ios-unsigned.ipa`（含 `GdouNativeCore`、`GdouEphemeralURLProtocol`、`GdouScheduleWidgetExtension` 与 `AppIntents`），生成并签名 `ota-manifest.json`，并在 Tag 触发时自动发布 GitHub Release 与同步 `altstore-source.json` 精确字节数。
 - **macOS 本机 Xcode 构建**：
   ```bash
   npx expo prebuild --platform ios --clean

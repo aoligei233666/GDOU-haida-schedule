@@ -15,7 +15,7 @@ import {
   OFFICIAL_GRADE_DETAIL_SOURCE_LABEL,
 } from '../services/gradeParser';
 import { exportSanitizedTranscript } from '../services/transcriptExporter';
-import { COLORS } from '../theme/colors';
+import { AppColorPalette, COLORS } from '../theme/colors';
 import { useAppTheme } from '../theme/ThemeContext';
 import { GradeItem, GraduationAuditReport, ScoreTierBucket } from '../types/models';
 
@@ -28,23 +28,38 @@ interface Props {
 type ViewTab = 'overview' | 'audit' | 'details';
 type SortMode = 'term' | 'gpa' | 'credit';
 
-const TIER_COLORS: Record<ScoreTierBucket['key'], { bar: string; bg: string; text: string }> = {
-  excellent: { bar: '#059669', bg: '#D1FAE5', text: '#065F46' },
-  good: { bar: '#0284C7', bg: '#E0F2FE', text: '#075985' },
-  medium: { bar: '#2563EB', bg: '#DBEAFE', text: '#1E40AF' },
-  pass: { bar: '#D97706', bg: '#FEF3C7', text: '#92400E' },
-  fail: { bar: '#DC2626', bg: '#FEE2E2', text: '#991B1B' },
-};
+function getTierColors(
+  isDark: boolean
+): Record<ScoreTierBucket['key'], { bar: string; bg: string; text: string }> {
+  if (isDark) {
+    return {
+      excellent: { bar: '#34D399', bg: '#064E3B', text: '#A7F3D0' },
+      good: { bar: '#38BDF8', bg: '#0C4A6E', text: '#BAE6FD' },
+      medium: { bar: '#60A5FA', bg: '#1E3A8A', text: '#BFDBFE' },
+      pass: { bar: '#FBBF24', bg: '#451A03', text: '#FDE68A' },
+      fail: { bar: '#F87171', bg: '#450A0A', text: '#FECACA' },
+    };
+  }
+  return {
+    excellent: { bar: '#059669', bg: '#D1FAE5', text: '#065F46' },
+    good: { bar: '#0284C7', bg: '#E0F2FE', text: '#075985' },
+    medium: { bar: '#2563EB', bg: '#DBEAFE', text: '#1E40AF' },
+    pass: { bar: '#D97706', bg: '#FEF3C7', text: '#92400E' },
+    fail: { bar: '#DC2626', bg: '#FEE2E2', text: '#991B1B' },
+  };
+}
 
-function getGpaColor(gpa: number): { bg: string; text: string } {
-  if (gpa >= 4.0) return { bg: COLORS.emeraldLight, text: COLORS.emerald };
-  if (gpa >= 3.0) return { bg: COLORS.oceanLight, text: COLORS.oceanPrimary };
-  if (gpa >= 2.0) return { bg: COLORS.amberLight, text: COLORS.amber };
-  return { bg: COLORS.dangerLight, text: COLORS.danger };
+function getGpaColor(gpa: number, colors: AppColorPalette): { bg: string; text: string } {
+  if (gpa >= 4.0) return { bg: colors.emeraldLight, text: colors.emerald };
+  if (gpa >= 3.0) return { bg: colors.oceanLight, text: colors.oceanPrimary };
+  if (gpa >= 2.0) return { bg: colors.amberLight, text: colors.amber };
+  return { bg: colors.dangerLight, text: colors.danger };
 }
 
 export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenSync }) => {
-  const { colors } = useAppTheme();
+  const { colors, isDark } = useAppTheme();
+  const styles = useMemo(() => createStyles(colors, isDark), [colors, isDark]);
+  const tierColors = useMemo(() => getTierColors(isDark), [isDark]);
   const [viewTab, setViewTab] = useState<ViewTab>('overview');
   const [exporting, setExporting] = useState(false);
   const [selectedTerm, setSelectedTerm] = useState<string>('ALL');
@@ -250,7 +265,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             <Ionicons
               name="stats-chart"
               size={14}
-              color={viewTab === 'overview' ? COLORS.white : COLORS.textSecondary}
+              color={viewTab === 'overview' ? COLORS.white : colors.textSecondary}
             />
             <Text style={[styles.segmentText, viewTab === 'overview' && styles.segmentTextActive]}>
               成绩总览
@@ -264,7 +279,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             <Ionicons
               name="school-outline"
               size={15}
-              color={viewTab === 'audit' ? COLORS.white : COLORS.textSecondary}
+              color={viewTab === 'audit' ? COLORS.white : colors.textSecondary}
             />
             <Text style={[styles.segmentText, viewTab === 'audit' && styles.segmentTextActive]}>
               培养方案
@@ -278,7 +293,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             <Ionicons
               name="list"
               size={15}
-              color={viewTab === 'details' ? COLORS.white : COLORS.textSecondary}
+              color={viewTab === 'details' ? COLORS.white : colors.textSecondary}
             />
             <Text style={[styles.segmentText, viewTab === 'details' && styles.segmentTextActive]}>
               成绩明细 ({grades.length})
@@ -290,7 +305,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
       {grades.length === 0 && !graduationAudit ? (
         <ScrollView contentContainerStyle={styles.content}>
           <View style={styles.emptyBox}>
-            <Ionicons name="ribbon-outline" size={48} color={COLORS.textMuted} />
+            <Ionicons name="ribbon-outline" size={48} color={colors.textMuted} />
             <Text style={styles.emptyTitle}>暂无成绩与学分数据</Text>
             <Text style={styles.emptyDesc}>
               点击右上角「教务同步」登录海大教务系统，即可一次性拉取全部学期的成绩单、分项明细（平时分/卷面占比）与培养方案毕业学分进度（账号密码用完即删）。
@@ -320,7 +335,13 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
               }
               size={18}
               color={
-                effectiveAudit.source === 'official_zf_curriculum' ? '#065F46' : '#B45309'
+                effectiveAudit.source === 'official_zf_curriculum'
+                  ? isDark
+                    ? colors.emerald
+                    : '#065F46'
+                  : isDark
+                    ? colors.amber
+                    : '#B45309'
               }
             />
             <View style={{ flex: 1 }}>
@@ -328,8 +349,8 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                 style={[
                   styles.sourceCardTitle,
                   effectiveAudit.source === 'official_zf_curriculum'
-                    ? { color: '#065F46' }
-                    : { color: '#92400E' },
+                    ? { color: isDark ? '#A7F3D0' : '#065F46' }
+                    : { color: isDark ? '#FDE68A' : '#92400E' },
                 ]}
               >
                 {effectiveAudit.sourceLabel}
@@ -349,7 +370,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
 
           <View style={styles.card}>
             <View style={styles.cardHeader}>
-              <Ionicons name="school-outline" size={18} color={COLORS.oceanPrimary} />
+              <Ionicons name="school-outline" size={18} color={colors.oceanPrimary} />
               <Text style={styles.cardTitle}>毕业学分进度核对</Text>
               <Text style={styles.cardHeaderRight}>
                 {effectiveAudit.totalRequiredCredits !== null
@@ -368,13 +389,13 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                 <Text style={styles.creditStatLbl}>方案要求学分</Text>
               </View>
               <View style={styles.creditStatPill}>
-                <Text style={[styles.creditStatVal, { color: COLORS.emerald }]}>
+                <Text style={[styles.creditStatVal, { color: colors.emerald }]}>
                   {effectiveAudit.totalEarnedCredits}
                 </Text>
                 <Text style={styles.creditStatLbl}>已获学分</Text>
               </View>
               <View style={styles.creditStatPill}>
-                <Text style={[styles.creditStatVal, { color: COLORS.oceanPrimary }]}>
+                <Text style={[styles.creditStatVal, { color: colors.oceanPrimary }]}>
                   {effectiveAudit.totalInProgressCredits}
                 </Text>
                 <Text style={styles.creditStatLbl}>在修学分</Text>
@@ -386,8 +407,8 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                     {
                       color:
                         (effectiveAudit.totalRemainingCredits ?? 0) > 0
-                          ? COLORS.coral
-                          : COLORS.emerald,
+                          ? colors.coral
+                          : colors.emerald,
                     },
                   ]}
                 >
@@ -429,7 +450,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                                 100
                             )
                           )}%`,
-                          backgroundColor: COLORS.oceanPrimary,
+                          backgroundColor: colors.oceanPrimary,
                         },
                       ]}
                     />
@@ -440,7 +461,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
 
           <View style={styles.card}>
             <View style={styles.cardHeader}>
-              <Ionicons name="layers-outline" size={18} color={COLORS.oceanPrimary} />
+              <Ionicons name="layers-outline" size={18} color={colors.oceanPrimary} />
               <Text style={styles.cardTitle}>各模块修读进度（{effectiveAudit.modules.length} 项）</Text>
             </View>
 
@@ -461,20 +482,20 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                       style={[
                         styles.auditStatusPill,
                         satisfied
-                          ? { backgroundColor: COLORS.emeraldLight }
+                          ? { backgroundColor: colors.emeraldLight }
                           : mod.remainingCredits !== null && mod.remainingCredits > 0
-                            ? { backgroundColor: COLORS.amberLight }
-                            : { backgroundColor: COLORS.oceanLight },
+                            ? { backgroundColor: colors.amberLight }
+                            : { backgroundColor: colors.oceanLight },
                       ]}
                     >
                       <Text
                         style={[
                           styles.auditStatusText,
                           satisfied
-                            ? { color: '#065F46' }
+                            ? { color: isDark ? '#A7F3D0' : '#065F46' }
                             : mod.remainingCredits !== null && mod.remainingCredits > 0
-                              ? { color: '#B45309' }
-                              : { color: COLORS.oceanDeep },
+                              ? { color: isDark ? '#FDE68A' : '#B45309' }
+                              : { color: isDark ? '#BAE6FD' : COLORS.oceanDeep },
                         ]}
                       >
                         {satisfied
@@ -499,7 +520,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                           styles.progressFill,
                           {
                             width: `${Math.max(4, pct)}%`,
-                            backgroundColor: satisfied ? COLORS.emerald : COLORS.oceanPrimary,
+                            backgroundColor: satisfied ? colors.emerald : colors.oceanPrimary,
                           },
                         ]}
                       />
@@ -518,7 +539,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
           {/* 1. Credit Progress Banner */}
           <View style={styles.card}>
             <View style={styles.cardHeader}>
-              <Ionicons name="ribbon-outline" size={18} color={COLORS.oceanPrimary} />
+              <Ionicons name="ribbon-outline" size={18} color={colors.oceanPrimary} />
               <Text style={styles.cardTitle}>学分完成总览</Text>
               <Text style={styles.cardHeaderRight}>
                 {overallSummary.totalCreditsEarned} / {overallSummary.totalCreditsAttempted} 学分
@@ -531,13 +552,13 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                 <Text style={styles.creditStatLbl}>累计实得学分</Text>
               </View>
               <View style={styles.creditStatPill}>
-                <Text style={[styles.creditStatVal, { color: COLORS.oceanPrimary }]}>
+                <Text style={[styles.creditStatVal, { color: colors.oceanPrimary }]}>
                   {requiredVsElective.required}
                 </Text>
                 <Text style={styles.creditStatLbl}>必修课学分</Text>
               </View>
               <View style={styles.creditStatPill}>
-                <Text style={[styles.creditStatVal, { color: COLORS.emerald }]}>
+                <Text style={[styles.creditStatVal, { color: colors.emerald }]}>
                   {requiredVsElective.other}
                 </Text>
                 <Text style={styles.creditStatLbl}>选修/其他学分</Text>
@@ -546,7 +567,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                 <Text
                   style={[
                     styles.creditStatVal,
-                    { color: overallSummary.failedCourses > 0 ? COLORS.danger : COLORS.emerald },
+                    { color: overallSummary.failedCourses > 0 ? colors.danger : colors.emerald },
                   ]}
                 >
                   {overallSummary.failedCourses}
@@ -583,8 +604,8 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                             {
                               width: `${widthPct}%`,
                               backgroundColor: cat.category.includes('必修')
-                                ? COLORS.oceanPrimary
-                                : COLORS.emerald,
+                                ? colors.oceanPrimary
+                                : colors.emerald,
                             },
                           ]}
                         />
@@ -599,7 +620,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
           {/* 2. Term-by-Term GPA & Credits Overview Table */}
           <View style={styles.card}>
             <View style={styles.cardHeader}>
-              <Ionicons name="calendar-outline" size={18} color={COLORS.oceanPrimary} />
+              <Ionicons name="calendar-outline" size={18} color={colors.oceanPrimary} />
               <Text style={styles.cardTitle}>各学期绩点与学分总览</Text>
               <Text style={styles.cardHeaderRight}>点击学期看明细</Text>
             </View>
@@ -612,7 +633,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             </View>
 
             {overallSummary.byTerm.map((t) => {
-              const badge = getGpaColor(t.weightedGpa);
+              const badge = getGpaColor(t.weightedGpa, colors);
               const gpaBarPct = Math.max(6, Math.min(100, Math.round((t.weightedGpa / 5) * 100)));
               return (
                 <TouchableOpacity
@@ -661,14 +682,14 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
           {/* 3. Score Tier Distribution */}
           <View style={styles.card}>
             <View style={styles.cardHeader}>
-              <Ionicons name="bar-chart-outline" size={18} color={COLORS.oceanPrimary} />
+              <Ionicons name="bar-chart-outline" size={18} color={colors.oceanPrimary} />
               <Text style={styles.cardTitle}>成绩分段分布</Text>
               <Text style={styles.cardHeaderRight}>共 {overallSummary.totalCourses} 门</Text>
             </View>
 
             <View style={{ gap: 9 }}>
               {overallSummary.scoreDistribution.map((bucket) => {
-                const palette = TIER_COLORS[bucket.key];
+                const palette = tierColors[bucket.key];
                 const pct = Math.round(bucket.ratio * 100);
                 const widthPct = bucket.count > 0 ? Math.max(4, pct) : 0;
                 return (
@@ -704,8 +725,8 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
           {failedGrades.length > 0 && (
             <View style={[styles.card, styles.failedCard]}>
               <View style={styles.cardHeader}>
-                <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
-                <Text style={[styles.cardTitle, { color: COLORS.danger }]}>
+                <Ionicons name="alert-circle" size={18} color={colors.danger} />
+                <Text style={[styles.cardTitle, { color: colors.danger }]}>
                   未通过 / 待关注课程 ({failedGrades.length} 门)
                 </Text>
               </View>
@@ -717,7 +738,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                       {g.termKey} · {g.credit} 学分 · {g.examNature}
                     </Text>
                   </View>
-                  <Text style={[styles.highlightScore, { color: COLORS.danger }]}>
+                  <Text style={[styles.highlightScore, { color: colors.danger }]}>
                     {g.scoreText}
                   </Text>
                 </View>
@@ -729,7 +750,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
           {topCourses.length > 0 && (
             <View style={styles.card}>
               <View style={styles.cardHeader}>
-                <Ionicons name="trophy-outline" size={18} color={COLORS.amber} />
+                <Ionicons name="trophy-outline" size={18} color={colors.amber} />
                 <Text style={styles.cardTitle}>高分优势课程 Top {topCourses.length}</Text>
               </View>
               {topCourses.map((g, idx) => (
@@ -746,7 +767,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                     </Text>
                   </View>
                   <View style={{ alignItems: 'flex-end' }}>
-                    <Text style={[styles.highlightScore, { color: COLORS.emerald }]}>
+                    <Text style={[styles.highlightScore, { color: colors.emerald }]}>
                       {g.scoreText}
                     </Text>
                     <Text style={styles.highlightGpa}>GPA {g.gpa.toFixed(2)}</Text>
@@ -758,7 +779,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
 
           {overallSummary.hasEstimatedItems && (
             <View style={styles.estimateBanner}>
-              <Ionicons name="information-circle-outline" size={16} color={COLORS.amber} />
+              <Ionicons name="information-circle-outline" size={16} color={colors.amber} />
               <Text style={styles.estimateText}>
                 注：部分课程因教务未返回官方绩点/百分制字段，已按五级制与海大常规规则估算，仅供参考，以教务系统官方成绩单为准。
               </Text>
@@ -775,7 +796,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             }}
           >
             <Text style={styles.viewAllBtnText}>查看全部 {grades.length} 门课程明细</Text>
-            <Ionicons name="arrow-forward" size={16} color={COLORS.oceanPrimary} />
+            <Ionicons name="arrow-forward" size={16} color={colors.oceanPrimary} />
           </TouchableOpacity>
         </ScrollView>
       ) : (
@@ -814,17 +835,17 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             {/* Search & Sort Controls */}
             <View style={styles.searchRow}>
               <View style={styles.searchInputWrap}>
-                <Ionicons name="search-outline" size={15} color={COLORS.textMuted} />
+                <Ionicons name="search-outline" size={15} color={colors.textMuted} />
                 <TextInput
                   style={styles.searchInput}
                   placeholder="搜索课程名 / 课程号 / 任课教师..."
-                  placeholderTextColor={COLORS.textMuted}
+                  placeholderTextColor={colors.textMuted}
                   value={searchQuery}
                   onChangeText={setSearchQuery}
                 />
                 {searchQuery.length > 0 && (
                   <TouchableOpacity onPress={() => setSearchQuery('')} hitSlop={8}>
-                    <Ionicons name="close-circle" size={16} color={COLORS.textMuted} />
+                    <Ionicons name="close-circle" size={16} color={colors.textMuted} />
                   </TouchableOpacity>
                 )}
               </View>
@@ -896,11 +917,11 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                 <TouchableOpacity
                   style={[
                     styles.miniChip,
-                    onlyFailed && { backgroundColor: COLORS.dangerLight, borderColor: COLORS.danger },
+                    onlyFailed && { backgroundColor: colors.dangerLight, borderColor: colors.danger },
                   ]}
                   onPress={() => setOnlyFailed((v) => !v)}
                 >
-                  <Text style={[styles.miniChipText, onlyFailed && { color: COLORS.danger }]}>
+                  <Text style={[styles.miniChipText, onlyFailed && { color: colors.danger }]}>
                     仅看未通过 ({failedGrades.length})
                   </Text>
                 </TouchableOpacity>
@@ -911,7 +932,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
           <ScrollView contentContainerStyle={styles.content}>
             {activeSummary.hasEstimatedItems && (
               <View style={styles.estimateBanner}>
-                <Ionicons name="information-circle-outline" size={16} color={COLORS.amber} />
+                <Ionicons name="information-circle-outline" size={16} color={colors.amber} />
                 <Text style={styles.estimateText}>
                   注：标注「估算」的课程因教务未返回官方绩点/百分制字段，已按五级制与海大常规规则估算，仅供参考。
                 </Text>
@@ -920,7 +941,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
 
             {detailGrades.length === 0 ? (
               <View style={styles.emptyFilterBox}>
-                <Ionicons name="filter-outline" size={32} color={COLORS.textMuted} />
+                <Ionicons name="filter-outline" size={32} color={colors.textMuted} />
                 <Text style={styles.emptyFilterText}>没有符合当前筛选条件的课程成绩</Text>
                 <TouchableOpacity
                   style={styles.resetFilterBtn}
@@ -937,12 +958,12 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
             ) : (
               detailGrades.map((item) => {
                 const scoreBadge = !item.passed
-                  ? { bg: COLORS.dangerLight, color: COLORS.danger }
+                  ? { bg: colors.dangerLight, color: colors.danger }
                   : item.gpa >= 4.0
-                    ? { bg: COLORS.emeraldLight, color: COLORS.emerald }
+                    ? { bg: colors.emeraldLight, color: colors.emerald }
                     : item.gpa >= 3.0
-                      ? { bg: COLORS.oceanLight, color: COLORS.oceanPrimary }
-                      : { bg: COLORS.amberLight, color: COLORS.amber };
+                      ? { bg: colors.oceanLight, color: colors.oceanPrimary }
+                      : { bg: colors.amberLight, color: colors.amber };
                 const isExpanded = expandedGradeId === item.id;
                 const hasSubScores = Boolean(item.subScores && item.subScores.length > 0);
 
@@ -970,15 +991,20 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                             </Text>
                           </View>
                           {hasSubScores && (
-                            <View style={[styles.tag, { backgroundColor: COLORS.emeraldLight }]}>
-                              <Text style={[styles.tagText, { color: '#065F46' }]}>
+                            <View style={[styles.tag, { backgroundColor: colors.emeraldLight }]}>
+                              <Text
+                                style={[
+                                  styles.tagText,
+                                  { color: isDark ? '#A7F3D0' : '#065F46' },
+                                ]}
+                              >
                                 分项明细▾
                               </Text>
                             </View>
                           )}
                           {item.examNature && item.examNature !== '正常考试' && (
-                            <View style={[styles.tag, { backgroundColor: COLORS.coralLight }]}>
-                              <Text style={[styles.tagText, { color: COLORS.coral }]}>
+                            <View style={[styles.tag, { backgroundColor: colors.coralLight }]}>
+                              <Text style={[styles.tagText, { color: colors.coral }]}>
                                 {item.examNature}
                               </Text>
                             </View>
@@ -1007,7 +1033,11 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                         {hasSubScores && item.subScores ? (
                           <>
                             <View style={styles.subScoreSourceRow}>
-                              <Ionicons name="shield-checkmark-outline" size={13} color="#065F46" />
+                              <Ionicons
+                                name="shield-checkmark-outline"
+                                size={13}
+                                color={isDark ? '#A7F3D0' : '#065F46'}
+                              />
                               <Text style={styles.subScoreSourceText}>
                                 {item.subScoreSourceLabel || OFFICIAL_GRADE_DETAIL_SOURCE_LABEL}
                               </Text>
@@ -1029,7 +1059,7 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
                                 <Text
                                   style={[
                                     styles.subScoreVal,
-                                    { flex: 0.9, textAlign: 'center', color: COLORS.oceanPrimary },
+                                    { flex: 0.9, textAlign: 'center', color: colors.oceanPrimary },
                                   ]}
                                 >
                                   {sub.weightText}
@@ -1063,680 +1093,681 @@ export const GradesScreen: React.FC<Props> = ({ grades, graduationAudit, onOpenS
   );
 };
 
-const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: COLORS.bg,
-  },
-  header: {
-    backgroundColor: COLORS.oceanDeep,
-    paddingHorizontal: 14,
-    paddingTop: 12,
-    paddingBottom: 14,
-  },
-  headerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  headerTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: COLORS.white,
-  },
-  headerSub: {
-    fontSize: 11.5,
-    color: '#93C5FD',
-    marginTop: 2,
-  },
-  syncPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: COLORS.oceanLight,
-    paddingHorizontal: 11,
-    paddingVertical: 6,
-    borderRadius: 999,
-    gap: 4,
-  },
-  syncPillText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLORS.oceanDeep,
-  },
-  heroGrid: {
-    flexDirection: 'row',
-    gap: 7,
-    marginTop: 12,
-  },
-  heroCardPrimary: {
-    flex: 1.35,
-    backgroundColor: COLORS.oceanPrimary,
-    borderRadius: 12,
-    paddingVertical: 9,
-    paddingHorizontal: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  heroValueBig: {
-    fontSize: 22,
-    fontWeight: '800',
-    color: COLORS.white,
-  },
-  heroLabelPrimary: {
-    fontSize: 10.5,
-    color: '#E0F2FE',
-    marginTop: 1,
-    fontWeight: '600',
-  },
-  heroCard: {
-    flex: 1,
-    backgroundColor: 'rgba(255,255,255,0.12)',
-    borderRadius: 12,
-    paddingVertical: 9,
-    paddingHorizontal: 5,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  heroValue: {
-    fontSize: 17,
-    fontWeight: '800',
-    color: COLORS.white,
-  },
-  heroLabel: {
-    fontSize: 10.5,
-    color: '#E2E8F0',
-    marginTop: 1,
-    fontWeight: '600',
-  },
-  heroMiniSub: {
-    fontSize: 9.5,
-    color: '#BAE6FD',
-    marginTop: 2,
-  },
-  segmentWrap: {
-    flexDirection: 'row',
-    backgroundColor: COLORS.surface,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    gap: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.border,
-  },
-  segmentBtn: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: 36,
-    borderRadius: 10,
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    gap: 6,
-  },
-  segmentBtnActive: {
-    backgroundColor: COLORS.oceanPrimary,
-    borderColor: COLORS.oceanPrimary,
-  },
-  segmentText: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: COLORS.textSecondary,
-  },
-  segmentTextActive: {
-    color: COLORS.white,
-  },
-  content: {
-    padding: 14,
-    paddingBottom: 32,
-    gap: 12,
-  },
-  card: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 14,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  failedCard: {
-    borderColor: '#FCA5A5',
-    backgroundColor: '#FFF5F5',
-  },
-  cardHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    marginBottom: 10,
-  },
-  cardTitle: {
-    fontSize: 14.5,
-    fontWeight: '700',
-    color: COLORS.oceanDeep,
-    flex: 1,
-  },
-  cardHeaderRight: {
-    fontSize: 11.5,
-    fontWeight: '600',
-    color: COLORS.textMuted,
-  },
-  creditSummaryRow: {
-    flexDirection: 'row',
-    gap: 7,
-    marginBottom: 12,
-  },
-  creditStatPill: {
-    flex: 1,
-    backgroundColor: COLORS.bg,
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 4,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: COLORS.borderLight,
-  },
-  creditStatVal: {
-    fontSize: 15,
-    fontWeight: '800',
-    color: COLORS.oceanDeep,
-  },
-  creditStatLbl: {
-    fontSize: 10,
-    color: COLORS.textSecondary,
-    marginTop: 2,
-    fontWeight: '600',
-  },
-  barSection: {
-    gap: 9,
-  },
-  subSectionHint: {
-    fontSize: 11,
-    color: COLORS.textMuted,
-    marginBottom: 2,
-  },
-  barRow: {
-    gap: 4,
-  },
-  barLabelRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  barName: {
-    fontSize: 12.5,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-    flex: 1,
-  },
-  barValue: {
-    fontSize: 11.5,
-    fontWeight: '600',
-    color: COLORS.textSecondary,
-  },
-  progressTrack: {
-    height: 7,
-    borderRadius: 999,
-    backgroundColor: COLORS.borderLight,
-    overflow: 'hidden',
-  },
-  progressFill: {
-    height: '100%',
-    borderRadius: 999,
-  },
-  termTableHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingBottom: 7,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.borderLight,
-    marginBottom: 4,
-  },
-  termColLabel: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: COLORS.textMuted,
-  },
-  termRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 9,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: COLORS.borderLight,
-  },
-  termRowName: {
-    fontSize: 12.5,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  miniGpaTrack: {
-    height: 4,
-    borderRadius: 999,
-    backgroundColor: COLORS.borderLight,
-    marginTop: 5,
-    overflow: 'hidden',
-  },
-  miniGpaFill: {
-    height: '100%',
-    borderRadius: 999,
-  },
-  gpaPill: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 8,
-  },
-  gpaPillText: {
-    fontSize: 12.5,
-    fontWeight: '800',
-  },
-  termRowAvg: {
-    fontSize: 12.5,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-    textAlign: 'center',
-  },
-  termRowCredits: {
-    fontSize: 12.5,
-    fontWeight: '800',
-    color: COLORS.oceanDeep,
-  },
-  termRowSub: {
-    fontSize: 10,
-    color: COLORS.textMuted,
-    marginTop: 1,
-  },
-  tierRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 9,
-  },
-  tierBadge: {
-    width: 48,
-    paddingVertical: 5,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  tierBadgeText: {
-    fontSize: 11.5,
-    fontWeight: '800',
-  },
-  tierRange: {
-    fontSize: 11.5,
-    fontWeight: '600',
-    color: COLORS.textPrimary,
-  },
-  highlightRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 7,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: COLORS.borderLight,
-    gap: 10,
-  },
-  rankCircle: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: COLORS.amberLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  rankText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: COLORS.amber,
-  },
-  highlightName: {
-    fontSize: 13.5,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  highlightMeta: {
-    fontSize: 11,
-    color: COLORS.textMuted,
-    marginTop: 2,
-  },
-  highlightScore: {
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  highlightGpa: {
-    fontSize: 10.5,
-    fontWeight: '600',
-    color: COLORS.textSecondary,
-  },
-  viewAllBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: COLORS.oceanTint,
-    borderWidth: 1,
-    borderColor: COLORS.oceanLight,
-    borderRadius: 12,
-    height: 44,
-    gap: 6,
-  },
-  viewAllBtnText: {
-    fontSize: 13.5,
-    fontWeight: '700',
-    color: COLORS.oceanPrimary,
-  },
-  filterSection: {
-    backgroundColor: COLORS.surface,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.border,
-    paddingBottom: 8,
-  },
-  termBar: {
-    paddingHorizontal: 14,
-    paddingTop: 9,
-    paddingBottom: 6,
-    gap: 6,
-  },
-  termChip: {
-    paddingHorizontal: 11,
-    paddingVertical: 5,
-    borderRadius: 999,
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginRight: 6,
-  },
-  termChipActive: {
-    backgroundColor: COLORS.oceanPrimary,
-    borderColor: COLORS.oceanPrimary,
-  },
-  termChipText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: COLORS.textSecondary,
-  },
-  termChipTextActive: {
-    color: COLORS.white,
-  },
-  searchRow: {
-    paddingHorizontal: 14,
-    paddingVertical: 4,
-  },
-  searchInputWrap: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 10,
-    paddingHorizontal: 10,
-    height: 36,
-    gap: 6,
-  },
-  searchInput: {
-    flex: 1,
-    fontSize: 13,
-    color: COLORS.textPrimary,
-    paddingVertical: 0,
-  },
-  sortBar: {
-    paddingHorizontal: 14,
-    paddingTop: 6,
-    gap: 6,
-  },
-  miniChip: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 8,
-    backgroundColor: COLORS.bg,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    marginRight: 6,
-  },
-  miniChipActive: {
-    backgroundColor: COLORS.oceanLight,
-    borderColor: COLORS.oceanPrimary,
-  },
-  miniChipActiveAlt: {
-    backgroundColor: COLORS.emeraldLight,
-    borderColor: COLORS.emerald,
-  },
-  miniChipText: {
-    fontSize: 11.5,
-    fontWeight: '600',
-    color: COLORS.textSecondary,
-  },
-  miniChipTextActive: {
-    color: COLORS.oceanPrimary,
-  },
-  miniChipTextActiveAlt: {
-    color: COLORS.emerald,
-  },
-  emptyBox: {
-    alignItems: 'center',
-    paddingVertical: 54,
-    paddingHorizontal: 24,
-  },
-  emptyTitle: {
-    fontSize: 17,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-    marginTop: 12,
-  },
-  emptyDesc: {
-    fontSize: 13,
-    color: COLORS.textSecondary,
-    textAlign: 'center',
-    lineHeight: 20,
-    marginTop: 6,
-    marginBottom: 18,
-  },
-  emptyBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: COLORS.oceanPrimary,
-    paddingHorizontal: 20,
-    height: 46,
-    borderRadius: 12,
-    gap: 8,
-  },
-  emptyBtnText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: COLORS.white,
-  },
-  emptyFilterBox: {
-    alignItems: 'center',
-    paddingVertical: 38,
-    gap: 10,
-  },
-  emptyFilterText: {
-    fontSize: 13.5,
-    color: COLORS.textSecondary,
-  },
-  resetFilterBtn: {
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    borderRadius: 999,
-    backgroundColor: COLORS.oceanLight,
-  },
-  resetFilterText: {
-    fontSize: 12.5,
-    fontWeight: '700',
-    color: COLORS.oceanPrimary,
-  },
-  estimateBanner: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    backgroundColor: COLORS.amberLight,
-    borderRadius: 10,
-    paddingHorizontal: 11,
-    paddingVertical: 8,
-    gap: 6,
-  },
-  estimateText: {
-    flex: 1,
-    fontSize: 11.5,
-    color: '#92400E',
-    lineHeight: 16,
-  },
-  gradeCard: {
-    backgroundColor: COLORS.surface,
-    borderRadius: 14,
-    padding: 13,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-  },
-  gradeMain: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  courseName: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-  },
-  tagRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 6,
-  },
-  tag: {
-    backgroundColor: COLORS.bg,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-  },
-  tagText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: COLORS.textSecondary,
-  },
-  termSubText: {
-    fontSize: 11,
-    color: COLORS.textMuted,
-    marginTop: 6,
-  },
-  scoreBadge: {
-    minWidth: 66,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  scoreText: {
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  gpaMini: {
-    fontSize: 10,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  sourceCard: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 8,
-    padding: 11,
-    borderRadius: 12,
-    borderWidth: 1,
-    marginBottom: 10,
-  },
-  sourceCardOfficial: {
-    backgroundColor: COLORS.emeraldLight,
-    borderColor: '#A7F3D0',
-  },
-  sourceCardEstimate: {
-    backgroundColor: COLORS.amberLight,
-    borderColor: '#FDE68A',
-  },
-  sourceCardTitle: {
-    fontSize: 12.5,
-    fontWeight: '700',
-    lineHeight: 17,
-  },
-  sourceCardSub: {
-    fontSize: 11,
-    color: COLORS.textSecondary,
-    marginTop: 3,
-  },
-  auditModRow: {
-    paddingVertical: 9,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: COLORS.borderLight,
-  },
-  auditModName: {
-    fontSize: 13.5,
-    fontWeight: '700',
-    color: COLORS.textPrimary,
-    flex: 1,
-    paddingRight: 8,
-  },
-  auditStatusPill: {
-    paddingHorizontal: 8,
-    paddingVertical: 2.5,
-    borderRadius: 6,
-  },
-  auditStatusText: {
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  auditModMeta: {
-    fontSize: 11.5,
-    color: COLORS.textSecondary,
-    marginTop: 3,
-  },
-  auditFootnote: {
-    fontSize: 11.5,
-    color: COLORS.textMuted,
-    marginTop: 10,
-    lineHeight: 17,
-  },
-  subScoreBox: {
-    marginTop: 10,
-    paddingTop: 10,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: COLORS.border,
-    gap: 5,
-  },
-  subScoreSourceRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    backgroundColor: COLORS.emeraldLight,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 7,
-    marginBottom: 4,
-  },
-  subScoreSourceText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#065F46',
-    flex: 1,
-  },
-  subScoreHeader: {
-    flexDirection: 'row',
-    paddingBottom: 4,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: COLORS.borderLight,
-  },
-  subScoreCol: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: COLORS.textMuted,
-  },
-  subScoreRow: {
-    flexDirection: 'row',
-    paddingVertical: 3,
-  },
-  subScoreVal: {
-    fontSize: 12.5,
-    color: COLORS.textPrimary,
-  },
-  subScoreEmpty: {
-    fontSize: 11.5,
-    color: COLORS.textMuted,
-    lineHeight: 17,
-  },
-});
+const createStyles = (colors: AppColorPalette, isDark: boolean) =>
+  StyleSheet.create({
+    root: {
+      flex: 1,
+      backgroundColor: colors.bg,
+    },
+    header: {
+      backgroundColor: colors.oceanDeep,
+      paddingHorizontal: 14,
+      paddingTop: 12,
+      paddingBottom: 14,
+    },
+    headerRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
+    },
+    headerTitle: {
+      fontSize: 20,
+      fontWeight: '700',
+      color: COLORS.white,
+    },
+    headerSub: {
+      fontSize: 11.5,
+      color: '#93C5FD',
+      marginTop: 2,
+    },
+    syncPill: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: COLORS.oceanLight,
+      paddingHorizontal: 11,
+      paddingVertical: 6,
+      borderRadius: 999,
+      gap: 4,
+    },
+    syncPillText: {
+      fontSize: 12,
+      fontWeight: '700',
+      color: COLORS.oceanDeep,
+    },
+    heroGrid: {
+      flexDirection: 'row',
+      gap: 7,
+      marginTop: 12,
+    },
+    heroCardPrimary: {
+      flex: 1.35,
+      backgroundColor: COLORS.oceanPrimary,
+      borderRadius: 12,
+      paddingVertical: 9,
+      paddingHorizontal: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    heroValueBig: {
+      fontSize: 22,
+      fontWeight: '800',
+      color: COLORS.white,
+    },
+    heroLabelPrimary: {
+      fontSize: 10.5,
+      color: '#E0F2FE',
+      marginTop: 1,
+      fontWeight: '600',
+    },
+    heroCard: {
+      flex: 1,
+      backgroundColor: 'rgba(255,255,255,0.12)',
+      borderRadius: 12,
+      paddingVertical: 9,
+      paddingHorizontal: 5,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    heroValue: {
+      fontSize: 17,
+      fontWeight: '800',
+      color: COLORS.white,
+    },
+    heroLabel: {
+      fontSize: 10.5,
+      color: '#E2E8F0',
+      marginTop: 1,
+      fontWeight: '600',
+    },
+    heroMiniSub: {
+      fontSize: 9.5,
+      color: '#BAE6FD',
+      marginTop: 2,
+    },
+    segmentWrap: {
+      flexDirection: 'row',
+      backgroundColor: colors.surface,
+      paddingHorizontal: 14,
+      paddingVertical: 8,
+      gap: 8,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    },
+    segmentBtn: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      height: 36,
+      borderRadius: 10,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      gap: 6,
+    },
+    segmentBtnActive: {
+      backgroundColor: COLORS.oceanPrimary,
+      borderColor: COLORS.oceanPrimary,
+    },
+    segmentText: {
+      fontSize: 13,
+      fontWeight: '700',
+      color: colors.textSecondary,
+    },
+    segmentTextActive: {
+      color: COLORS.white,
+    },
+    content: {
+      padding: 14,
+      paddingBottom: 32,
+      gap: 12,
+    },
+    card: {
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 14,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    failedCard: {
+      borderColor: isDark ? '#7F1D1D' : '#FCA5A5',
+      backgroundColor: isDark ? '#2B1114' : '#FFF5F5',
+    },
+    cardHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      marginBottom: 10,
+    },
+    cardTitle: {
+      fontSize: 14.5,
+      fontWeight: '700',
+      color: isDark ? colors.textPrimary : colors.oceanDeep,
+      flex: 1,
+    },
+    cardHeaderRight: {
+      fontSize: 11.5,
+      fontWeight: '600',
+      color: colors.textMuted,
+    },
+    creditSummaryRow: {
+      flexDirection: 'row',
+      gap: 7,
+      marginBottom: 12,
+    },
+    creditStatPill: {
+      flex: 1,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderRadius: 10,
+      paddingVertical: 8,
+      paddingHorizontal: 4,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.borderLight,
+    },
+    creditStatVal: {
+      fontSize: 15,
+      fontWeight: '800',
+      color: isDark ? colors.textPrimary : colors.oceanDeep,
+    },
+    creditStatLbl: {
+      fontSize: 10,
+      color: colors.textSecondary,
+      marginTop: 2,
+      fontWeight: '600',
+    },
+    barSection: {
+      gap: 9,
+    },
+    subSectionHint: {
+      fontSize: 11,
+      color: colors.textMuted,
+      marginBottom: 2,
+    },
+    barRow: {
+      gap: 4,
+    },
+    barLabelRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
+    },
+    barName: {
+      fontSize: 12.5,
+      fontWeight: '700',
+      color: colors.textPrimary,
+      flex: 1,
+    },
+    barValue: {
+      fontSize: 11.5,
+      fontWeight: '600',
+      color: colors.textSecondary,
+    },
+    progressTrack: {
+      height: 7,
+      borderRadius: 999,
+      backgroundColor: colors.borderLight,
+      overflow: 'hidden',
+    },
+    progressFill: {
+      height: '100%',
+      borderRadius: 999,
+    },
+    termTableHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingBottom: 7,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.borderLight,
+      marginBottom: 4,
+    },
+    termColLabel: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: colors.textMuted,
+    },
+    termRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingVertical: 9,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.borderLight,
+    },
+    termRowName: {
+      fontSize: 12.5,
+      fontWeight: '700',
+      color: colors.textPrimary,
+    },
+    miniGpaTrack: {
+      height: 4,
+      borderRadius: 999,
+      backgroundColor: colors.borderLight,
+      marginTop: 5,
+      overflow: 'hidden',
+    },
+    miniGpaFill: {
+      height: '100%',
+      borderRadius: 999,
+    },
+    gpaPill: {
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+      borderRadius: 8,
+    },
+    gpaPillText: {
+      fontSize: 12.5,
+      fontWeight: '800',
+    },
+    termRowAvg: {
+      fontSize: 12.5,
+      fontWeight: '700',
+      color: colors.textPrimary,
+      textAlign: 'center',
+    },
+    termRowCredits: {
+      fontSize: 12.5,
+      fontWeight: '800',
+      color: isDark ? colors.textPrimary : colors.oceanDeep,
+    },
+    termRowSub: {
+      fontSize: 10,
+      color: colors.textMuted,
+      marginTop: 1,
+    },
+    tierRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 9,
+    },
+    tierBadge: {
+      width: 48,
+      paddingVertical: 5,
+      borderRadius: 8,
+      alignItems: 'center',
+    },
+    tierBadgeText: {
+      fontSize: 11.5,
+      fontWeight: '800',
+    },
+    tierRange: {
+      fontSize: 11.5,
+      fontWeight: '600',
+      color: colors.textPrimary,
+    },
+    highlightRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingVertical: 7,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: colors.borderLight,
+      gap: 10,
+    },
+    rankCircle: {
+      width: 24,
+      height: 24,
+      borderRadius: 12,
+      backgroundColor: colors.amberLight,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    rankText: {
+      fontSize: 12,
+      fontWeight: '800',
+      color: colors.amber,
+    },
+    highlightName: {
+      fontSize: 13.5,
+      fontWeight: '700',
+      color: colors.textPrimary,
+    },
+    highlightMeta: {
+      fontSize: 11,
+      color: colors.textMuted,
+      marginTop: 2,
+    },
+    highlightScore: {
+      fontSize: 16,
+      fontWeight: '800',
+    },
+    highlightGpa: {
+      fontSize: 10.5,
+      fontWeight: '600',
+      color: colors.textSecondary,
+    },
+    viewAllBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.oceanTint,
+      borderWidth: 1,
+      borderColor: colors.oceanLight,
+      borderRadius: 12,
+      height: 44,
+      gap: 6,
+    },
+    viewAllBtnText: {
+      fontSize: 13.5,
+      fontWeight: '700',
+      color: colors.oceanPrimary,
+    },
+    filterSection: {
+      backgroundColor: colors.surface,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+      paddingBottom: 8,
+    },
+    termBar: {
+      paddingHorizontal: 14,
+      paddingTop: 9,
+      paddingBottom: 6,
+      gap: 6,
+    },
+    termChip: {
+      paddingHorizontal: 11,
+      paddingVertical: 5,
+      borderRadius: 999,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginRight: 6,
+    },
+    termChipActive: {
+      backgroundColor: COLORS.oceanPrimary,
+      borderColor: COLORS.oceanPrimary,
+    },
+    termChipText: {
+      fontSize: 12,
+      fontWeight: '600',
+      color: colors.textSecondary,
+    },
+    termChipTextActive: {
+      color: COLORS.white,
+    },
+    searchRow: {
+      paddingHorizontal: 14,
+      paddingVertical: 4,
+    },
+    searchInputWrap: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: 10,
+      paddingHorizontal: 10,
+      height: 36,
+      gap: 6,
+    },
+    searchInput: {
+      flex: 1,
+      fontSize: 13,
+      color: colors.textPrimary,
+      paddingVertical: 0,
+    },
+    sortBar: {
+      paddingHorizontal: 14,
+      paddingTop: 6,
+      gap: 6,
+    },
+    miniChip: {
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+      borderRadius: 8,
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginRight: 6,
+    },
+    miniChipActive: {
+      backgroundColor: colors.oceanLight,
+      borderColor: colors.oceanPrimary,
+    },
+    miniChipActiveAlt: {
+      backgroundColor: colors.emeraldLight,
+      borderColor: colors.emerald,
+    },
+    miniChipText: {
+      fontSize: 11.5,
+      fontWeight: '600',
+      color: colors.textSecondary,
+    },
+    miniChipTextActive: {
+      color: colors.oceanPrimary,
+    },
+    miniChipTextActiveAlt: {
+      color: colors.emerald,
+    },
+    emptyBox: {
+      alignItems: 'center',
+      paddingVertical: 54,
+      paddingHorizontal: 24,
+    },
+    emptyTitle: {
+      fontSize: 17,
+      fontWeight: '700',
+      color: colors.textPrimary,
+      marginTop: 12,
+    },
+    emptyDesc: {
+      fontSize: 13,
+      color: colors.textSecondary,
+      textAlign: 'center',
+      lineHeight: 20,
+      marginTop: 6,
+      marginBottom: 18,
+    },
+    emptyBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: COLORS.oceanPrimary,
+      paddingHorizontal: 20,
+      height: 46,
+      borderRadius: 12,
+      gap: 8,
+    },
+    emptyBtnText: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: COLORS.white,
+    },
+    emptyFilterBox: {
+      alignItems: 'center',
+      paddingVertical: 38,
+      gap: 10,
+    },
+    emptyFilterText: {
+      fontSize: 13.5,
+      color: colors.textSecondary,
+    },
+    resetFilterBtn: {
+      paddingHorizontal: 14,
+      paddingVertical: 7,
+      borderRadius: 999,
+      backgroundColor: colors.oceanLight,
+    },
+    resetFilterText: {
+      fontSize: 12.5,
+      fontWeight: '700',
+      color: colors.oceanPrimary,
+    },
+    estimateBanner: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      backgroundColor: colors.amberLight,
+      borderRadius: 10,
+      paddingHorizontal: 11,
+      paddingVertical: 8,
+      gap: 6,
+    },
+    estimateText: {
+      flex: 1,
+      fontSize: 11.5,
+      color: isDark ? '#FDE68A' : '#92400E',
+      lineHeight: 16,
+    },
+    gradeCard: {
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 13,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+    gradeMain: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    courseName: {
+      fontSize: 15,
+      fontWeight: '700',
+      color: colors.textPrimary,
+    },
+    tagRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 6,
+      marginTop: 6,
+    },
+    tag: {
+      backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+      borderRadius: 6,
+    },
+    tagText: {
+      fontSize: 11,
+      fontWeight: '600',
+      color: colors.textSecondary,
+    },
+    termSubText: {
+      fontSize: 11,
+      color: colors.textMuted,
+      marginTop: 6,
+    },
+    scoreBadge: {
+      minWidth: 66,
+      paddingHorizontal: 10,
+      paddingVertical: 8,
+      borderRadius: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    scoreText: {
+      fontSize: 18,
+      fontWeight: '800',
+    },
+    gpaMini: {
+      fontSize: 10,
+      fontWeight: '700',
+      marginTop: 2,
+    },
+    sourceCard: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      gap: 8,
+      padding: 11,
+      borderRadius: 12,
+      borderWidth: 1,
+      marginBottom: 10,
+    },
+    sourceCardOfficial: {
+      backgroundColor: colors.emeraldLight,
+      borderColor: isDark ? '#065F46' : '#A7F3D0',
+    },
+    sourceCardEstimate: {
+      backgroundColor: colors.amberLight,
+      borderColor: isDark ? '#78350F' : '#FDE68A',
+    },
+    sourceCardTitle: {
+      fontSize: 12.5,
+      fontWeight: '700',
+      lineHeight: 17,
+    },
+    sourceCardSub: {
+      fontSize: 11,
+      color: colors.textSecondary,
+      marginTop: 3,
+    },
+    auditModRow: {
+      paddingVertical: 9,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.borderLight,
+    },
+    auditModName: {
+      fontSize: 13.5,
+      fontWeight: '700',
+      color: colors.textPrimary,
+      flex: 1,
+      paddingRight: 8,
+    },
+    auditStatusPill: {
+      paddingHorizontal: 8,
+      paddingVertical: 2.5,
+      borderRadius: 6,
+    },
+    auditStatusText: {
+      fontSize: 11,
+      fontWeight: '700',
+    },
+    auditModMeta: {
+      fontSize: 11.5,
+      color: colors.textSecondary,
+      marginTop: 3,
+    },
+    auditFootnote: {
+      fontSize: 11.5,
+      color: colors.textMuted,
+      marginTop: 10,
+      lineHeight: 17,
+    },
+    subScoreBox: {
+      marginTop: 10,
+      paddingTop: 10,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: colors.border,
+      gap: 5,
+    },
+    subScoreSourceRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 5,
+      backgroundColor: colors.emeraldLight,
+      paddingHorizontal: 8,
+      paddingVertical: 4,
+      borderRadius: 7,
+      marginBottom: 4,
+    },
+    subScoreSourceText: {
+      fontSize: 11,
+      fontWeight: '600',
+      color: isDark ? '#A7F3D0' : '#065F46',
+      flex: 1,
+    },
+    subScoreHeader: {
+      flexDirection: 'row',
+      paddingBottom: 4,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.borderLight,
+    },
+    subScoreCol: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: colors.textMuted,
+    },
+    subScoreRow: {
+      flexDirection: 'row',
+      paddingVertical: 3,
+    },
+    subScoreVal: {
+      fontSize: 12.5,
+      color: colors.textPrimary,
+    },
+    subScoreEmpty: {
+      fontSize: 11.5,
+      color: colors.textMuted,
+      lineHeight: 17,
+    },
+  });

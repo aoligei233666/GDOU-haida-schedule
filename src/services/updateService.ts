@@ -40,30 +40,28 @@ export function buildCampusMirrorDownloadUrls(githubUrl: string): string[] {
 }
 
 /**
- * Concise summary of current v2.0.0 improvements & bug fixes shown directly in Settings -> Update Card.
+ * Concise summary of current v2.0.1 improvements & bug fixes shown directly in Settings -> Update Card.
  */
 export const CURRENT_VERSION_HIGHLIGHTS: string[] = [
-  '节假日与调休全链路贯通：系统日历、.ics 导出、起床与课前闹钟统一按海大校历跳过法定放假、自动补排调休课程，并支持云端静态校历配置自动对齐未来学年',
-  '全局深色模式 + 多学期归档 + 课程编辑与作业 DDL：支持跟随系统/深色/浅色切换、多学期课表自由切换、单课备注/调教室/换色与课程作业截止提醒，新增脱敏成绩单 CSV/文本导出与本地无凭据全量备份换机',
-  '双端原生能力大升级：桌面挂件与灵动岛支持点击直达课表/考试（gdouschedule://）、Android 新增 4×4 一周滚动大挂件与课节边界自刷新、iOS 新增 Siri/快捷指令 AppIntents 与后台定时刷新，并引入离线教学楼速查字典',
-  '架构与安全全面演进：OTA 热更引入 Ed25519 数字签名强制验签与校园网加速镜像兜底；本地原生桥接迁移至标准 Expo Native Module，并完成插件与认证核心模块化重构',
+  '深色模式全页面卡片精修：课表页今日课程横幅、考试页卡片与手动录入弹窗、绩点页总览/培养方案/成绩明细卡片及闹钟日历页全面切换深色海蓝表面，告别夜间残留白底',
+  '窄屏布局打磨：优化 360dp 窄屏开启情侣课表后顶部「我的 / 情侣同屏 / 伴侣」三段切换胶囊比例，消除「情侣同屏」两行折行',
+  '支持 v2.0.0 无损免安装软件内热更新（保持 Runtime v4，Ed25519 验签 + SHA-256 校验，秒级原地生效）',
+  '完整继承 v2.0.0 核心特性：节假日/调休全链路贯通、多学期归档、课程编辑与作业 DDL、脱敏成绩单导出、零凭据全量备份与双端小组件深链直达',
 ];
 
 export function getPlatformVersionHighlights(platformOs: string): string[] {
   if (platformOs === 'android') {
     return [
-      '节假日/调休贯通日历、.ics 与系统闹钟：放假自动停响、调休自动补排，支持云端海大校历静默同步',
-      '全局深色模式 + 多学期切换 + 课程编辑与作业 DDL + 脱敏成绩单导出 + 本地无凭据全量备份换机',
-      '新增 4×4「一周滚动课表」大挂件、挂件深链直达与课节边界后台自动刷新，新增离线教学楼定位速查与手势左右滑动切周',
-      'OTA 热更新升级 Ed25519 强制验签与校园网加速镜像兜底，原生桥接全面升级为本地 Expo Module（JSI）',
+      '全页面深色模式卡片精修：课表今日横幅、考试页、绩点页与闹钟日历页内部卡片、标签与输入弹窗全部适配低眩光深蓝主题',
+      '窄屏情侣切换胶囊优化：修复「情侣同屏」按钮在小屏手机上折行问题',
+      '保持 Runtime v4 兼容，v2.0.0 用户可直接在应用内通过 Ed25519 验签热更新秒级升级',
     ];
   }
   if (platformOs === 'ios') {
     return [
-      '节假日/调休贯通 iOS 日历、.ics 与 AlarmKit 闹钟：放假自动停响、调休自动补排，支持云端海大校历静默同步',
-      '全局深色模式 + 多学期切换 + 课程编辑与作业 DDL + 脱敏成绩单导出 + 本地无凭据全量备份换机',
-      'iOS 桌面挂件与灵动岛支持点击深链直达，新增 Siri 语音问课与快捷指令自动化（每天早 7 点自动开启灵动岛）及 BGAppRefreshTask 后台刷新',
-      'OTA 免重签热更新升级 Ed25519 强制验签与校园网加速镜像兜底，原生桥接升级为本地 Expo Module（JSI）',
+      '全页面深色模式卡片精修：课表今日横幅、考试页、绩点页与闹钟日历页内部卡片、标签与弹窗全部适配低眩光深蓝主题',
+      '窄屏情侣切换胶囊优化：修复「情侣同屏」按钮在小屏 iPhone 上折行问题',
+      '保持 Runtime v4 兼容，已安装 v2.0.0 的 iOS 设备可直接免重签软件内热更新秒级升级',
     ];
   }
   return CURRENT_VERSION_HIGHLIGHTS;

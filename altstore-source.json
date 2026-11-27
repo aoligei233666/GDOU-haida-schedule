@@ -20,14 +20,23 @@
       "iconURL": "https://raw.githubusercontent.com/aoligei233666/GDOU-haida-schedule/main/assets/icon.png",
       "tintColor": "#0284C7",
       "category": "utilities",
-      "version": "2.0.0",
-      "buildVersion": "13",
+      "version": "2.0.1",
+      "buildVersion": "14",
       "versionDate": "2026-11-27",
-      "versionDescription": "v2.0.0（架构与体验里程碑大版本）：\n1. 节假日/调休全链路贯通：系统日历、.ics 导出与闹钟统一按海大校历跳过放假、自动补排调休课程，支持云端海大校历免发版同步；\n2. 体验全面升级：新增全局深色模式（跟随系统/深色/浅色）、多学期本地归档与一键切换、单课临时教室/备注/配色编辑与作业实验 DDL 提醒、脱敏成绩单 CSV/文本导出、纯本地无凭据全量备份换机、手势左右滑切周与 1-20 周快捷网格跳转；\n3. 原生生态深化：桌面挂件与灵动岛支持点击深链直达（gdouschedule://），iOS 新增 Siri/快捷指令 AppIntents 与 BGAppRefreshTask 后台刷新，Android 新增 4×4 一周滚动大挂件与课节边界自刷新，内置海大四校区离线教学楼速查；\n4. 安全与工程重构：OTA 热更引入 Ed25519 数字签名强制验签与校园网加速镜像兜底，原生桥接迁移至本地 Expo Native Module（JSI），完成插件与认证核心模块化拆分。",
-      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v2.0.0/haida-schedule-v2.0.0-ios-unsigned.ipa",
+      "versionDescription": "v2.0.1（深色模式全量精修与窄屏优化，支持 v2.0.0 应用内直接热更新）：\n1. 全面补齐深色模式内部卡片与控件适配：修复课表页今日课程横幅、考试页卡片与录入弹窗、绩点页学分/培养方案/成绩明细卡片与闹钟日历页卡片在深色模式下仍残留浅色白底的问题；\n2. 优化窄屏（360dp）开启情侣课表后顶部「我的 / 情侣同屏 / 伴侣」三段切换胶囊的布局，消除「情侣同屏」文字两行折行；\n3. 保持 Runtime v4 兼容，已安装 v2.0.0 的用户可直接通过软件内 OTA 热更新完成秒级升级（Ed25519 验签 + SHA-256 校验）。",
+      "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v2.0.1/haida-schedule-v2.0.1-ios-unsigned.ipa",
       "size": 12370054,
       "minOSVersion": "16.4",
       "versions": [
+        {
+          "version": "2.0.1",
+          "buildVersion": "14",
+          "date": "2026-11-27",
+          "localizedDescription": "v2.0.1：\n1. 全量补齐课表今日横幅、考试页、绩点页与闹钟日历页的深色模式内部卡片/标签/弹窗配色；\n2. 修复窄屏开启情侣课表后「情侣同屏」胶囊文字换行；\n3. 兼容 Runtime v4，v2.0.0 可直接软件内 OTA 秒级热更新。",
+          "downloadURL": "https://github.com/aoligei233666/GDOU-haida-schedule/releases/download/v2.0.1/haida-schedule-v2.0.1-ios-unsigned.ipa",
+          "size": 12370054,
+          "minOSVersion": "16.4"
+        },
         {
           "version": "2.0.0",
           "buildVersion": "13",

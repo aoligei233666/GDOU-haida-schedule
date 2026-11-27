@@ -775,20 +775,27 @@ export const ScheduleScreen: React.FC<Props> = ({
           {/* Couple Mode Segment */}
           <View style={styles.coupleSegment}>
             <TouchableOpacity
-              style={[styles.segBtn, viewMode === 'mine' && styles.segBtnActive]}
+              style={[styles.segBtn, styles.segBtnCompact, viewMode === 'mine' && styles.segBtnActive]}
               onPress={() => handlePressCoupleModeBtn('mine')}
             >
-              <Text style={[styles.segBtnText, viewMode === 'mine' && styles.segBtnTextActive]}>
+              <Text
+                style={[styles.segBtnText, viewMode === 'mine' && styles.segBtnTextActive]}
+                numberOfLines={1}
+              >
                 我的
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.segBtn, viewMode === 'couple' && styles.segBtnCoupleActive]}
+              style={[
+                styles.segBtn,
+                styles.segBtnCoupleWide,
+                viewMode === 'couple' && styles.segBtnCoupleActive,
+              ]}
               onPress={() => handlePressCoupleModeBtn('couple')}
             >
               <Ionicons
                 name="heart"
-                size={11}
+                size={10}
                 color={viewMode === 'couple' ? '#BE185D' : '#FBCFE8'}
               />
               <Text
@@ -796,13 +803,20 @@ export const ScheduleScreen: React.FC<Props> = ({
                   styles.segBtnText,
                   viewMode === 'couple' && styles.segBtnTextCoupleActive,
                 ]}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.85}
               >
                 情侣同屏
               </Text>
             </TouchableOpacity>
             {coupleSchedule && (
               <TouchableOpacity
-                style={[styles.segBtn, viewMode === 'partner' && styles.segBtnCoupleActive]}
+                style={[
+                  styles.segBtn,
+                  styles.segBtnCompact,
+                  viewMode === 'partner' && styles.segBtnCoupleActive,
+                ]}
                 onPress={() => handlePressCoupleModeBtn('partner')}
               >
                 <Text
@@ -929,31 +943,45 @@ export const ScheduleScreen: React.FC<Props> = ({
 
       {!hasAnyCourses ? (
         <View style={styles.emptyState}>
-          <View style={styles.emptyIconCircle}>
-            <Ionicons name="school-outline" size={44} color={COLORS.oceanPrimary} />
+          <View style={[styles.emptyIconCircle, { backgroundColor: colors.oceanLight }]}>
+            <Ionicons name="school-outline" size={44} color={colors.oceanPrimary} />
           </View>
-          <Text style={styles.emptyTitle}>欢迎使用海大课表</Text>
-          <Text style={styles.emptyDesc}>
+          <Text style={[styles.emptyTitle, { color: colors.textPrimary }]}>欢迎使用海大课表</Text>
+          <Text style={[styles.emptyDesc, { color: colors.textSecondary }]}>
             支持一键同步广东海洋大学教务课表、考试安排、绩点学分与情侣双人课表。账号密码仅在拉取时临时验证，拉取完成立即销毁，本地零留存。
           </Text>
           <TouchableOpacity style={styles.emptyPrimaryBtn} onPress={onOpenSync}>
             <Ionicons name="cloud-download-outline" size={19} color={COLORS.white} />
             <Text style={styles.emptyPrimaryText}>登录海大教务同步数据（用完即删）</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.emptySecondaryBtn} onPress={onLoadSampleData}>
-            <Ionicons name="sparkles-outline" size={17} color={COLORS.oceanPrimary} />
-            <Text style={styles.emptySecondaryText}>加载海大示例数据体验课表 / 情侣同屏 / 绩点</Text>
+          <TouchableOpacity
+            style={[
+              styles.emptySecondaryBtn,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+            onPress={onLoadSampleData}
+          >
+            <Ionicons name="sparkles-outline" size={17} color={colors.oceanPrimary} />
+            <Text style={[styles.emptySecondaryText, { color: colors.oceanPrimary }]}>
+              加载海大示例数据体验课表 / 情侣同屏 / 绩点
+            </Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.emptySecondaryBtn, { borderColor: '#FBCFE8', backgroundColor: '#FDF2F8' }]}
+            style={[
+              styles.emptySecondaryBtn,
+              {
+                borderColor: isDark ? '#831843' : '#FBCFE8',
+                backgroundColor: isDark ? '#3B0726' : '#FDF2F8',
+              },
+            ]}
             onPress={() => setCoupleModalOpen(true)}
           >
-            <Ionicons name="heart-outline" size={17} color="#DB2777" />
-            <Text style={[styles.emptySecondaryText, { color: '#DB2777' }]}>
+            <Ionicons name="heart-outline" size={17} color={isDark ? '#F472B6' : '#DB2777'} />
+            <Text style={[styles.emptySecondaryText, { color: isDark ? '#F9A8D4' : '#DB2777' }]}>
               开启情侣课表（口令互传 / 面对面代拉取）
             </Text>
           </TouchableOpacity>
-          <Text style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 16, fontWeight: '600' }}>
+          <Text style={{ fontSize: 11.5, color: colors.textMuted, marginTop: 16, fontWeight: '600' }}>
             powered by 种果仁
           </Text>
         </View>
@@ -962,15 +990,24 @@ export const ScheduleScreen: React.FC<Props> = ({
           {/* Couple Live Status & Weekly Insights Banner */}
           {viewMode !== 'mine' && coupleSchedule && coupleInsights && (
             <TouchableOpacity
-              style={styles.coupleInsightBanner}
+              style={[
+                styles.coupleInsightBanner,
+                isDark && { backgroundColor: '#2D0A22', borderBottomColor: '#5B1443' },
+              ]}
               activeOpacity={0.85}
               onPress={() => setCoupleModalOpen(true)}
             >
               <View style={{ flex: 1 }}>
-                <Text style={styles.coupleHeadline} numberOfLines={1}>
+                <Text
+                  style={[styles.coupleHeadline, isDark && { color: '#FBCFE8' }]}
+                  numberOfLines={1}
+                >
                   {coupleInsights.liveHeadline}
                 </Text>
-                <Text style={styles.coupleSubline} numberOfLines={1}>
+                <Text
+                  style={[styles.coupleSubline, isDark && { color: '#F472B6' }]}
+                  numberOfLines={1}
+                >
                   {coupleInsights.liveSubline}
                   {coupleInsights.togetherSessionsCount > 0
                     ? ` · 同堂 ${coupleInsights.togetherSessionsCount} 节`
@@ -980,8 +1017,13 @@ export const ScheduleScreen: React.FC<Props> = ({
                     : ''}
                 </Text>
               </View>
-              <View style={styles.coupleManageBadge}>
-                <Text style={styles.coupleManageText}>管理</Text>
+              <View
+                style={[
+                  styles.coupleManageBadge,
+                  isDark && { backgroundColor: '#4C1433', borderColor: '#831843' },
+                ]}
+              >
+                <Text style={[styles.coupleManageText, isDark && { color: '#FBCFE8' }]}>管理</Text>
               </View>
             </TouchableOpacity>
           )}
@@ -992,24 +1034,46 @@ export const ScheduleScreen: React.FC<Props> = ({
             !lastScheduleDiff.dismissed &&
             lastScheduleDiff.entries.length > 0 && (
               <TouchableOpacity
-                style={styles.diffBanner}
+                style={[
+                  styles.diffBanner,
+                  isDark && { backgroundColor: colors.amberLight, borderBottomColor: '#78350F' },
+                ]}
                 activeOpacity={0.85}
                 onPress={() => setDiffModalOpen(true)}
               >
-                <Ionicons name="notifications-circle" size={18} color="#B45309" />
-                <Text style={styles.diffBannerText} numberOfLines={1}>
+                <Ionicons
+                  name="notifications-circle"
+                  size={18}
+                  color={isDark ? colors.amber : '#B45309'}
+                />
+                <Text
+                  style={[styles.diffBannerText, isDark && { color: '#FDE68A' }]}
+                  numberOfLines={1}
+                >
                   检测到 {lastScheduleDiff.entries.length} 处课表变动（
                   {lastScheduleDiff.entries[0]?.courseName} 等）· 点击查看详情
                 </Text>
-                <Ionicons name="chevron-forward" size={16} color="#B45309" />
+                <Ionicons
+                  name="chevron-forward"
+                  size={16}
+                  color={isDark ? colors.amber : '#B45309'}
+                />
               </TouchableOpacity>
             )}
 
           {/* Unparsed courses explicit warning banner */}
           {viewMode === 'mine' && unparsedCourses.length > 0 && (
-            <View style={styles.unparsedBanner}>
-              <Ionicons name="warning-outline" size={14} color={COLORS.amber} />
-              <Text style={{ flex: 1, fontSize: 11, color: '#92400E' }} numberOfLines={2}>
+            <View
+              style={[
+                styles.unparsedBanner,
+                isDark && { backgroundColor: colors.amberLight },
+              ]}
+            >
+              <Ionicons name="warning-outline" size={14} color={colors.amber} />
+              <Text
+                style={{ flex: 1, fontSize: 11, color: isDark ? '#FDE68A' : '#92400E' }}
+                numberOfLines={2}
+              >
                 有 {unparsedCourses.length} 门课程缺少星期/节次/周次（
                 {unparsedCourses.map((c) => c.name).slice(0, 2).join('、')}
                 ），已跳过网格与日历导出。
@@ -1020,23 +1084,45 @@ export const ScheduleScreen: React.FC<Props> = ({
           {/* Today's Spotlight (honors holiday & makeup overrides) */}
           {viewMode !== 'couple' &&
             (todayCourses.length > 0 || todayResolvedData.resolved.badgeText) && (
-              <View style={styles.todayBanner}>
+              <View
+                style={[
+                  styles.todayBanner,
+                  { backgroundColor: colors.surface, borderBottomColor: colors.border },
+                ]}
+              >
                 <TouchableOpacity
                   style={[
                     styles.todayBadge,
-                    todayResolvedData.resolved.isHoliday && { backgroundColor: '#DC2626' },
-                    todayResolvedData.resolved.isMakeup && { backgroundColor: '#D97706' },
+                    { backgroundColor: colors.oceanTint, borderColor: colors.oceanLight },
+                    todayResolvedData.resolved.isHoliday && {
+                      backgroundColor: '#DC2626',
+                      borderColor: '#DC2626',
+                    },
+                    todayResolvedData.resolved.isMakeup && {
+                      backgroundColor: '#D97706',
+                      borderColor: '#D97706',
+                    },
                   ]}
                   onPress={() => setCalendarModalOpen(true)}
                 >
-                  <Text style={styles.todayBadgeText}>
+                  <Text
+                    style={[
+                      styles.todayBadgeText,
+                      { color: colors.oceanPrimary },
+                      (todayResolvedData.resolved.isHoliday ||
+                        todayResolvedData.resolved.isMakeup) && { color: COLORS.white },
+                    ]}
+                  >
                     {todayResolvedData.resolved.badgeText
                       ? todayResolvedData.resolved.badgeText
                       : `${viewMode === 'partner' ? `${partnerName}今日` : '今日'} ${todayCourses.length} 节`}
                   </Text>
                 </TouchableOpacity>
                 {todayResolvedData.resolved.isHoliday ? (
-                  <Text style={styles.todayHolidayText} numberOfLines={1}>
+                  <Text
+                    style={[styles.todayHolidayText, { color: colors.danger }]}
+                    numberOfLines={1}
+                  >
                     法定节假日停课中 · 点击左侧标签查看校历调休
                   </Text>
                 ) : (
@@ -1050,13 +1136,26 @@ export const ScheduleScreen: React.FC<Props> = ({
                       return (
                         <TouchableOpacity
                           key={c.id}
-                          style={styles.todayChip}
+                          style={[
+                            styles.todayChip,
+                            {
+                              backgroundColor: isDark ? colors.surfaceElevated : colors.bg,
+                              borderWidth: isDark ? 1 : 0,
+                              borderColor: colors.border,
+                            },
+                          ]}
                           onPress={() => setActiveModalCourses(overlappingToday)}
                         >
-                          <Text style={styles.todayChipTitle} numberOfLines={1}>
+                          <Text
+                            style={[styles.todayChipTitle, { color: colors.textPrimary }]}
+                            numberOfLines={1}
+                          >
                             {span.startText} {c.name}
                           </Text>
-                          <Text style={styles.todayChipSub} numberOfLines={1}>
+                          <Text
+                            style={[styles.todayChipSub, { color: colors.textSecondary }]}
+                            numberOfLines={1}
+                          >
                             {c.location}
                           </Text>
                         </TouchableOpacity>
@@ -1475,9 +1574,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 4.5,
-    paddingHorizontal: 6,
+    paddingHorizontal: 4,
     borderRadius: 999,
-    gap: 3,
+    gap: 2,
+  },
+  segBtnCompact: {
+    flex: 0.85,
+  },
+  segBtnCoupleWide: {
+    flex: 1.4,
+    paddingHorizontal: 5,
   },
   segBtnActive: {
     backgroundColor: COLORS.white,
@@ -1486,7 +1592,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FCE7F3',
   },
   segBtnText: {
-    fontSize: 11,
+    fontSize: 10.5,
     fontWeight: '700',
     color: 'rgba(255,255,255,0.85)',
   },
@@ -1497,7 +1603,7 @@ const styles = StyleSheet.create({
     color: '#9D174D',
   },
   coupleGearBtn: {
-    paddingHorizontal: 7,
+    paddingHorizontal: 5,
     paddingVertical: 4,
   },
   filterTogglePill: {
